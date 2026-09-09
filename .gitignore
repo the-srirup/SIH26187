@@ -1,0 +1,45 @@
+# Byte-compiled / optimized / cached Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.eggs/
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+ibvap_env/
+
+# Environment / secrets (keep the example committed)
+.env
+.env.local
+.env.*.local
+
+# Claude Code / editor tooling
+.claude/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Models (large — re-downloaded at runtime, see README)
+*.pt
+*.pth
+*.onnx
+*.engine
+*.trt
+
+# Runtime / generated artifacts
+alerts.db
+alerts/
+clips/
+videos/
+snapshots/
+DEMO_OUTPUTS/
+*.log

@@ -1,0 +1,8 @@
+Part 9 — Realistic timeline
+Before the internal college round: Phases 1–5 working, plus slides. Record a screen-capture demo as
+backup in case live demo fails.
+If selected for the national round: Phases 6–7 polished, multi-camera on LAN, then Phase 8 stretch goals
+only if everything else is stable.
+The single biggest mistake teams make is attempting all eight capabilities at 40% quality. A complete,
+reliable pipeline covering intrusion, vehicles, and tamper-proof logging beats a half-broken system that
+gestures at everything. Put the rest under "future scope" and say so confidently.

@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>IBVAP — Intelligent Border Video Analytics</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+    <header class="topbar">
+        <div class="topbar-brand">
+            <span class="brand-icon">🛡️</span>
+            <h1>IBVAP</h1>
+            <span class="brand-sub">Intelligent Border Video Analytics</span>
+        </div>
+        <div class="topbar-right">
+            <span id="clock" class="clock"></span>
+            <button id="btn-integrity" class="btn btn-outline" onclick="verifyIntegrity()">
+                🔗 Verify Log Integrity
+            </button>
+            <div id="integrity-badge" class="badge badge-unknown">—</div>
+        </div>
+    </header>
+
+    <main class="layout">
+        <!-- Left: Camera Grid -->
+        <section class="cameras-section">
+            <div class="section-header">
+                <h2>Live Feeds</h2>
+                <button class="btn btn-primary" onclick="openAddCamera()">+ Add Camera</button>
+            </div>
+            <div id="camera-grid" class="camera-grid">
+                <div class="camera-tile loading">
+                    <div class="spinner"></div>
+                    <p>Loading cameras...</p>
+                </div>
+            </div>
+        </section>
+
+        <!-- Right: Alert Feed -->
+        <section class="alerts-section">
+            <div class="section-header">
+                <h2>Alerts</h2>
+                <select id="alert-filter" onchange="loadAlerts()" class="filter-select">
+                    <option value="">All Types</option>
+                    <option value="entry">Entry</option>
+                    <option value="exit">Exit</option>
+                    <option value="loiter">Loiter</option>
+                    <option value="wrong_direction">Wrong Direction</option>
+                    <option value="enter">Zone Enter</option>
+                </select>
+            </div>
+            <div id="alert-feed" class="alert-feed">
+                <p class="empty-state">Waiting for alerts...</p>
+            </div>
+        </section>
+    </main>
+
+    <!-- Alert Detail Modal -->
+    <div id="alert-modal" class="modal" onclick="if(event.target===this)closeModal()">
+        <div class="modal-content">
+            <span class="modal-close" onclick="closeModal()">&times;</span>
+            <div id="modal-body"></div>
+        </div>
+    </div>
+
+    <!-- Add Camera Modal -->
+    <div id="camera-modal" class="modal" onclick="if(event.target===this)closeCameraModal()">
+        <div class="modal-content modal-small">
+            <span class="modal-close" onclick="closeCameraModal()">&times;</span>
+            <h2>Add Camera</h2>
+            <form id="camera-form" onsubmit="submitCamera(event)">
+                <label>Name</label>
+                <input type="text" id="cam-name" required placeholder="e.g., BOP-01 North">
+                <label>URL / Source</label>
+                <input type="text" id="cam-url" required placeholder="e.g., rtsp://192.168.1.10/video or 0 for webcam">
+                <label>Location</label>
+                <input type="text" id="cam-location" placeholder="e.g., Checkpost Alpha">
+                <button type="submit" class="btn btn-primary">Add Camera</button>
+            </form>
+        </div>
+    </div>
+
+    <!-- Fence Drawing Canvas -->
+    <div id="canvas-modal" class="modal" onclick="if(event.target===this)closeCanvasModal()">
+        <div class="modal-content modal-large">
+            <span class="modal-close" onclick="closeCanvasModal()">&times;</span>
+            <h2>Draw Fence / Zone</h2>
+            <div class="canvas-toolbar">
+                <button id="btn-draw-line" class="btn btn-sm active" onclick="setDrawMode('line')">Line</button>
+                <button id="btn-draw-zone" class="btn btn-sm" onclick="setDrawMode('zone')">Polygon Zone</button>
+                <span id="draw-hint" class="draw-hint">Click to place points — double-click to finish</span>
+            </div>
+            <div class="canvas-container">
+                <canvas id="draw-canvas" width="800" height="500"></canvas>
+            </div>
+            <div class="canvas-actions">
+                <button class="btn btn-primary" onclick="saveDrawing()">Save Rule</button>
+                <button class="btn btn-outline" onclick="clearDrawing()">Clear</button>
+            </div>
+            <div id="coords-display" class="coords-display"></div>
+        </div>
+    </div>
+
+    <div id="toast-container" class="toast-container"></div>
+
+    <script src="/static/js/app.js"></script>
+</body>
+</html>

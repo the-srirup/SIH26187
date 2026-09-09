@@ -1,0 +1,31 @@
+Requirement from the PS
+How you build it
+Difficulty
+ANPR
+Plate detector + OCR, needs Indian-plate fine-tuning Hard — do
+last
+Six of eight come almost free from one model. Treat face and ANPR as stretch goals.
+Part 1 — What to learn first
+Do these in order. Do not skip ahead; each one is a prerequisite for the next.
+1.1 Python fundamentals (skip if comfortable)
+Functions, dictionaries, list comprehensions, classes, with blocks, virtual environments.
+Automate the Boring Stuff — https://automatetheboringstuff.com/ (free, Chapters 1–6 are enough)
+1.2 OpenCV basics
+Reading video, showing frames, drawing rectangles and lines, colour spaces, resizing.
+Official tutorials — https://docs.opencv.org/4.x/d9/df8/tutorial_root.html
+PyImageSearch OpenCV start guide — https://pyimagesearch.com/start-here/
+The only functions you truly need: VideoCapture , read , imshow , rectangle , putText , line , resize , waitKey ,
+VideoWriter .
+1.3 Object detection concepts
+You need the ideas, not the maths: bounding box, confidence score, class, IoU, non-maximum suppression,
+mAP.
+Ultralytics docs, Predict mode — https://docs.ultralytics.com/modes/predict/
+Ultralytics Track mode — https://docs.ultralytics.com/modes/track/
+1.4 Multi-object tracking
+Understand why detection alone is not enough: a detector tells you "there is a person here" in each frame
+independently, with no memory. Tracking assigns a persistent ID so you can say "person #7 moved from A
+to B", which is what every rule in this project depends on.
+1.5 FastAPI
+Routes, path and query parameters, Pydantic models, StreamingResponse , WebSockets.
+Official tutorial — https://fastapi.tiangolo.com/tutorial/ (the best documentation in Python, work through
+it directly)

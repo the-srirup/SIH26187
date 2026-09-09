@@ -1,0 +1,34 @@
+Part 7 — Team split (6 people)
+Role
+Owns
+CV lead 1
+Detection, tracking, model integration, night-mode
+CV lead 2
+Rules engine — fences, zones, loitering, debouncing
+Backend
+FastAPI, SQLite, hash chain, clip recording, threading
+Frontend 1
+Dashboard layout, live tiles, alert feed, WebSocket
+Frontend 2
+Fence drawing canvas, filters, replay modal
+Presentation + researchSlides, papers, cost analysis, demo script, deployment story
+That last role is not a consolation prize. In Round 1 the presentation is the submission, and in the final
+round the pitch decides as much as the code.
+Part 8 — What judges will ask, and your answers
+"Why not just buy cameras with built-in analytics?" Cost per post, multiplied by the number of posts
+along a 15,000 km border. Also vendor lock-in — proprietary systems cannot be integrated with existing
+command-and-control software. Have a specific rupee figure ready.
+"How does this work without internet at a remote BOP?" Everything runs on a local edge device — a
+Jetson Orin Nano or a small GPU mini-PC. Only alert metadata and short clips travel upstream, not
+continuous video. Demonstrate this by running your whole system on an isolated hotspot with airplane
+mode on your laptop.
+"How many cameras can one device handle?" Give a measured number, not a guess. Benchmark it: run 1,
+2, 4 streams and record the FPS. A real number from your own testing is far more convincing than a claim.
+"What about false alarms?" Confidence thresholds, minimum object size, debounce windows, and
+configurable per-camera rules. Show that you thought about the operator's experience, not just the
+model's accuracy.
+"Why is this filed under Blockchain & Cybersecurity?" This is your opening. Explain the tamper-evident
+hash chain, the evidentiary value in a court or court-martial, and add RBAC, TLS, and audit logging.
+"Is face recognition accurate enough?" Say honestly that at CCTV distances and angles it is not reliable
+enough for positive identification, and that you present it as an investigative lead requiring human
+confirmation. Overclaiming here is the fastest way to lose credibility with a Home Ministry panel.

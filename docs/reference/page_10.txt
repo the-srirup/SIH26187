@@ -1,0 +1,63 @@
+Paper
+Why it matters
+Link
+YOLOv5 (Sapkota & Karkee,
+2026)
+Multi-object tracking
+Paper
+Why it matters
+Link
+SORT (Bewley et
+al., 2016)
+Kalman filter + Hungarian algorithm. The simplest
+tracker worth understanding.
+https://arxiv.org/abs/1602.00763
+DeepSORT
+(Wojke et al.,
+2017)
+Adds appearance embeddings so identities survive
+occlusion.
+https://arxiv.org/abs/1703.07402
+ByteTrack
+(Zhang et al.,
+ECCV 2022)
+What you are actually running. Its insight: keep the
+low-confidence detections instead of discarding them,
+and match them against existing tracks. Recovers
+partially occluded people. Read this one.
+https://arxiv.org/abs/2110.06864
+BoT-SORT
+(Aharon et al.,
+2022)
+The other tracker Ultralytics ships. Adds camera-
+motion compensation.
+https://arxiv.org/abs/2206.14651
+OC-SORT (Cao
+et al., 2023)
+Handles non-linear motion and long occlusions better.
+https://arxiv.org/abs/2203.14360
+Face detection and recognition
+Paper
+Why it matters
+Link
+FaceNet (Schroff et
+al., 2015)
+Introduced the embedding-plus-distance framing
+that all modern face recognition uses.
+https://arxiv.org/abs/1503.03832
+RetinaFace (Deng et
+al., 2019)
+Single-stage dense face localisation with
+landmarks.
+https://arxiv.org/abs/1905.00641
+ArcFace (Deng et al.,
+CVPR 2019)
+The additive angular margin loss behind
+InsightFace. The standard baseline for face
+embeddings.
+https://arxiv.org/abs/1801.07698
+SCRFD (Guo et al.,
+2021)
+Efficient face detector, the one InsightFace uses by
+default.
+https://arxiv.org/abs/2105.04714

@@ -1,0 +1,42 @@
+IBVAP — Intelligent Border Video Analytics
+Platform
+Complete build guide, SIH 2026 · PS 26187 · Ministry of Home Affairs / SSB
+Part 0 — What you are actually building
+A software layer that sits on top of CCTV cameras that already exist. Video comes in over the network, an
+AI model looks at every frame, rules decide what counts as an incident, and alerts appear on a dashboard
+with a saved clip as evidence.
+The single most important framing for your pitch:
+Smart cameras with built-in analytics cost ₹40,000–₹1,50,000 each. A Border Out Post may already have 8
+ordinary cameras worth ₹3,000 each. Replacing them across thousands of posts is financially impossible.
+Our software gives those existing cameras the same capability for the price of one edge computer per
+post.
+Everything else in the project supports that one sentence.
+The eight required capabilities, mapped to what actually builds them
+Requirement from the PS
+How you build it
+Difficulty
+Human detection and tracking
+YOLO + ByteTrack, one function call
+Easy
+Vehicle detection and classification
+Same call — COCO classes car/truck/bus/motorcycle Easy
+Virtual fence intrusion detection
+Your own geometry code on tracked centre points
+Easy, ~40
+lines
+Suspicious activity detection
+Dwell time, loitering, wrong-direction, from track
+history
+Medium
+Night-time movement detection
+Same detection + CLAHE contrast enhancement +
+time filter
+Easy
+Real-time alert generation and event
+logging
+FastAPI + SQLite + WebSocket
+Medium
+Face detection
+InsightFace (SCRFD detector + ArcFace
+embeddings)
+Medium

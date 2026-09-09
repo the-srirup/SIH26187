@@ -1,0 +1,37 @@
+The browser then displays it with nothing more than <img src="/stream/1"> . No WebRTC, no HLS, no video
+library.
+Threading. Run one detection thread per camera writing into a shared dict of latest frames. FastAPI reads
+from that dict. Never run inference inside a request handler — it will block every other request.
+Phase 6 — Dashboard
+Plain HTML, CSS and JavaScript is completely acceptable and removes an entire category of build failures.
+Use React only if two teammates already know it well.
+What it must contain:
+A grid of live camera tiles, each an <img> pointing at /stream/{id}
+Alert feed on the right, newest first, updating over the WebSocket
+Click an alert → modal with the evidence clip and full metadata
+A canvas overlay for drawing the fence with the mouse, POSTing coordinates to /api/rules
+Filters: camera, alert type, time range
+An "Verify log integrity" button that calls /api/integrity/verify and shows a green tick
+The fence drawing tool is the highest-value UI feature. It proves your system is configurable per site
+rather than hardcoded for one demo video, which is the first thing a sceptical judge probes.
+Phase 7 — LAN deployment
+Cameras: install IP Webcam on Android phones. Each gives you http://192.168.x.x:8080/video , openable
+directly by cv2.VideoCapture .
+Bind the server to 0.0.0.0 , never 127.0.0.1 : uvicorn main:app --host 0.0.0.0 --port 8000
+Find your LAN IP with ipconfig / ip addr ; teammates open http://<that-ip>:8000
+Allow the port through Windows Defender Firewall — a blocked port looks exactly like a code bug
+Client isolation on institutional Wi-Fi blocks device-to-device traffic entirely. Carry a phone hotspot or a
+cheap router as fallback and test it a week early
+Downscale streams to 640×480 at ~5 FPS. Four 1080p streams will saturate the Wi-Fi and the CPU
+from fastapi.responses import StreamingResponse
+def frames(camera_id: int):
+while True:
+        frame = latest_annotated_frame[camera_id]
+        ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n"
+               + buf.tobytes() + b"\r\n")
+@app.get("/stream/{camera_id}")
+def stream(camera_id: int):
+return StreamingResponse(
+        frames(camera_id),
+media_type="multipart/x-mixed-replace; boundary=frame")

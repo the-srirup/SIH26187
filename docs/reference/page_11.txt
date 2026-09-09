@@ -1,0 +1,65 @@
+ANPR — read these before promising ANPR in your pitch
+Paper
+Why it matters
+Link
+Indian Licence
+Plate Dataset in the
+Wild (Tanwar et al.,
+2021)
+16,192 images, 21,683 annotated plates. Explicitly
+documents why models trained on Chinese or
+Brazilian plates fail on Indian ones — font styles and
+plate designs vary too much between countries.
+https://arxiv.org/abs/2111.06054
+End-to-End ANPR
+for Indian datasets
+(Nadiminti et al.,
+BARC, 2022)
+From Bhabha Atomic Research Centre. Found that
+fine-tuning a COCO-pretrained YOLO on Indian
+vehicle images was more sample-efficient than
+adapting a CCPD-trained model. Directly relevant,
+and citing Indian government research strengthens
+your pitch.
+https://arxiv.org/abs/2207.06657
+CRNN (Shi et al.,
+2015)
+The convolutional-recurrent architecture underlying
+most OCR engines.
+https://arxiv.org/abs/1507.05717
+PP-OCR (Du et al.,
+2020)
+The system behind PaddleOCR, a practical choice for
+plate text.
+https://arxiv.org/abs/2009.09941
+Anomaly and suspicious activity detection
+Paper
+Why it matters
+Link
+Real-world Anomaly
+Detection in
+Surveillance Videos
+(Sultani et al., CVPR
+2018)
+Introduced UCF-Crime: 1,900 untrimmed
+surveillance videos, 13 anomaly classes, ~128
+hours. Uses multiple-instance learning with only
+video-level labels, avoiding frame-by-frame
+annotation. The canonical citation for this
+problem.
+https://arxiv.org/abs/1801.04264
+Survey on Deep
+Learning for Video
+Anomaly Detection
+Broad overview of the field and its datasets —
+good for your literature-review slide.
+https://arxiv.org/abs/2009.14146
+Low-light enhancement
+Paper
+Why it matters
+Link
+Zero-DCE (Guo et
+al., CVPR 2020)
+Low-light enhancement with no paired training data.
+Relevant to the night-time requirement.
+https://arxiv.org/abs/2001.06826

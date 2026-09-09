@@ -1,0 +1,40 @@
+version: "3.9"
+
+services:
+  ibvap:
+    build: .
+    container_name: ibvap
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./alerts:/app/alerts
+      - ./clips:/app/clips
+      - ./videos:/app/videos
+      - ./static:/app/static
+      - ./dashboard:/app/dashboard
+    environment:
+      - DATABASE_URL=sqlite:///./alerts.db
+      - HOST=0.0.0.0
+      - PORT=8000
+    restart: unless-stopped
+    depends_on:
+      - camera-sim
+
+  camera-sim:
+    image: alpine:latest
+    container_name: ibvap-camera-sim
+    command: sh -c "apk add --no-cache ffmpeg && \
+      ffmpeg -f lavfi -i 'testsrc=size=640x480:rate=30' \
+      -f lavfi -i 'sine=frequency=1000:duration=60' \
+      -c:v libx264 -preset ultrafast -tune zerolatency \
+      -f mpegts udp://ibvap:8001/stream"
+    networks:
+      - ibvap-net
+    restart: "no"
+
+volumes:
+  db-data:
+
+networks:
+  ibvap-net:
+    driver: bridge

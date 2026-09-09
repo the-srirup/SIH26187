@@ -1,0 +1,41 @@
+Part 5 — Datasets
+Dataset
+Use
+Link
+COCO
+What your pretrained model already knows —
+80 classes including person, car, truck, bus,
+motorcycle
+https://cocodataset.org/
+UCF-Crime
+Real surveillance footage of anomalies; use
+clips as demo input
+https://www.crcv.ucf.edu/projects/real-
+world/
+MOT17 / MOT20 Tracking benchmarks, for evaluating your
+tracker quantitatively
+https://motchallenge.net/
+Indian Licence
+Plate Dataset
+ANPR fine-tuning — see the paper above
+https://arxiv.org/abs/2111.06054
+Roboflow
+Universe
+Search for pre-annotated Indian number plate
+sets
+https://universe.roboflow.com/
+WIDER FACE
+Face detection benchmark
+http://shuoyang1213.me/WIDERFACE/
+For demo footage: search YouTube for CCTV compilations, perimeter security demos, and border patrol
+footage, and download with yt-dlp . Collect 5–6 clips well in advance — the venue Wi-Fi will not cooperate.
+Part 6 — Documentation you will reference constantly
+Ultralytics docs — https://docs.ultralytics.com/
+Ultralytics GitHub — https://github.com/ultralytics/ultralytics
+FastAPI — https://fastapi.tiangolo.com/
+OpenCV Python — https://docs.opencv.org/4.x/d6/d00/tutorial_py_root.html
+SQLAlchemy ORM tutorial — https://docs.sqlalchemy.org/en/20/orm/quickstart.html
+Shapely — https://shapely.readthedocs.io/
+InsightFace — https://github.com/deepinsight/insightface
+EasyOCR — https://github.com/JaidedAI/EasyOCR
+Python hashlib — https://docs.python.org/3/library/hashlib.html

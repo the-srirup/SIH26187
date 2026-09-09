@@ -1,0 +1,19 @@
+# Normalise line endings; treat code/docs as text, media/models as binary.
+* text=auto eol=lf
+
+*.py    text eol=lf
+*.md    text eol=lf
+*.txt   text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.json  text eol=lf
+*.toml  text eol=lf
+*.sh    text eol=lf
+
+*.mp4   binary
+*.jpg   binary
+*.jpeg  binary
+*.png   binary
+*.pdf   binary
+*.pt    binary
+*.db    binary
