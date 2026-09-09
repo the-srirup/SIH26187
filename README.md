@@ -244,5 +244,3 @@ SIH26187/
 
 ---
 
-## License
-MIT
