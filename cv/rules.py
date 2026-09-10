@@ -4,6 +4,20 @@ wrong-direction detection with per-track debouncing.
 
 All rules operate on the foot point (ground contact) and stable track_id
 produced by ``Detector.track()``.
+
+Foot-Point Anchor Logic:
+    Each rule requires the foot point (bottom-centre of bounding box) to
+    be a stable anchor within the detection zone for at least
+    ANCHOR_CONFIRMATION_FRAMES consecutive frames before triggering an
+    alert. This prevents false alarms from environmental factors like
+    swaying tree branches, passing shadows, or transient occlusions.
+
+Alert Debouncer:
+    The RuleEngine maintains a _debounce dictionary keyed by
+    (rule_name, track_id, alert_type) that enforces a minimum time
+    between consecutive alerts for the same object+rule combination.
+    Even after anchor confirmation, a new alert only fires if the
+    debounce window has elapsed.
 """
 
 from __future__ import annotations
@@ -62,9 +76,17 @@ class FenceRule(BaseRule):
     """
     Virtual fence — detects line crossing (entry / exit) using 2-D cross product.
 
-    The directed line from ``(x1, y1)`` → ``(x2, y2)`` defines "entry" as crossing
-    from left to right (cross product sign change − → +) and "exit" as right to left
-    (+ → −).  This matches the right-hand rule convention.
+    Foot-Point Anchor Logic:
+        A crossing is only confirmed when the foot point (bottom-centre of
+        the bounding box) has been on the new side of the line for at least
+        ``ANCHOR_CONFIRMATION_FRAMES`` consecutive frames. This prevents false
+        alarms from environmental shifts — a swaying tree branch or passing
+        shadow will oscillate across the line briefly but never reach the
+        anchor threshold.
+
+    The directed line from ``(x1, y1)`` → ``(x2, y2)`` defines "entry" as
+    crossing from left to right (cross product sign change − → +) and "exit"
+    as right to left (+ → −).  This matches the right-hand rule convention.
     """
 
     def __init__(
@@ -81,6 +103,8 @@ class FenceRule(BaseRule):
         self.p2 = np.array([x2, y2], dtype=float)
         # track_id -> which side of the line the track was on last frame (−1 / +1 / 0)
         self._side: dict[int, int] = {}
+        # track_id -> consecutive frame count on current side (anchor confirmation)
+        self._anchor_count: dict[int, int] = {}
 
     @staticmethod
     def _cross(p1: np.ndarray, p2: np.ndarray, pt: np.ndarray) -> float:
@@ -96,35 +120,89 @@ class FenceRule(BaseRule):
         return 0
 
     def update(self, track_id: int, foot_point: tuple[int, int], **kwargs) -> Alert | None:
+        """Update fence rule for a track.
+
+        Foot-Point Anchor Logic:
+        - Track which side of the fence the foot point is on
+        - When crossing to a new side, start counting consecutive frames on that side
+        - Only trigger an alert after ANCHOR_CONFIRMATION_FRAMES frames have passed
+        - This prevents false alarms from environmental noise (branches, shadows)
+        """
+        from core.config import settings
+
         side = self._side_of(foot_point)
         prev_side = self._side.get(track_id, 0)
 
-        alert: Alert | None = None
-        if prev_side == -1 and side == 1:
-            alert = Alert(
-                rule_name=self.name,
-                rule_type="fence",
-                track_id=track_id,
-                alert_type="entry",
-                details={"line": [float(c) for coord in self.line.coords for c in coord]},
-            )
-        elif prev_side == 1 and side == -1:
-            alert = Alert(
-                rule_name=self.name,
-                rule_type="fence",
-                track_id=track_id,
-                alert_type="exit",
-                details={"line": [float(c) for coord in self.line.coords for c in coord]},
-            )
+        # Always update the side tracking for this track
+        self._side[track_id] = side
 
+        # Track if we're in a crossing state (just crossed, waiting for anchor)
+        if not hasattr(self, '_crossed'):
+            self._crossed: dict[int, tuple[int, str]] = {}  # track_id -> (anchor_count, crossing_direction)
+
+        crossed_state = self._crossed.get(track_id, (0, None))
+        anchor_count, crossing_type = crossed_state
+
+        # Check for side change (crossing event) - only when actually on a side, not on the line
+        side_changed = prev_side != 0 and prev_side != side
+
+        if side_changed:
+            # We just crossed - determine direction and reset counter
+            if prev_side == -1 and side == 1:
+                crossing_type = "entry"
+            elif prev_side == 1 and side == -1:
+                crossing_type = "exit"
+            else:
+                crossing_type = None
+            anchor_count = 0  # Will start counting from 0
+
+        # Count frames on current side (only if not on the line)
         if side != 0:
-            self._side[track_id] = side
+            anchor_count += 1
+            self._crossed[track_id] = (anchor_count, crossing_type)
+        else:
+            # On the line - keep previous state but don't increment
+            # When object moves off the line to a side, it will be treated as a continuation
+            pass
+
+        # Anchor confirmation check
+        anchor_frames = getattr(settings, 'ANCHOR_CONFIRMATION_FRAMES', 5)
+        alert: Alert | None = None
+
+        if anchor_count >= anchor_frames and crossing_type:
+            if crossing_type == "entry":
+                alert = Alert(
+                    rule_name=self.name,
+                    rule_type="fence",
+                    track_id=track_id,
+                    alert_type="entry",
+                    details={"line": [float(c) for coord in self.line.coords for c in coord]},
+                )
+                crossing_type = None  # Reset for next crossing
+            elif crossing_type == "exit":
+                alert = Alert(
+                    rule_name=self.name,
+                    rule_type="fence",
+                    track_id=track_id,
+                    alert_type="exit",
+                    details={"line": [float(c) for coord in self.line.coords for c in coord]},
+                )
+                crossing_type = None  # Reset for next crossing
+
+            self._crossed[track_id] = (anchor_count, crossing_type)
+
         return alert
 
 
 class ZoneRule(BaseRule):
     """
     Zone (polygon) intrusion — detects enter / exit using Shapely point-in-polygon.
+
+    Foot-Point Anchor Logic:
+        The foot point must be inside the polygon for at least
+        ``ANCHOR_CONFIRMATION_FRAMES`` consecutive frames before a zone
+        intrusion alert is triggered. A swaying branch or passing shadow
+        that briefly enters the zone will not exceed the threshold.
     """
 
     def __init__(self, name: str, points: list[tuple[float, float]]) -> None:
@@ -134,31 +212,55 @@ class ZoneRule(BaseRule):
             self.polygon = self.polygon.buffer(0)  # attempt self-repair
         # track_id -> was_inside (bool)
         self._inside: dict[int, bool] = {}
+        # track_id -> consecutive frames inside the zone (anchor confirmation)
+        self._inside_count: dict[int, int] = {}
 
     def update(self, track_id: int, foot_point: tuple[int, int], **kwargs) -> Alert | None:
+        """Update zone rule for a track.
+
+        Foot-Point Anchor Logic:
+        - Count consecutive frames where the foot point is inside the zone
+        - Only trigger 'enter' alert after ANCHOR_CONFIRMATION_FRAMES
+        - This prevents false alarms from shadows, swaying branches, etc.
+        """
+        from core.config import settings
+
         pt = Point(foot_point)
         inside = self.polygon.contains(pt)
-        was_inside = self._inside.get(track_id, False)
 
-        alert: Alert | None = None
-        if not was_inside and inside:
-            alert = Alert(
-                rule_name=self.name,
-                rule_type="zone",
-                track_id=track_id,
-                alert_type="enter",
-                details={"polygon": [list(c) for c in self.polygon.exterior.coords]},
-            )
-        elif was_inside and not inside:
-            alert = Alert(
-                rule_name=self.name,
-                rule_type="zone",
-                track_id=track_id,
-                alert_type="exit",
-                details={"polygon": [list(c) for c in self.polygon.exterior.coords]},
-            )
+        # Count consecutive frames inside the zone
+        if inside:
+            self._inside_count[track_id] = self._inside_count.get(track_id, 0) + 1
+        else:
+            self._inside_count[track_id] = 0
 
         self._inside[track_id] = inside
+
+        anchor_frames = getattr(settings, 'ANCHOR_CONFIRMATION_FRAMES', 5)
+        alert: Alert | None = None
+
+        # Exit doesn't need anchor - we know for sure they left
+        if self._inside.get(track_id, False) != inside:
+            if inside:
+                # Entered zone - need anchor confirmation
+                if self._inside_count[track_id] >= anchor_frames:
+                    alert = Alert(
+                        rule_name=self.name,
+                        rule_type="zone",
+                        track_id=track_id,
+                        alert_type="enter",
+                        details={"polygon": [list(c) for c in self.polygon.exterior.coords]},
+                    )
+            else:
+                # Exited zone - no anchor needed for exit
+                alert = Alert(
+                    rule_name=self.name,
+                    rule_type="zone",
+                    track_id=track_id,
+                    alert_type="exit",
+                    details={"polygon": [list(c) for c in self.polygon.exterior.coords]},
+                )
+
         return alert
 
 
@@ -184,6 +286,8 @@ class LoiterRule(BaseRule):
         self.dwell_seconds = dwell_seconds if dwell_seconds is not None else settings.LOITER_SECONDS
         # track_id -> (entry_timestamp, has_alerted)
         self._state: dict[int, tuple[float, bool]] = {}
+        # track_id -> consecutive frames inside the zone (anchor confirmation)
+        self._inside_count: dict[int, int] = {}
 
     def update(
         self,
@@ -192,33 +296,43 @@ class LoiterRule(BaseRule):
         timestamp: float | None = None,
         **kwargs,
     ) -> Alert | None:
+        from core.config import settings
+
         ts = timestamp if timestamp is not None else time.time()
         pt = Point(foot_point)
         inside = self.polygon.contains(pt)
 
         entry_ts, has_alerted = self._state.get(track_id, (ts, False))
+        inside_count = self._inside_count.get(track_id, 0)
 
-        alert: Alert | None = None
+        # Anchor confirmation: count consecutive frames inside the zone
         if inside:
-            if not has_alerted and (ts - entry_ts) >= self.dwell_seconds:
-                alert = Alert(
-                    rule_name=self.name,
-                    rule_type="loiter",
-                    track_id=track_id,
-                    alert_type="loiter",
-                    details={
-                        "polygon": [list(c) for c in self.polygon.exterior.coords],
-                        "dwell_seconds": self.dwell_seconds,
-                        "actual_dwell": ts - entry_ts,
-                    },
-                )
-                self._state[track_id] = (entry_ts, True)
+            self._inside_count[track_id] = inside_count + 1
         else:
+            self._inside_count[track_id] = 0
             # Left the zone — reset
             self._state.pop(track_id, None)
+            return None
 
-        if inside and track_id not in self._state:
-            self._state[track_id] = (ts, False)
+        # Loiter requires both dwell time AND anchor confirmation
+        alert: Alert | None = None
+        anchor_frames = getattr(settings, 'ANCHOR_CONFIRMATION_FRAMES', 5)
+        dwell_met = (ts - entry_ts) >= self.dwell_seconds
+        anchor_met = self._inside_count[track_id] >= anchor_frames
+
+        if not has_alerted and dwell_met and anchor_met:
+            alert = Alert(
+                rule_name=self.name,
+                rule_type="loiter",
+                track_id=track_id,
+                alert_type="loiter",
+                details={
+                    "polygon": [list(c) for c in self.polygon.exterior.coords],
+                    "dwell_seconds": self.dwell_seconds,
+                    "actual_dwell": ts - entry_ts,
+                },
+            )
+            self._state[track_id] = (entry_ts, True)
 
         return alert
 
@@ -227,6 +341,13 @@ class DirectionRule(BaseRule):
     """
     Wrong-direction detection — fires when a track crosses a directed line
     in the *disallowed* direction.
+
+    Foot-Point Anchor Logic:
+        The foot point must be on the wrong side of the line for at least
+        ``ANCHOR_CONFIRMATION_FRAMES`` consecutive frames before a
+        ``wrong_direction`` alert is triggered. This prevents false alarms
+        from environmental factors like swaying branches that momentarily
+        cross the line.
 
     ``allowed_direction`` must be "entry" (left→right cross = + cross product)
     or "exit" (right→left cross = − cross product).  Any crossing opposite to
@@ -251,6 +372,8 @@ class DirectionRule(BaseRule):
         self.p2 = np.array([x2, y2], dtype=float)
         # track_id -> previous side (−1 / +1 / 0)
         self._side: dict[int, int] = {}
+        # track_id -> consecutive frames on current side (anchor confirmation)
+        self._anchor_count: dict[int, int] = {}
 
     @staticmethod
     def _cross(p1: np.ndarray, p2: np.ndarray, pt: np.ndarray) -> float:
@@ -265,40 +388,65 @@ class DirectionRule(BaseRule):
         return 0
 
     def update(self, track_id: int, foot_point: tuple[int, int], **kwargs) -> Alert | None:
+        """Update direction rule for a track.
+
+        Foot-Point Anchor Logic:
+        - Track which side of the line the foot point is on
+        - When crossing to a new side, start counting consecutive frames on that side
+        - Only trigger after ANCHOR_CONFIRMATION_FRAMES to avoid false alarms
+        """
+        from core.config import settings
+
         side = self._side_of(foot_point)
         prev_side = self._side.get(track_id, 0)
 
-        alert: Alert | None = None
-        crossed_entry = prev_side == -1 and side == 1
-        crossed_exit = prev_side == 1 and side == -1
+        # Always update the side tracking for this track
+        self._side[track_id] = side
 
-        if crossed_entry and self.allowed != "entry":
-            alert = Alert(
-                rule_name=self.name,
-                rule_type="direction",
-                track_id=track_id,
-                alert_type="wrong_direction",
-                details={
-                    "line": [float(c) for coord in self.line.coords for c in coord],
-                    "allowed": self.allowed,
-                    "actual": "entry",
-                },
-            )
-        elif crossed_exit and self.allowed != "exit":
-            alert = Alert(
-                rule_name=self.name,
-                rule_type="direction",
-                track_id=track_id,
-                alert_type="wrong_direction",
-                details={
-                    "line": [float(c) for coord in self.line.coords for c in coord],
-                    "allowed": self.allowed,
-                    "actual": "exit",
-                },
-            )
+        # Track crossing state
+        if not hasattr(self, '_crossed'):
+            self._crossed: dict[int, tuple[int, str]] = {}
 
+        crossed_state = self._crossed.get(track_id, (0, None))
+        anchor_count, crossing_type = crossed_state
+
+        # Check for side change (crossing event) - only when actually on a side, not on the line
+        side_changed = prev_side != 0 and prev_side != side
+
+        if side_changed:
+            # We just crossed - determine direction and reset counter
+            if prev_side == -1 and side == 1:
+                crossing_type = "entry"
+            elif prev_side == 1 and side == -1:
+                crossing_type = "exit"
+            else:
+                crossing_type = None
+            anchor_count = 0
+
+        # Count frames on current side
         if side != 0:
-            self._side[track_id] = side
+            anchor_count += 1
+            self._crossed[track_id] = (anchor_count, crossing_type)
+
+        anchor_frames = getattr(settings, 'ANCHOR_CONFIRMATION_FRAMES', 5)
+        alert: Alert | None = None
+
+        if anchor_count >= anchor_frames and crossing_type:
+            # Check if direction is wrong (opposite of allowed)
+            # crossing_type contains the direction we crossed in
+            if crossing_type != self.allowed:
+                alert = Alert(
+                    rule_name=self.name,
+                    rule_type="direction",
+                    track_id=track_id,
+                    alert_type="wrong_direction",
+                    details={
+                        "line": [float(c) for coord in self.line.coords for c in coord],
+                        "allowed": self.allowed,
+                        "actual": crossing_type,
+                    },
+                )
+
         return alert
 
 

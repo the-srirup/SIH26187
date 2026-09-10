@@ -5,6 +5,7 @@ import pytest
 import json
 from unittest.mock import Mock, patch
 from datetime import datetime, timezone
+import numpy as np
 
 from api.main import (
     generate_ai_explanation,
@@ -329,6 +330,43 @@ class TestHashChainIntegrity:
         hash2 = chain_hash(payload2, prev_hash)
 
         assert hash1 != hash2  # Should be sensitive to input changes
+
+
+class TestFaceAndANPRUtilities:
+    """Light-weight tests for new production-oriented face/ANPR code.
+
+    These tests intentionally avoid model download/loading because evaluating
+    that belongs in a smoke test, not the fast local test suite.
+    """
+
+    def test_anpr_plate_normalization(self, monkeypatch):
+        """ANPR should strip spaces/punctuation and prefer plate-like tokens."""
+        from core.config import settings
+        monkeypatch.setattr(settings, "ANPR_ENABLED", False)
+
+        from cv.anpr import ANPRProcessor
+        processor = ANPRProcessor()
+
+        assert processor.normalize_plate_text("WB 12-AB 3456") == "WB12AB3456"
+        assert processor._extract_most_plate_like("DL8CAF4943") == "DL8CAF4943"
+        assert processor._extract_most_plate_like("") is None
+
+    def test_face_embedding_normalization(self):
+        """Face embeddings must be normalized before watchlist matching."""
+        from cv.face import get_face_recognizer
+        fr = get_face_recognizer()
+        emb = np.ones(512, dtype=np.float32) * 2.0
+        normalized = fr._normalize_embedding(emb)
+        assert normalized.shape == (512,)
+        assert abs(float(np.linalg.norm(normalized)) - 1.0) < 1e-5
+
+    def test_face_metrics_available(self):
+        """FaceRecognizer exposes runtime metrics for status endpoints."""
+        from cv.face import get_face_recognizer
+        fr = get_face_recognizer()
+        metrics = fr.get_metrics()
+        for key in ["enabled", "watchlist_count", "threshold", "cached_tracks", "last_processed_frame"]:
+            assert key in metrics
 
 
 if __name__ == "__main__":

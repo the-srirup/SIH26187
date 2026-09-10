@@ -254,6 +254,7 @@ def serialize_camera(cam: models.Camera) -> dict:
         "url": cam.url,
         "location": cam.location,
         "is_active": cam.is_active,
+        "is_online": getattr(cam, 'is_online', True),  # Backwards compatible
     }
 
 
@@ -645,66 +646,23 @@ def generate_anchor_proof() -> dict:
 
 
 @app.get("/health")
-def health():
-    return {"status": "ok", "version": settings.VERSION, "timestamp": datetime.now(timezone.utc).isoformat()}
-
-
-@app.post("/api/anpr/languages")
-def set_anpr_languages(languages: str = Form(...)):
-    """Set the languages used for ANPR OCR (comma-separated)."""
-    from cv.anpr import EASYOCR_AVAILABLE
-
-    if not EASYOCR_AVAILABLE:
-        raise HTTPException(503, "EasyOCR not available")
-
-    lang_list = [lang.strip() for lang in languages.split(",") if lang.strip()]
-    if not lang_list:
-        lang_list = ["en"]  # Default fallback
-
-    processor = get_anpr_processor()
-    success = processor.set_languages(lang_list)
-
-    if not success:
-        raise HTTPException(500, "Failed to set ANPR languages")
-
+def health(db: Session = Depends(get_db_session)):
+    """Health check with camera status."""
+    cameras = db.query(models.Camera).all()
+    camera_status = [
+        {
+            "id": c.id,
+            "name": c.name,
+            "is_active": c.is_active,
+            "is_online": getattr(c, 'is_online', True)
+        }
+        for c in cameras
+    ]
     return {
-        "languages": processor.lang_list,
-        "message": f"ANPR languages set to: {', '.join(lang_list)}"
-    }
-
-
-@app.get("/api/anpr/test/{camera_id}")
-def test_anpr_on_camera(camera_id: int, db: Session = Depends(get_db_session)):
-    """Test ANPR on a specific camera's latest frame (for debugging/demo)."""
-    # Get the latest frame from the buffer
-    frame = FrameBuffer.get().get_frame(camera_id)
-    if frame is None:
-        raise HTTPException(404, "No frame available for camera")
-
-    # Run ANPR on the frame
-    processor = get_anpr_processor()
-    if not processor.is_available():
-        raise HTTPException(503, "ANPR not available")
-
-    # Preprocess and detect
-    processed_frame = processor.preprocess_for_indian_plates(frame)
-    detections = processor.detect_and_recognize(processed_frame)
-
-    # Format results
-    results = []
-    for detection in detections:
-        results.append({
-            "bbox": list(detection.bbox),
-            "plate_text": detection.plate_text,
-            "confidence": detection.text_confidence,
-            "detection_confidence": detection.confidence
-        })
-
-    return {
-        "camera_id": camera_id,
-        "frame_processed": True,
-        "detections": results,
-        "count": len(results)
+        "status": "ok",
+        "version": settings.VERSION,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "cameras": camera_status
     }
 
 
@@ -714,8 +672,19 @@ def test_anpr_on_camera(camera_id: int, db: Session = Depends(get_db_session)):
 
 
 @app.get("/api/system/info")
-def system_info():
+def system_info(db: Session = Depends(get_db_session)):
+    """System info with camera status (for verifying live camera integration)."""
     import torch
+    mgr = CameraManager.get()
+    cameras = mgr.list_cameras()
+    camera_status = []
+    for proc in cameras:
+        camera_status.append({
+            "camera_id": proc.camera_id,
+            "url": proc.url,
+            "is_online": proc._is_online,
+            "frame_count": proc._frame_count,
+        })
     return {
         "version": settings.VERSION,
         "python": __import__("sys").version.split()[0],
@@ -723,8 +692,9 @@ def system_info():
         "torch": torch.__version__ if torch else "not installed",
         "cuda_available": torch.cuda.is_available() if torch else False,
         "insightface": "available" if get_face_recognizer()._enabled else "not installed",
-        "active_cameras": len(CameraManager.get().list_cameras()),
+        "active_cameras": len(cameras),
         "explanation_cache_size": len(alert_explanations_cache),
+        "cameras": camera_status,
     }
 
 
@@ -1255,6 +1225,12 @@ def list_watchlist():
     return get_face_recognizer().get_watchlist()
 
 
+@app.get("/api/watchlist/status")
+def get_watchlist_status():
+    fr = get_face_recognizer()
+    return fr.get_metrics()
+
+
 @app.post("/api/watchlist")
 async def add_to_watchlist(
     name: str = Form(...),
@@ -1268,9 +1244,12 @@ async def add_to_watchlist(
     if not fr._enabled:
         raise HTTPException(503, "Face recognition not available (insightface not installed)")
 
+    content = await image.read()
+    if not content:
+        raise HTTPException(400, "Empty image file")
+
     # Save uploaded file temporarily
     with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
-        content = await image.read()
         tmp.write(content)
         tmp_path = tmp.name
 
@@ -1293,6 +1272,38 @@ async def add_to_watchlist(
     return {"id": watchlist_id, "name": name}
 
 
+@app.post("/api/watchlist/from-embedding")
+async def add_to_watchlist_from_embedding(
+    name: str = Form(...),
+    embedding: str = Form(...),
+    metadata: str = Form("{}"),
+):
+    """
+    Add a watchlist entry from a JSON-encoded embedding vector.
+
+    Useful for testing the matching pipeline without sending an actual image
+    through the browser. The embedding must be a 512-float JSON array.
+    """
+    import numpy as np
+
+    fr = get_face_recognizer()
+    try:
+        vector = np.asarray(json.loads(embedding), dtype=np.float32)
+    except (json.JSONDecodeError, ValueError, TypeError):
+        raise HTTPException(400, "embedding must be a JSON array of floats")
+
+    if vector.shape != (512,):
+        raise HTTPException(400, f"embedding must have exactly 512 elements, got {vector.size}")
+
+    try:
+        meta = json.loads(metadata) if isinstance(metadata, str) else {}
+    except json.JSONDecodeError:
+        meta = {}
+
+    watchlist_id = fr.add_watchlist_from_embedding(name, vector, meta)
+    return {"id": watchlist_id, "name": name}
+
+
 @app.delete("/api/watchlist/{watchlist_id}")
 def remove_from_watchlist(watchlist_id: int):
     fr = get_face_recognizer()
@@ -1309,6 +1320,39 @@ def set_watchlist_threshold(threshold: float = Form(...)):
     return {"threshold": threshold}
 
 
+@app.get("/api/face/test/{camera_id}")
+def test_face_on_camera(camera_id: int):
+    """Run face recognition on a camera's latest buffered frame."""
+    frame = FrameBuffer.get().get_frame(camera_id)
+    if frame is None:
+        raise HTTPException(404, "No frame available for camera")
+
+    fr = get_face_recognizer()
+    if not fr._enabled:
+        raise HTTPException(503, "Face recognition not available")
+
+    matches = fr.recognize(frame, detections=None, frame_number=0, force=True)
+    results = [
+        {
+            "bbox": list(m.bbox),
+            "track_id": m.track_id,
+            "matched": m.matched,
+            "watchlist_id": m.watchlist_id,
+            "watchlist_name": m.watchlist_name,
+            "similarity": round(float(m.similarity), 4),
+            "det_score": round(float(m.det_score), 4),
+        }
+        for m in matches
+    ]
+    return {
+        "camera_id": camera_id,
+        "frame_processed": True,
+        "matches": results,
+        "count": len(results),
+        "threshold": fr._similarity_threshold,
+    }
+
+
 # ANPR (Stretch Goal) Endpoints
 #
 
@@ -1320,9 +1364,10 @@ def get_anpr_status():
     return {
         "available": processor.is_available(),
         "enabled": settings.ANPR_ENABLED,
-        "languages": processor.lang_list if processor.is_available() else [],
+        "languages": processor.lang_list,
         "confidence_threshold": settings.ANPR_CONFIDENCE_THRESHOLD,
-        "easyocr_available": EASYOCR_AVAILABLE
+        "easyocr_available": EASYOCR_AVAILABLE,
+        "ocr_call_count": processor._ocr_call_count,
     }
 
 
@@ -1363,9 +1408,9 @@ def test_anpr_on_camera(camera_id: int, db: Session = Depends(get_db_session)):
     if not processor.is_available():
         raise HTTPException(503, "ANPR not available")
 
-    # Preprocess and detect
-    processed_frame = processor.preprocess_for_indian_plates(frame)
-    detections = processor.detect_and_recognize(processed_frame)
+    # Preprocess and detect. The camera buffer is already annotated, so we use
+    # full-frame fallback unless the caller provides detections.
+    detections = processor.recognize_plates(frame, vehicle_detections=None)
 
     # Format results
     results = []
@@ -1374,7 +1419,9 @@ def test_anpr_on_camera(camera_id: int, db: Session = Depends(get_db_session)):
             "bbox": list(detection.bbox),
             "plate_text": detection.plate_text,
             "confidence": detection.text_confidence,
-            "detection_confidence": detection.confidence
+            "detection_confidence": detection.confidence,
+            "vehicle_class": detection.vehicle_class,
+            "vehicle_track_id": detection.vehicle_track_id,
         })
 
     return {
@@ -1386,21 +1433,26 @@ def test_anpr_on_camera(camera_id: int, db: Session = Depends(get_db_session)):
 
 
 # --------------------------------------------------------------------------- #
-# System info / debug
+# System Endpoints (for dashboard and demo tools)
 # --------------------------------------------------------------------------- #
 
-
-@app.get("/api/system/info")
-def system_info():
-    import torch
+@app.post("/api/system/anchor-blockchain")
+def trigger_blockchain_anchor(db: Session = Depends(get_db_session)):
+    """
+    Manually trigger blockchain anchoring for the current chain tip.
+    Used by the hackathon demo to demonstrate tamper-evident logging.
+    """
+    anchor = generate_blockchain_anchor(db)
     return {
-        "version": settings.VERSION,
-        "python": __import__("sys").version.split()[0],
-        "opencv": cv2.__version__,
-        "torch": torch.__version__ if torch else "not installed",
-        "cuda_available": torch.cuda.is_available() if torch else False,
-        "insightface": "available" if get_face_recognizer()._enabled else "not installed",
-        "active_cameras": len(CameraManager.get().list_cameras()),
+        "success": True,
+        "anchor_data": {
+            "anchor_id": anchor.anchor_id,
+            "chain_tip_hash": anchor.chain_tip_hash,
+            "merkle_root": anchor.merkle_root,
+            "block_height": anchor.block_height,
+            "timestamp": anchor.timestamp,
+            "tx_hash": anchor.tx_hash
+        }
     }
 
 

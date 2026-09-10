@@ -112,6 +112,28 @@ def seed_demo():
     log.info("Demo data seeded successfully!")
 
 
+def update_demo_camera_urls():
+    """Point camera URLs at available demo footage."""
+    demo_dir = Path("videos")
+    demo_dir.mkdir(exist_ok=True)
+    demo_videos = sorted(demo_dir.glob("demo_cam*.mp4"))
+    fallback_video = Path("samples/sample_border_scenario.mp4")
+
+    db = SessionLocal()
+    try:
+        cameras = db.query(Camera).all()
+        for idx, cam in enumerate(cameras):
+            if demo_videos:
+                cam.url = str(demo_videos[idx % len(demo_videos)])
+            elif fallback_video.exists():
+                cam.url = str(fallback_video.resolve())
+            else:
+                cam.url = "0"
+        db.commit()
+    finally:
+        db.close()
+
+
 def run(args):
     """Launch the demo."""
     print("=" * 60)
@@ -132,12 +154,7 @@ def run(args):
     # Seed database
     seed_demo()
 
-    # Update camera URLs to point to demo videos
-    db = SessionLocal()
-    for cam in db.query(Camera).all():
-        cam.url = str(demo_dir / f"demo_cam{cam.id}.mp4")
-    db.commit()
-    db.close()
+    update_demo_camera_urls()
 
     print()
     print("🚀 Starting IBVAP server...")
@@ -161,5 +178,6 @@ if __name__ == "__main__":
 
     if args.skip_server:
         seed_demo()
+        update_demo_camera_urls()
     else:
         run(args)

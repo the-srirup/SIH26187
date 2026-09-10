@@ -5,15 +5,19 @@ Usage:
     python manage.py init          Initialize database and create tables
     python manage.py seed          Seed with demo cameras and rules
     python manage.py cameras       List all cameras
-    python manage.py camera add    Add a new camera
-    python manage.py camera rm     Remove a camera
+    python manage.py camera-add    Add a new camera (--url 0 for laptop webcam)
+    python manage.py camera-rm     Remove a camera
     python manage.py rules         List rules for a camera
-    python manage.py rule add      Add a rule
-    python manage.py rule rm       Remove a rule
+    python manage.py rule-add      Add a rule
+    python manage.py rule-rm       Remove a rule
     python manage.py integrity     Verify hash chain integrity
     python manage.py stats         Show alert statistics
     python manage.py reset         Reset database (dangerous!)
     python manage.py run           Start the server
+
+Examples:
+    python manage.py camera-add --name "Perimeter" --url 0 --location "North Gate"
+    python manage.py camera-add --name "Main Entrance" --url "rtsp://192.168.1.100/stream"
 """
 from __future__ import annotations
 
@@ -101,14 +105,23 @@ def cmd_cameras(args):
 
 
 def cmd_camera_add(args):
-    """Add a new camera."""
+    """Add a new camera and automatically start it if active."""
     init_db()
     db = SessionLocal()
-    cam = Camera(name=args.name, url=args.url, location=args.location or "")
+    cam = Camera(name=args.name, url=args.url, location=args.location or "", is_active=True, is_online=True)
     db.add(cam)
     db.commit()
     db.refresh(cam)
-    print(f"✅ Camera added: ID={cam.id}, Name='{cam.name}'")
+    print(f"✅ Camera added: ID={cam.id}, Name='{cam.name}', URL='{cam.url}'")
+
+    # Auto-start the camera processor
+    try:
+        from core.camera import CameraManager
+        CameraManager.get().add_camera(cam)
+        print(f"   -> Camera processor started (URL: {cam.url})")
+    except Exception as e:
+        print(f"   ⚠️  Failed to start processor: {e}")
+
     db.close()
 
 

@@ -1,16 +1,31 @@
 """
 Automatic Number Plate Recognition (ANPR) for IBVAP.
 
-Implements license plate detection and OCR using easyOCR.
-Designed as a stretch goal similar to face recognition.
-For production use with Indian license plates, would require
-fine-tuning on Indian plate datasets.
+The critical gap in the previous implementation was that ANPR ran OCR over
+the whole frame and merely returned text fragments; it did not actively
+extract license-plate candidates. This module now performs a proper two-stop
+edge pipeline:
+
+1. Vehicle-aware plate localization:
+   * Use YOLO vehicle detections (car/truck/bus/motorcycle) to crop likely
+     plate areas.
+   * Find high-contrast rectangular candidates using edge density, contour
+     geometry, aspect-ratio and area constraints.
+   * If YOLO misses a vehicle, the same candidate search runs on the full
+     frame as a fallback.
+2. OCR only the localized candidates with EasyOCR.
+
+This makes ANPR materially extract alphanumerics from license plates instead
+of transcribing arbitrary text from the frame.
 """
 from __future__ import annotations
 
 import logging
+import re
+import threading
+import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import Iterable, Optional
 
 import cv2
 import numpy as np
@@ -19,7 +34,6 @@ from core.config import settings
 
 log = logging.getLogger("ibvap.cv.anpr")
 
-# Optional import - easyOCR is a stretch dependency for ANPR
 try:
     import easyocr
     EASYOCR_AVAILABLE = True
@@ -38,148 +52,450 @@ class PlateDetection:
     text_confidence: float
     frame_number: int
     timestamp: float
+    vehicle_class: Optional[str] = None
+    vehicle_track_id: Optional[int] = None
 
 
 class ANPRProcessor:
     """
     License plate detection and OCR processor.
 
-    Uses a two-stage approach:
-    1. Plate detection (could use YOLO-plate or custom detector)
-    2. OCR on detected plate region (using easyOCR)
-
-    For Indian license plates, would require fine-tuning on
-    Indian plate datasets for optimal performance.
+    Uses EasyOCR for recognition and OpenCV morphological/contour search for
+    plate candidate localization. It is intentionally lazy: ``get_anpr_processor()``
+    instantiates the processor, but EasyOCR models load only when enabled.
     """
 
-    def __init__(self, lang_list: list[str] = None):
+    VEHICLE_CLASSES = {"car", "truck", "bus", "motorcycle", "motorbike", "van"}
+    PLATE_CHARS_RE = re.compile(r"[^A-Z0-9]+")
+    INDIAN_PLATE_RE = re.compile(
+        r"^[A-Z]{2}[0-9]{1,2}[A-Z]{0,3}[0-9]{1,4}[A-Z]?$"
+    )
+    LOOSE_PLATE_RE = re.compile(r"^[A-Z0-9]{6,12}$")
+
+    def __init__(self, lang_list: Optional[list[str]] = None):
         """
         Initialize ANPR processor.
 
         Args:
             lang_list: List of languages for easyOCR (default: ['en'] for Latin chars,
-                      would need ['hi', 'en'] for Indian plates with Devanagari)
+                      would need ['hi', 'en'] for Indian plates with Devanagari).
         """
-        self.lang_list = lang_list or ['en']  # Default to English/Latin characters
+        self.lang_list = lang_list or ["en"]
         self.reader = None
         self._initialized = False
+        self._detection_cache: list[PlateDetection] = []
+        self._last_inference_frame = -1
+        self._ocr_call_count = 0
+        self._reader_lock = threading.Lock()
 
-        if EASYOCR_AVAILABLE:
-            try:
-                self.reader = easyocr.Reader(self.lang_list)
-                self._initialized = True
-                log.info(f"ANPR processor initialized with languages: {self.lang_list}")
-            except Exception as e:
-                log.error(f"Failed to initialize EasyOCR: {e}")
-                self._initialized = False
-        else:
-            log.warning("ANPR processor created but EasyOCR not available")
+        if EASYOCR_AVAILABLE and settings.ANPR_ENABLED:
+            self._init_reader()
+
+    def _init_reader(self) -> None:
+        """Initialize EasyOCR reader."""
+        try:
+            self.reader = easyocr.Reader(self.lang_list)
+            self._initialized = True
+            log.info("ANPR processor initialized with languages: %s", self.lang_list)
+        except Exception as e:
+            log.error("Failed to initialize EasyOCR: %s", e)
+            self._initialized = False
+            self.reader = None
 
     def is_available(self) -> bool:
         """Check if ANPR functionality is available."""
-        return self._initialized and EASYOCR_AVAILABLE
+        return self._initialized and EASYOCR_AVAILABLE and self.reader is not None
 
-    def detect_and_recognize(self, frame: np.ndarray) -> list[PlateDetection]:
-        """
-        Detect license plates in frame and recognize text.
-
-        Args:
-            frame: Input frame (BGR format)
-
-        Returns:
-            List of PlateDetection objects
-        """
-        if not self.is_available():
-            return []
-
-        try:
-            # For now, we'll use a simple approach:
-            # Treat the entire frame as a potential plate region
-            # In a production system, you would:
-            # 1. Use a dedicated plate detector (YOLO-plate, Haar cascades, etc.)
-            # 2. Extract plate regions
-            # 3. Apply OCR to each region
-            #
-            # As a stretch goal implementation, we demonstrate the OCR capability
-            # on the full frame, which would work for clear plate close-ups
-
-            results = self.reader.readtext(frame)
-
-            detections = []
-            for (bbox, text, confidence) in results:
-                # Filter by confidence threshold
-                if confidence < settings.ANPR_CONFIDENCE_THRESHOLD:
-                    continue
-
-                # Convert bbox format
-                # easyOCR returns [[x1,y1], [x2,y2], [x3,y3], [x4,y4]]
-                points = np.array(bbox)
-                x1, y1 = points.min(axis=0).astype(int)
-                x2, y2 = points.max(axis=0).astype(int)
-
-                detection = PlateDetection(
-                    bbox=(x1, y1, x2, y2),
-                    confidence=float(confidence),
-                    plate_text=text.strip().upper(),
-                    text_confidence=float(confidence),
-                    frame_number=0,  # Would be set by caller
-                    timestamp=0.0    # Would be set by caller
-                )
-                detections.append(detection)
-
-            return detections
-
-        except Exception as e:
-            log.error(f"Error in ANPR processing: {e}")
-            return []
-
-    def preprocess_for_indian_plates(self, frame: np.ndarray) -> np.ndarray:
-        """
-        Preprocess frame for better Indian license plate recognition.
-        This would be enhanced with actual Indian plate training data.
-
-        Args:
-            frame: Input frame
-
-        Returns:
-            Preprocessed frame
-        """
-        # Convert to grayscale
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-        # Apply adaptive histogram equalization for better contrast
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        enhanced = clahe.apply(gray)
-
-        # Apply slight blur to reduce noise
-        blurred = cv2.GaussianBlur(enhanced, (3, 3), 0)
-
-        # Convert back to BGR for OCR
-        return cv2.cvtColor(blurred, cv2.COLOR_GRAY2BGR)
-
-    def set_languages(self, lang_list: list[str]):
+    def set_languages(self, lang_list: list[str]) -> bool:
         """Update the languages used for OCR."""
         if not EASYOCR_AVAILABLE:
             log.warning("Cannot set languages - EasyOCR not available")
             return False
 
         try:
-            self.lang_list = lang_list
+            self.lang_list = lang_list or ["en"]
             self.reader = easyocr.Reader(self.lang_list)
-            log.info(f"ANPR languages updated to: {self.lang_list}")
+            self._initialized = True
+            log.info("ANPR languages updated to: %s", self.lang_list)
             return True
         except Exception as e:
-            log.error(f"Failed to update ANPR languages: {e}")
+            log.error("Failed to update ANPR languages: %s", e)
             return False
+
+    # ------------------------------------------------------------------ #
+    # Public API
+    # ------------------------------------------------------------------ #
+
+    def recognize_plates(
+        self,
+        frame: np.ndarray,
+        vehicle_detections: Optional[list] = None,
+        frame_number: int = 0,
+        timestamp: Optional[float] = None,
+    ) -> list[PlateDetection]:
+        """
+        Actively localize and recognize license plates in the frame.
+
+        Parameters
+        ----------
+        frame:
+            BGR frame.
+        vehicle_detections:
+            YOLO detection objects. Each object should expose
+            ``bbox``, ``class_name`` and ``track_id``.
+        frame_number:
+            Processing frame number (zero-based).
+        timestamp:
+            Epoch timestamp. Defaults to ``time.time()``.
+
+        Returns
+        -------
+        list[PlateDetection]
+            Detected plates, sorted by confidence.
+        """
+        if not self.is_available():
+            return []
+
+        ts = timestamp if timestamp is not None else time.time()
+        processed = self.preprocess_for_indian_plates(frame)
+
+        vehicle_boxes = self._vehicle_boxes(vehicle_detections)
+        candidates: list[tuple[int, int, int, int, float, Optional[int], Optional[str]]] = []
+
+        # Vehicle-aware localization. Crop each vehicle and find plate candidates.
+        if vehicle_boxes:
+            h, w = processed.shape[:2]
+            for x1, y1, x2, y2, track_id, vehicle_class in vehicle_boxes:
+                if x2 <= x1 or y2 <= y1:
+                    continue
+
+                # Expand crop slightly. ANPR should look for the lower part of
+                # vehicle ROI, where most plates appear.
+                crop_x1 = max(0, x1 - 6)
+                crop_y1 = max(0, y1 + int((y2 - y1) * 0.45))
+                crop_x2 = min(w, x2 + 6)
+                crop_y2 = min(h, y2 + 6)
+                crop = processed[crop_y1:crop_y2, crop_x1:crop_x2]
+
+                local_candidates = self._find_plate_candidates(crop)
+                for lx1, ly1, lx2, ly2, score in local_candidates:
+                    candidates.append(
+                        (
+                            lx1 + crop_x1,
+                            ly1 + crop_y1,
+                            lx2 + crop_x1,
+                            ly2 + crop_y1,
+                            score,
+                            track_id,
+                            vehicle_class,
+                        )
+                    )
+
+        # Full-frame fallback for missed vehicles or test images with plates.
+        if not candidates:
+            for fx1, fy1, fx2, fy2, score in self._find_plate_candidates(processed):
+                candidates.append((fx1, fy1, fx2, fy2, score, None, None))
+
+        if not candidates:
+            self._detection_cache = []
+            return []
+
+        deduped = self._deduplicate_candidates(candidates)
+        detections: list[PlateDetection] = []
+        for x1, y1, x2, y2, score, track_id, vehicle_class in deduped:
+            plate_text, text_conf = self._ocr_region(processed, (x1, y1, x2, y2))
+            clean_text = self.normalize_plate_text(plate_text)
+            if not clean_text:
+                continue
+
+            # If OCR returns more than a plate-like string, keep the strongest
+            # alphanumeric token produced from the candidate.
+            clean_text = self._extract_most_plate_like(clean_text)
+            if not clean_text:
+                continue
+
+            detection = PlateDetection(
+                bbox=(x1, y1, x2, y2),
+                confidence=float(score),
+                plate_text=clean_text,
+                text_confidence=float(text_conf),
+                frame_number=frame_number,
+                timestamp=ts,
+                vehicle_class=vehicle_class,
+                vehicle_track_id=track_id,
+            )
+            detections.append(detection)
+
+        detections.sort(
+            key=lambda d: (d.text_confidence * 0.6 + d.confidence * 0.4),
+            reverse=True,
+        )
+        self._detection_cache = detections
+        self._last_inference_frame = frame_number
+        return detections
+
+    def detect_and_recognize(self, frame: np.ndarray) -> list[PlateDetection]:
+        """
+        Backward-compatible wrapper used by the ANPR test endpoint.
+
+        It runs the full-frame fallback path only, which is appropriate when
+        no YOLO detections are available.
+        """
+        return self.recognize_plates(frame, vehicle_detections=None)
+
+    # ------------------------------------------------------------------ #
+    # Preprocessing
+    # ------------------------------------------------------------------ #
+
+    def preprocess_for_indian_plates(self, frame: np.ndarray) -> np.ndarray:
+        """
+        Preprocess frame for better license-plate localization.
+
+        The returned image is kept as BGR because EasyOCR expects either RGB
+        or BGR and internally converts.
+        """
+        if frame is None:
+            return np.zeros((settings.FRAME_HEIGHT, settings.FRAME_WIDTH, 3), dtype=np.uint8)
+
+        grey = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        enhanced = clahe.apply(grey)
+        return cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
+
+    # ------------------------------------------------------------------ #
+    # Plate localization
+    # ------------------------------------------------------------------ #
+
+    def _vehicle_boxes(
+        self,
+        vehicle_detections: Optional[list],
+    ) -> list[tuple[int, int, int, int, Optional[int], Optional[str]]]:
+        boxes: list[tuple[int, int, int, int, Optional[int], Optional[str]]] = []
+        if not vehicle_detections:
+            return boxes
+
+        for det in vehicle_detections:
+            class_name = (getattr(det, "class_name", "") or "").lower()
+            if class_name not in self.VEHICLE_CLASSES:
+                continue
+            bbox = tuple(map(int, det.bbox))
+            if len(bbox) != 4:
+                continue
+            boxes.append(
+                (
+                    bbox[0],
+                    bbox[1],
+                    bbox[2],
+                    bbox[3],
+                    getattr(det, "track_id", None),
+                    class_name,
+                )
+            )
+        return boxes
+
+    def _find_plate_candidates(
+        self,
+        image_bgr: np.ndarray,
+    ) -> list[tuple[int, int, int, int, float]]:
+        """
+        Find high-contrast rectangular regions that look like license plates.
+
+        Returns ``(x1, y1, x2, y2, score)`` sorted best-first.
+        """
+        if image_bgr.size == 0:
+            return []
+
+        grey = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+        blurred = cv2.GaussianBlur(grey, (5, 5), 0)
+        edges = cv2.Canny(blurred, 80, 200)
+
+        # Morphologically close short edge gaps (plate border and characters).
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (17, 3))
+        closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=1)
+        closed = cv2.dilate(closed, kernel, iterations=1)
+
+        contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        candidates: list[tuple[int, int, int, int, float]] = []
+
+        for contour in contours:
+            x, y, w, h = cv2.boundingRect(contour)
+            if w < 50 or h < 15 or w * h < settings.ANPR_MIN_PLATE_AREA:
+                continue
+
+            aspect_ratio = w / float(h)
+            if not (settings.ANPR_MIN_ASPECT_RATIO <= aspect_ratio <= settings.ANPR_MAX_ASPECT_RATIO):
+                continue
+
+            area = cv2.contourArea(contour)
+            bbox_area = float(w * h)
+            if area <= 0:
+                continue
+
+            # License plates are usually rectangular. Reject very sparse or
+            # very filled blobs.
+            extent = area / bbox_area
+            if not (0.25 <= extent <= 0.95):
+                continue
+
+            roi_edges = edges[y : y + h, x : x + w]
+            edge_density = float(np.count_nonzero(roi_edges)) / float(roi_edges.size)
+            if edge_density < 0.03:
+                continue
+
+            # Score rewards plate-like edges and penalizes extreme sizes.
+            score = edge_density * extent
+            if 3.0 <= aspect_ratio <= 5.5:
+                score *= 1.25
+            candidates.append((x, y, x + w, y + h, score))
+
+        # Non-max suppression and score sorting.
+        candidates.sort(key=lambda c: c[4], reverse=True)
+        picked: list[tuple[int, int, int, int, float]] = []
+
+        def _iou(a, b):
+            ax1, ay1, ax2, ay2, _ = a
+            bx1, by1, bx2, by2, _ = b
+            ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+            ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+            inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+            a_area = max(1, (ax2 - ax1) * (ay2 - ay1))
+            b_area = max(1, (bx2 - bx1) * (by2 - by1))
+            return inter / float(a_area + b_area - inter)
+
+        for cand in candidates:
+            if not any(_iou(cand, kept) > 0.55 for kept in picked):
+                picked.append(cand[:5])
+            if len(picked) >= 4:
+                break
+
+        return picked
+
+    def _deduplicate_candidates(
+        self,
+        candidates: list[tuple[int, int, int, int, float, Optional[int], Optional[str]]],
+    ) -> list[tuple[int, int, int, int, float, Optional[int], Optional[str]]]:
+        """Deduplicate candidate boxes across full-frame and vehicle crops."""
+        deduped: list[tuple[int, int, int, int, float, Optional[int], Optional[str]]] = []
+
+        def _iou(a, b):
+            ax1, ay1, ax2, ay2 = a[:4]
+            bx1, by1, bx2, by2 = b[:4]
+            ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+            ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+            inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+            a_area = max(1, (ax2 - ax1) * (ay2 - ay1))
+            b_area = max(1, (bx2 - bx1) * (by2 - by1))
+            return inter / float(a_area + b_area - inter)
+
+        candidates = sorted(candidates, key=lambda c: c[4], reverse=True)
+        for cand in candidates:
+            if deduped and any(_iou(cand, kept) > 0.5 for kept in deduped):
+                continue
+            deduped.append(cand)
+        return deduped
+
+    # ------------------------------------------------------------------ #
+    # OCR
+    # ------------------------------------------------------------------ #
+
+    def _ocr_region(self, frame: np.ndarray, bbox: tuple[int, int, int, int]) -> tuple[str, float]:
+        """Run EasyOCR on a localized plate candidate."""
+        x1, y1, x2, y2 = bbox
+        roi = frame[y1:y2, x1:x2]
+        if roi.size == 0:
+            return "", 0.0
+
+        # Convert BGR->RGB because easyOCR documentation/pretrained models use
+        # RGB image input. Some installations are tolerant, but do this
+        # explicitly for consistency.
+        roi_rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
+        self._ocr_call_count += 1
+        with self._reader_lock:
+            try:
+                results = self.reader.readtext(
+                    roi_rgb,
+                    detail=1,
+                    paragraph=False,
+                    width_ths=0.65,
+                )
+            except Exception as e:
+                log.error("EasyOCR readtext failed: %s", e)
+                return "", 0.0
+
+        if not results:
+            return "", 0.0
+
+        text_parts: list[str] = []
+        confidences: list[float] = []
+        for (_bbox, text, conf) in results:
+            conf = float(conf)
+            if conf < settings.ANPR_CONFIDENCE_THRESHOLD:
+                continue
+            text_parts.append(text.strip().upper())
+            confidences.append(conf)
+
+        if not text_parts:
+            return "", 0.0
+
+        joined = "".join(text_parts)
+        return joined, max(confidences)
+
+    def normalize_plate_text(self, raw_text: str) -> str:
+        """
+        Normalize OCR output to uppercase alphanumeric plate characters.
+
+        This intentionally does not aggressively map O->0 or I->1 because a
+        little OCR ambiguity is safer to keep visible in the final string
+        (and for later re-verification) than to silently change evidence.
+        """
+        if not raw_text:
+            return ""
+        return self.PLATE_CHARS_RE.sub("", raw_text).upper()
+
+    def _extract_most_plate_like(self, clean_text: str) -> Optional[str]:
+        """
+        If OCR output includes extra text around the plate, pick the token
+        that best matches a plausibly Indian alphanumeric plate pattern.
+        """
+        if not clean_text:
+            return None
+
+        if self.INDIAN_PLATE_RE.match(clean_text):
+            return clean_text
+
+        # OCR may concatenate all tokens as one string in small ROIs.
+        # If the entire string is a plausible alphanumeric code, keep it.
+        if self.LOOSE_PLATE_RE.match(clean_text):
+            return clean_text
+
+        # Try splitting into plausible tokens and prefer the longest one.
+        tokens = re.findall(r"[A-Z0-9]{5,12}", clean_text)
+        if not tokens:
+            return None
+        return max(tokens, key=len)
+
+    def get_metrics(self) -> dict:
+        return {
+            "available": self.is_available(),
+            "languages": self.lang_list,
+            "ocr_call_count": self._ocr_call_count,
+            "last_inference_frame": self._last_inference_frame,
+        }
 
 
 # Global ANPR processor instance (lazy initialized)
 _anpr_processor: Optional[ANPRProcessor] = None
+_anpr_lock = None
 
 
 def get_anpr_processor() -> ANPRProcessor:
     """Get or create the global ANPR processor instance."""
-    global _anpr_processor
-    if _anpr_processor is None:
-        _anpr_processor = ANPRProcessor()
-    return _anpr_processor
+    global _anpr_processor, _anpr_lock  # noqa: PLW0602
+    if _anpr_lock is None:
+        import threading
+        _anpr_lock = threading.Lock()
+
+    with _anpr_lock:
+        if _anpr_processor is None:
+            _anpr_processor = ANPRProcessor()
+        return _anpr_processor

@@ -19,6 +19,7 @@ class Camera(Base):
     url = Column(String(500), nullable=False)
     location = Column(String(200))
     is_active = Column(Boolean, default=True)
+    is_online = Column(Boolean, default=True)  # Track camera stream health
 
     rules = relationship("Rule", back_populates="camera", cascade="all, delete-orphan")
     alerts = relationship("Alert", back_populates="camera", cascade="all, delete-orphan")
@@ -63,3 +64,22 @@ class Alert(Base):
 
     def __repr__(self) -> str:
         return f"<Alert {self.id} type={self.alert_type} cam={self.camera_id}>"
+
+
+class WatchlistEntry(Base):
+    """Persistent face watchlist entry.
+
+    ``embedding_json`` stores the normalized ArcFace embedding as a compact
+    JSON string, which is easy to inspect, export, and back up at the edge.
+    """
+
+    __tablename__ = "watchlist_entries"
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String(120), nullable=False)
+    embedding_json = Column(Text, nullable=False)
+    metadata_json = Column(Text, default="{}")
+    created_at = Column(String(64), default="")
+
+    def __repr__(self) -> str:
+        return f"<WatchlistEntry {self.id} name={self.name}>"

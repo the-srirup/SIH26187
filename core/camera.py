@@ -227,6 +227,15 @@ class CameraProcessor:
     _cap: Optional[cv2.VideoCapture] = field(default=None, init=False)
     _frame_count: int = field(default=0, init=False)
     _anpr_results: list = field(default_factory=list, init=False)
+    _face_results: list = field(default_factory=list, init=False)
+    _consecutive_failures: int = field(default=0, init=False)
+    _is_online: bool = field(default=True, init=False)
+    _last_successful_frame: float = field(default_factory=time.time, init=False)
+    _offline_threshold: float = field(default=5.0, init=False)  # Seconds without frame before marking offline
+    _face_alert_debounce: dict = field(default_factory=dict, init=False)
+    _anpr_alert_debounce: dict = field(default_factory=dict, init=False)
+    _last_reconnect_attempt: float = field(default=0.0, init=False)
+    _reconnect_interval: float = field(default=5.0, init=False)  # seconds
 
     def __post_init__(self) -> None:
         self.claher = LowLightEnhancer()
@@ -288,8 +297,12 @@ class CameraProcessor:
     # ------------------------------------------------------------------ #
     # Video capture
     # ------------------------------------------------------------------ #
-    def _open_capture(self) -> cv2.VideoCapture:
-        """Open video source with retries and fallback."""
+    def _open_capture(self) -> Optional[cv2.VideoCapture]:
+        """Open a video source.
+
+        Returns ``None`` when the source cannot be opened so the processor can
+        back off cleanly instead of repeatedly triggering OpenCV warnings.
+        """
         # If URL is a digit, treat as webcam index
         if self.url.isdigit():
             src = int(self.url)
@@ -298,9 +311,9 @@ class CameraProcessor:
 
         cap = cv2.VideoCapture(src)
         if not cap.isOpened():
-            # Fallback: synthetic test pattern
-            log.warning("Failed to open %s, using synthetic frames", self.url)
-            cap = cv2.VideoCapture(self._synthetic_generator())
+            log.warning("Failed to open video source: %s", self.url)
+            cap.release()
+            return None
         return cap
 
     @staticmethod
@@ -313,9 +326,21 @@ class CameraProcessor:
         )
 
     def _read_frame(self) -> Optional[np.ndarray]:
-        """Read one frame, handling reconnection and looped playback."""
+        """Read one frame, handling reconnection and looped playback.
+
+        Reconnection is rate-limited. If a finite file reaches EOF it loops
+        back to the first frame; if a network/file source failed, we wait a
+        configurable backoff before retrying. The camera thread marks the
+        camera offline via ``_update_camera_status`` until a frame appears.
+        """
         if self._cap is None:
+            now = time.time()
+            if now - self._last_reconnect_attempt < self._reconnect_interval:
+                return None
+            self._last_reconnect_attempt = now
             self._cap = self._open_capture()
+            if self._cap is None:
+                return None
 
         ok, frame = self._cap.read()
         if not ok:
@@ -330,12 +355,12 @@ class CameraProcessor:
                 if ok:
                     log.info("Looped video back to frame 0")
             if not ok:
-                log.warning("Reconnect attempt...")
+                # Release and rate-limit the next reconnect. Do not grind the
+                # CPU / flood logs if an IP camera or RTSP stream is down.
                 self._cap.release()
-                self._cap = self._open_capture()
-                ok, frame = self._cap.read()
-                if not ok:
-                    return None
+                self._cap = None
+                self._last_reconnect_attempt = time.time()
+                return None
 
         # Resize for consistent processing
         frame = cv2.resize(frame, (settings.FRAME_WIDTH, settings.FRAME_HEIGHT))
@@ -344,9 +369,26 @@ class CameraProcessor:
     # ------------------------------------------------------------------ #
     # Main loop
     # ------------------------------------------------------------------ #
+    def _update_camera_status(self, is_online: bool) -> None:
+        """Update camera's online status in the database."""
+        db = SessionLocal()
+        try:
+            cam = db.query(Camera).filter(Camera.id == self.camera_id).first()
+            if cam:
+                cam.is_online = is_online
+                db.commit()
+                status = "online" if is_online else "offline"
+                log.info("Camera %d marked as %s", self.camera_id, status)
+        except Exception as e:
+            log.error("Failed to update camera status: %s", e)
+            db.rollback()
+        finally:
+            db.close()
+
     def run(self) -> None:
         """Main processing loop — runs in background thread."""
         self._running = True
+        self._is_online = True
         log.info("Camera %d processor started", self.camera_id)
 
         frame_interval = 1.0 / settings.TARGET_FPS
@@ -357,8 +399,23 @@ class CameraProcessor:
 
             frame = self._read_frame()
             if frame is None:
-                time.sleep(0.1)
+                self._consecutive_failures += 1
+                # Check if we should mark camera as offline
+                if self._is_online and self._consecutive_failures > 3:
+                    self._is_online = False
+                    self._update_camera_status(False)
+                # Try to reconnect periodically
+                time.sleep(0.5)
                 continue
+
+            # Reset failure counter on successful frame
+            if self._consecutive_failures > 0:
+                self._consecutive_failures = 0
+                # Check if camera recovered
+                if not self._is_online:
+                    self._is_online = True
+                    self._update_camera_status(True)
+                    log.info("Camera %d recovered - stream restored", self.camera_id)
 
             # Low-light enhancement
             frame = self.claher.maybe_enhance(frame)
@@ -366,18 +423,29 @@ class CameraProcessor:
             # Detect + track
             detections = self.detector.track(frame)
 
-            # Face recognition (if enabled)
+            # Face recognition (if enabled). Results are drawn in
+            # ``_annotate_frame`` and matched faces are persisted as alerts.
+            self._face_results = []
             if self.face_recognizer:
-                face_results = self.face_recognizer.recognize(frame)
-                # Could trigger face alerts here
+                self._face_results = self.face_recognizer.recognize(
+                    frame,
+                    detections=detections,
+                    frame_number=self._frame_count,
+                )
+                for match in self._face_results:
+                    if match.matched:
+                        self._persist_face_alert(match, frame, detections)
 
             # ANPR processing (if enabled)
             self._anpr_results = []
             if self._anpr_processor and self._anpr_processor.is_available():
-                # Preprocess for better Indian plate recognition if needed
-                processed_frame = self._anpr_processor.preprocess_for_indian_plates(frame)
-                self._anpr_results = self._anpr_processor.detect_and_recognize(processed_frame)
-                # Could trigger ANPR-based alerts here (e.g., watchlist plate matching)
+                self._anpr_results = self._anpr_processor.recognize_plates(
+                    frame,
+                    vehicle_detections=detections,
+                    frame_number=self._frame_count,
+                )
+                for plate in self._anpr_results:
+                    self._persist_anpr_alert(plate, frame, detections)
 
             # Run rules engine
             alerts = []
@@ -408,19 +476,30 @@ class CameraProcessor:
         log.info("Camera %d processor stopped", self.camera_id)
 
     def _persist_alert(
-        self, rule_alert: RuleAlert, frame: np.ndarray, detections: list
+        self,
+        rule_alert: RuleAlert,
+        frame: np.ndarray,
+        detections: list,
+        override_object_class: Optional[str] = None,
+        override_confidence: Optional[float] = None,
+        override_track_id: Optional[int] = None,
     ) -> None:
         """Save alert to DB with hash chain and start evidence clip."""
         db = SessionLocal()
         try:
             # Find object class for this track
-            obj_class = ""
-            confidence = 0.0
-            for det in detections:
-                if det.track_id == rule_alert.track_id:
-                    obj_class = det.class_name
-                    confidence = det.confidence
-                    break
+            obj_class = override_object_class
+            confidence = override_confidence
+            if obj_class is None or confidence is None:
+                obj_class = obj_class or ""
+                confidence = confidence if confidence is not None else 0.0
+                for det in detections:
+                    if det.track_id == (override_track_id if override_track_id is not None else rule_alert.track_id):
+                        obj_class = det.class_name
+                        confidence = det.confidence
+                        break
+
+            track_id = override_track_id if override_track_id is not None else rule_alert.track_id
 
             # Hash chain - get previous hash
             prev_hash = latest_chain_hash(db)
@@ -432,7 +511,7 @@ class CameraProcessor:
                 camera_id=self.camera_id,
                 alert_type=rule_alert.alert_type,
                 object_class=obj_class,
-                track_id=rule_alert.track_id,
+                track_id=track_id,
                 confidence=confidence,
                 timestamp=timestamp,
                 snapshot_path="",  # will be set after ID known
@@ -483,11 +562,80 @@ class CameraProcessor:
         finally:
             db.close()
 
+    def _persist_face_alert(self, match, frame: np.ndarray, detections: list) -> None:
+        """Persist a watchlist face match as a tamper-evident alert."""
+        key = (match.watchlist_id, match.track_id)
+        now = time.time()
+        last = self._face_alert_debounce.get(key, 0.0)
+        if now - last < settings.FACE_ALERT_DEBOUNCE_SECONDS:
+            return
+
+        if match.watchlist_name is None:
+            return
+
+        self._face_alert_debounce[key] = now
+        alert = RuleAlert(
+            rule_name="face_watchlist",
+            rule_type="face",
+            track_id=match.track_id if match.track_id is not None else 0,
+            alert_type="watchlist_match",
+            details={
+                "watchlist_id": match.watchlist_id,
+                "watchlist_name": match.watchlist_name,
+                "similarity": round(float(match.similarity), 4),
+            },
+        )
+        self._persist_alert(
+            alert,
+            frame,
+            detections,
+            override_object_class="face",
+            override_confidence=float(match.similarity),
+            override_track_id=alert.track_id,
+        )
+
+    def _persist_anpr_alert(self, plate, frame: np.ndarray, detections: list) -> None:
+        """Persist a recognized number plate as an ANPR alert."""
+        if not plate.plate_text:
+            return
+
+        key = (plate.plate_text, plate.vehicle_track_id)
+        now = time.time()
+        last = self._anpr_alert_debounce.get(key, 0.0)
+        if now - last < settings.ANPR_ALERT_DEBOUNCE_SECONDS:
+            return
+
+        self._anpr_alert_debounce[key] = now
+        alert = RuleAlert(
+            rule_name="anpr",
+            rule_type="anpr",
+            track_id=plate.vehicle_track_id if plate.vehicle_track_id is not None else 0,
+            alert_type="anpr_detection",
+            details={
+                "plate_text": plate.plate_text,
+                "text_confidence": round(float(plate.text_confidence), 4),
+                "localization_confidence": round(float(plate.confidence), 4),
+                "vehicle_class": plate.vehicle_class or "unknown",
+            },
+        )
+        self._persist_alert(
+            alert,
+            frame,
+            detections,
+            override_object_class=plate.vehicle_class or "vehicle",
+            override_confidence=float(plate.text_confidence),
+            override_track_id=alert.track_id,
+        )
+
     def _annotate_frame(
         self, frame: np.ndarray, detections: list, alerts: list
     ) -> np.ndarray:
         """Draw boxes, tracks, rules, and alerts on frame for streaming."""
         out = frame.copy()
+
+        # Draw watchlist face matches first so object boxes don't hide them.
+        if self._face_results:
+            out = self.face_recognizer.draw_matches(out, self._face_results)
 
         # Draw detections
         for det in detections:
@@ -634,4 +782,3 @@ class CameraManager:
         for proc in list(self._cameras.values()):
             proc.stop()
         self._cameras.clear()
-
