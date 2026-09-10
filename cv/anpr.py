@@ -80,31 +80,70 @@ class ANPRProcessor:
             lang_list: List of languages for easyOCR (default: ['en'] for Latin chars,
                       would need ['hi', 'en'] for Indian plates with Devanagari).
         """
-        self.lang_list = lang_list or ["en"]
+        self.lang_list = lang_list or [
+            lang.strip() for lang in settings.ANPR_LANGUAGES.split(",") if lang.strip()
+        ] or ["en"]
         self.reader = None
         self._initialized = False
+        self._init_failed = False
         self._detection_cache: list[PlateDetection] = []
         self._last_inference_frame = -1
         self._ocr_call_count = 0
+        self._ocr_ms_total = 0.0
         self._reader_lock = threading.Lock()
-
-        if EASYOCR_AVAILABLE and settings.ANPR_ENABLED:
-            self._init_reader()
+        self._init_lock = threading.Lock()
+        self._event_debounce: dict[tuple, float] = {}
+        self._gpu = False
+        self._plates_read = 0
+        self._plates_uncertain = 0
 
     def _init_reader(self) -> None:
-        """Initialize EasyOCR reader."""
+        """
+        Load the EasyOCR reader (~5-10 s, several hundred MB).
+
+        Deliberately lazy: the previous build loaded this during application
+        startup even on deployments that never see a vehicle, delaying the
+        dashboard coming up.  It now loads on the first frame that actually
+        contains a vehicle.
+        """
         try:
-            self.reader = easyocr.Reader(self.lang_list)
+            gpu = False
+            try:
+                import torch
+
+                gpu = bool(torch.cuda.is_available())
+            except Exception:
+                pass
+            self.reader = easyocr.Reader(self.lang_list, gpu=gpu, verbose=False)
+            self._gpu = gpu
             self._initialized = True
-            log.info("ANPR processor initialized with languages: %s", self.lang_list)
+            log.info(
+                "ANPR reader ready — languages=%s device=%s",
+                self.lang_list, "cuda" if gpu else "cpu",
+            )
         except Exception as e:
             log.error("Failed to initialize EasyOCR: %s", e)
             self._initialized = False
+            self._init_failed = True
             self.reader = None
 
     def is_available(self) -> bool:
-        """Check if ANPR functionality is available."""
-        return self._initialized and EASYOCR_AVAILABLE and self.reader is not None
+        """
+        True when OCR can run. Triggers the one-time model load if needed.
+
+        Returns False (rather than raising) when EasyOCR is missing or failed
+        to load, so the rest of the surveillance pipeline is unaffected.
+        """
+        if not (EASYOCR_AVAILABLE and settings.ANPR_ENABLED):
+            return False
+        if self._initialized:
+            return True
+        if self._init_failed:
+            return False
+        with self._init_lock:
+            if not self._initialized and not self._init_failed:
+                self._init_reader()
+        return self._initialized and self.reader is not None
 
     def set_languages(self, lang_list: list[str]) -> bool:
         """Update the languages used for OCR."""
@@ -114,7 +153,8 @@ class ANPRProcessor:
 
         try:
             self.lang_list = lang_list or ["en"]
-            self.reader = easyocr.Reader(self.lang_list)
+            self._init_failed = False
+            self.reader = easyocr.Reader(self.lang_list, gpu=self._gpu, verbose=False)
             self._initialized = True
             log.info("ANPR languages updated to: %s", self.lang_list)
             return True
@@ -201,6 +241,11 @@ class ANPRProcessor:
             return []
 
         deduped = self._deduplicate_candidates(candidates)
+        # OCR is by far the most expensive stage; only the strongest candidates
+        # are read, bounding worst-case latency per analytics frame.
+        deduped = sorted(deduped, key=lambda c: c[4], reverse=True)
+        deduped = deduped[: max(1, int(settings.ANPR_MAX_PLATES_PER_TICK))]
+
         detections: list[PlateDetection] = []
         for x1, y1, x2, y2, score, track_id, vehicle_class in deduped:
             plate_text, text_conf = self._ocr_region(processed, (x1, y1, x2, y2))
@@ -208,17 +253,24 @@ class ANPRProcessor:
             if not clean_text:
                 continue
 
-            # If OCR returns more than a plate-like string, keep the strongest
-            # alphanumeric token produced from the candidate.
-            clean_text = self._extract_most_plate_like(clean_text)
-            if not clean_text:
+            best = self._extract_most_plate_like(clean_text)
+            if not best:
                 continue
+
+            # Reward a read that matches the Indian plate grammar; penalise a
+            # string that is merely alphanumeric noise of the right length.
+            structured = bool(self.INDIAN_PLATE_RE.match(best))
+            adjusted = float(text_conf) * (1.0 if structured else 0.75)
+            if adjusted >= settings.ANPR_CONFIDENCE_THRESHOLD:
+                self._plates_read += 1
+            else:
+                self._plates_uncertain += 1
 
             detection = PlateDetection(
                 bbox=(x1, y1, x2, y2),
                 confidence=float(score),
-                plate_text=clean_text,
-                text_confidence=float(text_conf),
+                plate_text=self.format_indian_plate(best) if structured else best,
+                text_confidence=adjusted,
                 frame_number=frame_number,
                 timestamp=ts,
                 vehicle_class=vehicle_class,
@@ -410,6 +462,7 @@ class ANPRProcessor:
         # explicitly for consistency.
         roi_rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
         self._ocr_call_count += 1
+        started = time.perf_counter()
         with self._reader_lock:
             try:
                 results = self.reader.readtext(
@@ -417,28 +470,39 @@ class ANPRProcessor:
                     detail=1,
                     paragraph=False,
                     width_ths=0.65,
+                    allowlist="ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
                 )
             except Exception as e:
                 log.error("EasyOCR readtext failed: %s", e)
                 return "", 0.0
+            finally:
+                self._ocr_ms_total += (time.perf_counter() - started) * 1000.0
 
         if not results:
             return "", 0.0
 
+        # Keep every read and report the confidence honestly. Discarding
+        # low-confidence reads here (as the previous build did) made it
+        # impossible to distinguish "no plate" from "plate I could not read",
+        # so a marginal plate silently vanished instead of surfacing as
+        # PLATE UNCERTAIN.
         text_parts: list[str] = []
         confidences: list[float] = []
         for (_bbox, text, conf) in results:
-            conf = float(conf)
-            if conf < settings.ANPR_CONFIDENCE_THRESHOLD:
+            cleaned = text.strip().upper()
+            if not cleaned:
                 continue
-            text_parts.append(text.strip().upper())
-            confidences.append(conf)
+            text_parts.append(cleaned)
+            confidences.append(float(conf))
 
         if not text_parts:
             return "", 0.0
 
-        joined = "".join(text_parts)
-        return joined, max(confidences)
+        # Weight by character count: a 9-character read at 0.6 is a better
+        # plate candidate than a 1-character read at 0.95.
+        total_chars = sum(len(t) for t in text_parts) or 1
+        weighted = sum(c * len(t) for c, t in zip(confidences, text_parts)) / total_chars
+        return "".join(text_parts), float(weighted)
 
     def normalize_plate_text(self, raw_text: str) -> str:
         """
@@ -474,11 +538,89 @@ class ANPRProcessor:
             return None
         return max(tokens, key=len)
 
+    # ------------------------------------------------------------------ #
+    # Pipeline integration
+    # ------------------------------------------------------------------ #
+
+    def cached_detections(self) -> list[PlateDetection]:
+        """Last OCR result set, reused between cadence ticks."""
+        return list(self._detection_cache)
+
+    @staticmethod
+    def format_indian_plate(text: str) -> str:
+        """
+        Group a validated plate the way it is printed: ``MH12AB1234`` ->
+        ``MH 12 AB 1234``.  Purely presentational; the raw string is kept in
+        the event details so the evidence is not reshaped.
+        """
+        match = re.match(r"^([A-Z]{2})([0-9]{1,2})([A-Z]{0,3})([0-9]{1,4})([A-Z]?)$", text)
+        if not match:
+            return text
+        return " ".join(part for part in match.groups() if part)
+
+    def build_event(self, plate: PlateDetection):
+        """
+        Build a debounced ANPR event, or ``None``.
+
+        A read below ``ANPR_ALERT_CONFIDENCE`` is *not* logged as a plate
+        number — writing a guessed registration into an evidentiary log is
+        worse than logging nothing.  The overlay still shows it live as
+        PLATE UNCERTAIN so the operator knows a plate was seen.
+        """
+        from cv.rules import Alert as RuleAlert
+
+        if not plate.plate_text:
+            return None
+        if plate.text_confidence < settings.ANPR_ALERT_CONFIDENCE:
+            return None
+
+        track_id = int(plate.vehicle_track_id or 0)
+        key = (plate.plate_text, track_id)
+        now = time.time()
+        last = self._event_debounce.get(key, 0.0)
+        if now - last < settings.ANPR_ALERT_DEBOUNCE_SECONDS:
+            return None
+        self._event_debounce[key] = now
+        if len(self._event_debounce) > 256:
+            self._event_debounce = {
+                k: v for k, v in self._event_debounce.items() if now - v < 600
+            }
+
+        verified = bool(self.INDIAN_PLATE_RE.match(plate.plate_text.replace(" ", "")))
+        return RuleAlert(
+            rule_name="anpr", rule_type="anpr", track_id=track_id,
+            alert_type="anpr_detection",
+            description=(
+                f"Number plate read: {plate.plate_text} "
+                f"({plate.text_confidence * 100:.0f}% OCR confidence"
+                f"{', matches Indian plate format' if verified else ''})"
+            ),
+            details={
+                "plate_text": plate.plate_text,
+                "plate_raw": plate.plate_text.replace(" ", ""),
+                "ocr_confidence": round(float(plate.text_confidence), 4),
+                "localization_confidence": round(float(plate.confidence), 4),
+                "format_verified": verified,
+                "vehicle_class": plate.vehicle_class or "unknown",
+                "bbox": list(plate.bbox),
+            },
+        )
+
     def get_metrics(self) -> dict:
+        calls = max(1, self._ocr_call_count)
         return {
             "available": self.is_available(),
+            "enabled": settings.ANPR_ENABLED,
+            "easyocr_installed": EASYOCR_AVAILABLE,
             "languages": self.lang_list,
+            "device": "cuda" if self._gpu else "cpu",
             "ocr_call_count": self._ocr_call_count,
+            "ocr_ms_avg": round(self._ocr_ms_total / calls, 1),
+            "plates_confident": self._plates_read,
+            "plates_uncertain": self._plates_uncertain,
+            "cadence_frames": settings.ANPR_EVERY_N_FRAMES,
+            "confidence_threshold": settings.ANPR_CONFIDENCE_THRESHOLD,
+            "alert_confidence": settings.ANPR_ALERT_CONFIDENCE,
             "last_inference_frame": self._last_inference_frame,
         }
 

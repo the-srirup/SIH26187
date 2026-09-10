@@ -1,109 +1,255 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>IBVAP — Intelligent Border Video Analytics</title>
-    <link rel="stylesheet" href="/static/css/style.css">
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>IBVAP — Border Surveillance Command</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🛡️</text></svg>">
+<link rel="stylesheet" href="/static/css/style.css?v=2.0.2">
 </head>
 <body>
-    <header class="topbar">
-        <div class="topbar-brand">
-            <span class="brand-icon">🛡️</span>
-            <h1>IBVAP</h1>
-            <span class="brand-sub">Intelligent Border Video Analytics</span>
-        </div>
-        <div class="topbar-right">
-            <span id="clock" class="clock"></span>
-            <button id="btn-integrity" class="btn btn-outline" onclick="verifyIntegrity()">
-                🔗 Verify Log Integrity
-            </button>
-            <div id="integrity-badge" class="badge badge-unknown">—</div>
-        </div>
-    </header>
 
-    <main class="layout">
-        <!-- Left: Camera Grid -->
-        <section class="cameras-section">
-            <div class="section-header">
-                <h2>Live Feeds</h2>
-                <button class="btn btn-primary" onclick="openAddCamera()">+ Add Camera</button>
-            </div>
-            <div id="camera-grid" class="camera-grid">
-                <div class="camera-tile loading">
-                    <div class="spinner"></div>
-                    <p>Loading cameras...</p>
-                </div>
-            </div>
-        </section>
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark">IB</span>
+    <div class="brand-text">
+      <h1>IBVAP</h1>
+      <p>Intelligent Border Video Analytics Platform</p>
+    </div>
+  </div>
 
-        <!-- Right: Alert Feed -->
-        <section class="alerts-section">
-            <div class="section-header">
-                <h2>Alerts</h2>
-                <select id="alert-filter" onchange="loadAlerts()" class="filter-select">
-                    <option value="">All Types</option>
-                    <option value="entry">Entry</option>
-                    <option value="exit">Exit</option>
-                    <option value="loiter">Loiter</option>
-                    <option value="wrong_direction">Wrong Direction</option>
-                    <option value="enter">Zone Enter</option>
-                </select>
-            </div>
-            <div id="alert-feed" class="alert-feed">
-                <p class="empty-state">Waiting for alerts...</p>
-            </div>
-        </section>
-    </main>
+  <div class="topbar-status">
+    <div class="status-pill" id="system-status">
+      <span class="dot dot-pending"></span><span id="system-status-text">CONNECTING</span>
+    </div>
+    <div class="clock-block">
+      <span class="clock" id="clock">--:--:--</span>
+      <span class="clock-date" id="clock-date">Indian Standard Time</span>
+    </div>
+  </div>
 
-    <!-- Alert Detail Modal -->
-    <div id="alert-modal" class="modal" onclick="if(event.target===this)closeModal()">
-        <div class="modal-content">
-            <span class="modal-close" onclick="closeModal()">&times;</span>
-            <div id="modal-body"></div>
+  <nav class="topbar-actions">
+    <button class="btn btn-ghost" data-view="operations" onclick="IBVAP.showView('operations')">Operations</button>
+    <button class="btn btn-ghost" data-view="events" onclick="IBVAP.showView('events')">Event Log</button>
+    <button class="btn btn-ghost" data-view="analyze" onclick="IBVAP.showView('analyze')">Analyze Video</button>
+    <button class="btn btn-ghost" data-view="system" onclick="IBVAP.showView('system')">System</button>
+    <button class="btn btn-verify" onclick="IBVAP.verifyIntegrity()">
+      <span class="btn-icon">🔗</span> Verify Log Integrity
+    </button>
+    <span class="badge badge-idle" id="integrity-badge">NOT CHECKED</span>
+  </nav>
+</header>
+
+<div class="statbar" id="statbar">
+  <div class="stat"><span class="stat-label">Active Cameras</span><span class="stat-value" id="stat-cameras">0<small>/0</small></span></div>
+  <div class="stat"><span class="stat-label">Persons</span><span class="stat-value" id="stat-persons">0</span></div>
+  <div class="stat"><span class="stat-label">Vehicles</span><span class="stat-value" id="stat-vehicles">0</span></div>
+  <div class="stat"><span class="stat-label">Events Today</span><span class="stat-value" id="stat-today">0</span></div>
+  <div class="stat"><span class="stat-label">System FPS</span><span class="stat-value" id="stat-fps">0.0</span></div>
+  <div class="stat"><span class="stat-label">Inference</span><span class="stat-value" id="stat-inference">— <small>ms</small></span></div>
+  <div class="stat"><span class="stat-label">Latency</span><span class="stat-value" id="stat-latency">— <small>ms</small></span></div>
+  <div class="stat"><span class="stat-label">Compute</span><span class="stat-value" id="stat-device">—</span></div>
+</div>
+
+<main class="layout">
+
+  <!-- ============================= OPERATIONS ============================ -->
+  <section class="view view-operations active" data-view="operations">
+    <div class="panel panel-cameras">
+      <div class="panel-head">
+        <h2>Live Feeds</h2>
+        <div class="panel-actions">
+          <button class="btn btn-sm" onclick="IBVAP.openCameraModal()">+ Add Camera</button>
+          <button class="btn btn-sm btn-ghost" onclick="IBVAP.loadCameras()">Refresh</button>
         </div>
+      </div>
+      <div class="camera-grid" id="camera-grid">
+        <div class="placeholder"><div class="spinner"></div><p>Connecting to cameras…</p></div>
+      </div>
     </div>
 
-    <!-- Add Camera Modal -->
-    <div id="camera-modal" class="modal" onclick="if(event.target===this)closeCameraModal()">
-        <div class="modal-content modal-small">
-            <span class="modal-close" onclick="closeCameraModal()">&times;</span>
-            <h2>Add Camera</h2>
-            <form id="camera-form" onsubmit="submitCamera(event)">
-                <label>Name</label>
-                <input type="text" id="cam-name" required placeholder="e.g., BOP-01 North">
-                <label>URL / Source</label>
-                <input type="text" id="cam-url" required placeholder="e.g., rtsp://192.168.1.10/video or 0 for webcam">
-                <label>Location</label>
-                <input type="text" id="cam-location" placeholder="e.g., Checkpost Alpha">
-                <button type="submit" class="btn btn-primary">Add Camera</button>
-            </form>
+    <aside class="panel panel-alerts">
+      <div class="panel-head">
+        <h2>Live Alerts</h2>
+        <div class="panel-actions">
+          <select id="alert-filter" class="select select-sm" onchange="IBVAP.renderAlertFeed()">
+            <option value="">All severities</option>
+            <option value="CRITICAL">Critical</option>
+            <option value="HIGH">High</option>
+            <option value="MEDIUM">Medium</option>
+            <option value="LOW">Low</option>
+          </select>
+          <button class="btn btn-sm btn-ghost" onclick="IBVAP.clearFeed()">Clear</button>
         </div>
-    </div>
+      </div>
+      <div class="alert-feed" id="alert-feed">
+        <p class="empty">Monitoring. No alerts yet.</p>
+      </div>
+    </aside>
+  </section>
 
-    <!-- Fence Drawing Canvas -->
-    <div id="canvas-modal" class="modal" onclick="if(event.target===this)closeCanvasModal()">
-        <div class="modal-content modal-large">
-            <span class="modal-close" onclick="closeCanvasModal()">&times;</span>
-            <h2>Draw Fence / Zone</h2>
-            <div class="canvas-toolbar">
-                <button id="btn-draw-line" class="btn btn-sm active" onclick="setDrawMode('line')">Line</button>
-                <button id="btn-draw-zone" class="btn btn-sm" onclick="setDrawMode('zone')">Polygon Zone</button>
-                <span id="draw-hint" class="draw-hint">Click to place points — double-click to finish</span>
-            </div>
-            <div class="canvas-container">
-                <canvas id="draw-canvas" width="800" height="500"></canvas>
-            </div>
-            <div class="canvas-actions">
-                <button class="btn btn-primary" onclick="saveDrawing()">Save Rule</button>
-                <button class="btn btn-outline" onclick="clearDrawing()">Clear</button>
-            </div>
-            <div id="coords-display" class="coords-display"></div>
+  <!-- ============================== EVENT LOG =========================== -->
+  <section class="view view-events" data-view="events">
+    <div class="panel">
+      <div class="panel-head">
+        <h2>Event Log <span class="muted" id="events-count"></span></h2>
+        <div class="panel-actions">
+          <input class="input input-sm" id="log-search" placeholder="Search description / plate…" onkeydown="if(event.key==='Enter')IBVAP.loadEventLog()">
+          <select id="log-camera" class="select select-sm" onchange="IBVAP.loadEventLog()"><option value="">All cameras</option></select>
+          <select id="log-type" class="select select-sm" onchange="IBVAP.loadEventLog()"><option value="">All types</option></select>
+          <select id="log-severity" class="select select-sm" onchange="IBVAP.loadEventLog()">
+            <option value="">All severities</option><option>CRITICAL</option><option>HIGH</option><option>MEDIUM</option><option>LOW</option><option>INFO</option>
+          </select>
+          <select id="log-source" class="select select-sm" onchange="IBVAP.loadEventLog()">
+            <option value="">Live + Uploads</option><option value="live">Live only</option><option value="upload">Uploads only</option>
+          </select>
+          <button class="btn btn-sm" onclick="IBVAP.loadEventLog()">Apply</button>
         </div>
+      </div>
+      <div class="table-scroll">
+        <table class="log-table">
+          <thead><tr>
+            <th>#</th><th>Time (IST)</th><th>Severity</th><th>Event</th><th>Source</th>
+            <th>Object</th><th>Track</th><th>Origin</th><th>Evidence</th><th>Chain</th>
+          </tr></thead>
+          <tbody id="log-body"><tr><td colspan="10" class="empty">Loading…</td></tr></tbody>
+        </table>
+      </div>
+      <div class="pager">
+        <button class="btn btn-sm btn-ghost" id="log-prev" onclick="IBVAP.pageEvents(-1)">‹ Newer</button>
+        <span class="muted" id="log-range"></span>
+        <button class="btn btn-sm btn-ghost" id="log-next" onclick="IBVAP.pageEvents(1)">Older ›</button>
+      </div>
     </div>
+  </section>
 
-    <div id="toast-container" class="toast-container"></div>
+  <!-- =========================== ANALYZE VIDEO ========================== -->
+  <section class="view view-analyze" data-view="analyze">
+    <div class="panel">
+      <div class="panel-head"><h2>Analyze Video</h2>
+        <span class="muted">Uploaded footage runs through the same analytics pipeline as live CCTV</span>
+      </div>
 
-    <script src="/static/js/app.js"></script>
+      <div class="upload-area" id="drop-zone">
+        <div class="upload-icon">🎞️</div>
+        <h3>Upload CCTV Video</h3>
+        <p class="muted">Drag an <strong>.mp4</strong> here, or choose a file. Maximum <span id="upload-limit">512</span> MB.</p>
+        <input type="file" id="file-input" accept="video/mp4,.mp4" hidden onchange="IBVAP.fileChosen(event)">
+        <div class="upload-controls">
+          <button class="btn" onclick="document.getElementById('file-input').click()">Choose File</button>
+          <select id="upload-camera" class="select"><option value="">No fence rules</option></select>
+          <button class="btn btn-primary" id="btn-analyze" onclick="IBVAP.startAnalysis()" disabled>Analyze Video</button>
+        </div>
+        <p class="selected-file" id="selected-file"></p>
+      </div>
+
+      <div class="analysis-active" id="analysis-active" hidden>
+        <div class="analysis-video">
+          <img id="analysis-preview" alt="Analysis preview">
+          <div class="analysis-overlay" id="analysis-overlay">PROCESSING</div>
+        </div>
+        <div class="analysis-meta">
+          <h3 id="analysis-filename">—</h3>
+          <div class="progress"><div class="progress-fill" id="analysis-progress-fill"></div></div>
+          <p class="progress-label"><span id="analysis-progress-text">0%</span> · <span id="analysis-status">queued</span></p>
+          <div class="mini-stats" id="analysis-stats"></div>
+          <div class="analysis-buttons">
+            <button class="btn btn-sm btn-ghost" onclick="IBVAP.cancelAnalysis()" id="btn-cancel-analysis">Cancel</button>
+            <a class="btn btn-sm" id="btn-download-analysis" hidden target="_blank">Play Annotated Video</a>
+            <button class="btn btn-sm" id="btn-view-analysis-events" hidden onclick="IBVAP.showAnalysisEvents()">View Events</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel-head sub"><h3>Analysis History</h3></div>
+      <div class="analysis-history" id="analysis-history"><p class="empty">No videos analysed yet.</p></div>
+    </div>
+  </section>
+
+  <!-- ============================== SYSTEM ============================== -->
+  <section class="view view-system" data-view="system">
+    <div class="panel">
+      <div class="panel-head"><h2>System &amp; Integrity</h2>
+        <button class="btn btn-sm btn-ghost" onclick="IBVAP.loadSystem()">Refresh</button>
+      </div>
+      <div class="system-grid" id="system-grid"><p class="empty">Loading…</p></div>
+
+      <div class="panel-head sub"><h3>Tamper-Evident Hash-Chained Event Log</h3></div>
+      <div class="integrity-block">
+        <p class="muted">
+          Every event is sealed with SHA-256 over its payload plus the previous event's hash.
+          Editing, deleting or reordering any record breaks the chain from that point onward.
+          Periodic Merkle checkpoints seal ranges of the log locally — this is a cryptographic
+          hash chain, not a distributed blockchain.
+        </p>
+        <div class="integrity-actions">
+          <button class="btn btn-verify" onclick="IBVAP.verifyIntegrity()">Verify Log Integrity</button>
+          <button class="btn btn-sm" onclick="IBVAP.makeCheckpoint()">Seal Checkpoint</button>
+          <button class="btn btn-sm btn-ghost" onclick="IBVAP.downloadCertificate()">Export Certificate</button>
+        </div>
+        <pre class="integrity-output" id="integrity-output">Not yet verified.</pre>
+        <div id="checkpoint-list"></div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<!-- ============================== MODALS ================================ -->
+
+<div class="modal" id="modal-alert" onclick="if(event.target===this)IBVAP.closeModal('modal-alert')">
+  <div class="modal-box modal-lg">
+    <button class="modal-close" onclick="IBVAP.closeModal('modal-alert')">&times;</button>
+    <div id="alert-detail"></div>
+  </div>
+</div>
+
+<div class="modal" id="modal-camera" onclick="if(event.target===this)IBVAP.closeModal('modal-camera')">
+  <div class="modal-box">
+    <button class="modal-close" onclick="IBVAP.closeModal('modal-camera')">&times;</button>
+    <h2>Add Camera</h2>
+    <form onsubmit="IBVAP.submitCamera(event)">
+      <label>Camera name</label>
+      <input class="input" id="cam-name" required placeholder="BOP-02 SOUTH">
+      <label>Source URL</label>
+      <input class="input" id="cam-url" required placeholder="rtsp://192.168.1.10:554/stream  ·  0 for webcam  ·  path/to/file.mp4">
+      <p class="hint">Accepts RTSP/HTTP IP-camera streams, a local webcam index, or a video file path.</p>
+      <label>Location</label>
+      <input class="input" id="cam-location" placeholder="Sector 4 — Checkpost Alpha">
+      <button class="btn btn-primary btn-block" type="submit">Add Camera</button>
+    </form>
+  </div>
+</div>
+
+<div class="modal" id="modal-fence" onclick="if(event.target===this)IBVAP.closeModal('modal-fence')">
+  <div class="modal-box modal-lg">
+    <button class="modal-close" onclick="IBVAP.closeModal('modal-fence')">&times;</button>
+    <h2>Virtual Fence — <span id="fence-camera-name"></span></h2>
+    <div class="fence-toolbar">
+      <div class="segmented" id="fence-modes">
+        <button class="seg active" data-mode="line" onclick="IBVAP.setFenceMode('line')">Tripwire Line</button>
+        <button class="seg" data-mode="zone" onclick="IBVAP.setFenceMode('zone')">Restricted Zone</button>
+        <button class="seg" data-mode="loiter" onclick="IBVAP.setFenceMode('loiter')">Loiter Zone</button>
+        <button class="seg" data-mode="direction" onclick="IBVAP.setFenceMode('direction')">Direction Rule</button>
+      </div>
+      <span class="fence-hint" id="fence-hint">Click two points to place a tripwire.</span>
+    </div>
+    <div class="fence-canvas-wrap">
+      <canvas id="fence-canvas" width="640" height="384"></canvas>
+    </div>
+    <div class="fence-options" id="fence-options"></div>
+    <div class="fence-actions">
+      <input class="input input-sm" id="fence-name" placeholder="Rule name (optional)">
+      <button class="btn btn-primary" onclick="IBVAP.saveFence()">Save Rule</button>
+      <button class="btn btn-ghost" onclick="IBVAP.resetFenceDraft()">Clear Drawing</button>
+    </div>
+    <div class="fence-existing">
+      <h3>Armed Rules</h3>
+      <div id="fence-rule-list"><p class="empty">No rules on this camera.</p></div>
+    </div>
+  </div>
+</div>
+
+<div class="toast-stack" id="toast-stack"></div>
+<script src="/static/js/app.js?v=2.0.2"></script>
 </body>
 </html>

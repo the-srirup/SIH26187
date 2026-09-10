@@ -1,14 +1,36 @@
 """
 SQLAlchemy ORM models.
 
-Three tables — cameras, rules, alerts — match the schema recommended
-in the hackathon build guide.  Each alert includes a *prev_hash* column
-so the full alert history forms a tamper-evident hash chain.
+Five tables:
+
+``cameras``        registered video sources (RTSP / HTTP / webcam / file)
+``rules``          virtual fences, zones, loiter areas, direction rules
+``alerts``         the tamper-evident event log (SHA-256 hash chain)
+``checkpoints``    periodic Merkle checkpoints sealing a range of the chain
+``watchlist_entries``  enrolled face embeddings
+``analysis_sessions``  uploaded-MP4 analysis runs
+
+Timestamps are stored as aware **UTC ISO-8601** strings (sortable, filterable)
+alongside a denormalised **IST** display string, so the audit log reads
+correctly to an Indian operator without any client-side conversion.
 """
-from sqlalchemy import Boolean, Column, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import (
+    Boolean, Column, Float, ForeignKey, Index, Integer, String, Text,
+)
 from sqlalchemy.orm import relationship
 
 from core.database import Base
+
+# Alert severities, ordered.
+SEVERITY_INFO = "INFO"
+SEVERITY_LOW = "LOW"
+SEVERITY_MEDIUM = "MEDIUM"
+SEVERITY_HIGH = "HIGH"
+SEVERITY_CRITICAL = "CRITICAL"
+SEVERITY_ORDER = {
+    SEVERITY_INFO: 0, SEVERITY_LOW: 1, SEVERITY_MEDIUM: 2,
+    SEVERITY_HIGH: 3, SEVERITY_CRITICAL: 4,
+}
 
 
 class Camera(Base):
@@ -17,9 +39,12 @@ class Camera(Base):
     id = Column(Integer, primary_key=True)
     name = Column(String(120), nullable=False)
     url = Column(String(500), nullable=False)
-    location = Column(String(200))
+    location = Column(String(200), default="")
     is_active = Column(Boolean, default=True)
-    is_online = Column(Boolean, default=True)  # Track camera stream health
+    is_online = Column(Boolean, default=False)
+    #: "live" (camera / RTSP / file loop) or "upload" (analysis session source)
+    source_kind = Column(String(20), default="live")
+    created_at = Column(String(40), default="")
 
     rules = relationship("Rule", back_populates="camera", cascade="all, delete-orphan")
     alerts = relationship("Alert", back_populates="camera", cascade="all, delete-orphan")
@@ -33,11 +58,13 @@ class Rule(Base):
 
     id = Column(Integer, primary_key=True)
     camera_id = Column(Integer, ForeignKey("cameras.id"), nullable=False)
-    rule_type = Column(String(50), nullable=False)  # 'line', 'zone', 'loiter', 'wrong_direction'
-    geometry = Column(Text)  # JSON coordinates
-    params = Column(Text)  # JSON parameters, e.g. {"dwell_seconds": 60}
+    #: 'line' | 'zone' | 'loiter' | 'direction'
+    rule_type = Column(String(50), nullable=False)
+    geometry = Column(Text)      # JSON coordinate list, in frame pixel space
+    params = Column(Text)        # JSON, e.g. {"dwell_seconds": 30}
     is_active = Column(Boolean, default=True)
     name = Column(String(200))
+    created_at = Column(String(40), default="")
 
     camera = relationship("Camera", back_populates="rules")
 
@@ -46,32 +73,88 @@ class Rule(Base):
 
 
 class Alert(Base):
+    """
+    One sealed event in the audit log.
+
+    ``prev_hash``/``hash`` chain every row to its predecessor: altering any
+    hashed column of any row invalidates that row and everything after it.
+    """
+
     __tablename__ = "alerts"
 
     id = Column(Integer, primary_key=True)
     camera_id = Column(Integer, ForeignKey("cameras.id"), nullable=False)
     alert_type = Column(String(100), nullable=False)
-    object_class = Column(String(50))
-    track_id = Column(Integer)
-    confidence = Column(Float)
-    timestamp = Column(String(50), nullable=False)  # ISO-8601 string
-    snapshot_path = Column(String(500))
-    clip_path = Column(String(500))
+    severity = Column(String(20), default=SEVERITY_MEDIUM)
+    object_class = Column(String(50), default="")
+    track_id = Column(Integer, default=0)
+    confidence = Column(Float, default=0.0)
+
+    #: Aware UTC ISO-8601 — canonical, sortable, hashed.
+    timestamp = Column(String(50), nullable=False)
+    #: Denormalised IST display string — what the operator actually reads.
+    timestamp_ist = Column(String(64), default="")
+
+    #: Which rule produced this event, and of what kind.
+    rule_name = Column(String(200), default="")
+    rule_type = Column(String(50), default="")
+    #: 'ai_detection' for model output, 'rule_engine' for analytics rules.
+    detector = Column(String(40), default="rule_engine")
+    #: 'live' or 'upload'
+    source_type = Column(String(20), default="live")
+    #: Upload analysis session id, when source_type == 'upload'.
+    session_id = Column(String(64), default="")
+    #: Free-form JSON: plate text, watchlist name, dwell seconds, geometry…
+    details_json = Column(Text, default="{}")
+    description = Column(Text, default="")
+
+    snapshot_path = Column(String(500), default="")
+    clip_path = Column(String(500), default="")
+
     prev_hash = Column(String(64), nullable=False)
     hash = Column(String(64), nullable=False)
 
     camera = relationship("Camera", back_populates="alerts")
 
+    __table_args__ = (
+        Index("ix_alerts_timestamp", "timestamp"),
+        Index("ix_alerts_camera_type", "camera_id", "alert_type"),
+        Index("ix_alerts_session", "session_id"),
+    )
+
     def __repr__(self) -> str:
         return f"<Alert {self.id} type={self.alert_type} cam={self.camera_id}>"
 
 
-class WatchlistEntry(Base):
-    """Persistent face watchlist entry.
-
-    ``embedding_json`` stores the normalized ArcFace embedding as a compact
-    JSON string, which is easy to inspect, export, and back up at the edge.
+class Checkpoint(Base):
     """
+    A periodic Merkle checkpoint over a contiguous range of the alert chain.
+
+    This is **not** a public blockchain anchor — nothing is broadcast to any
+    network.  It is a locally sealed checkpoint: a Merkle root over the alert
+    hashes in ``[first_alert_id, last_alert_id]`` plus the chain tip at seal
+    time.  Exported checkpoints let a third party verify a range of the log
+    without being handed the whole database.
+    """
+
+    __tablename__ = "checkpoints"
+
+    id = Column(Integer, primary_key=True)
+    checkpoint_uid = Column(String(64), nullable=False, unique=True)
+    first_alert_id = Column(Integer, default=0)
+    last_alert_id = Column(Integer, default=0)
+    alert_count = Column(Integer, default=0)
+    merkle_root = Column(String(64), nullable=False)
+    chain_tip_hash = Column(String(64), nullable=False)
+    timestamp = Column(String(50), nullable=False)     # aware UTC ISO-8601
+    timestamp_ist = Column(String(64), default="")
+
+    def __repr__(self) -> str:
+        return f"<Checkpoint {self.id} root={self.merkle_root[:12]}…>"
+
+
+class WatchlistEntry(Base):
+    """Persistent face watchlist entry (normalised ArcFace embedding)."""
 
     __tablename__ = "watchlist_entries"
 
@@ -83,3 +166,45 @@ class WatchlistEntry(Base):
 
     def __repr__(self) -> str:
         return f"<WatchlistEntry {self.id} name={self.name}>"
+
+
+class AnalysisSession(Base):
+    """An uploaded-MP4 analysis run, persisted so results survive a restart."""
+
+    __tablename__ = "analysis_sessions"
+
+    id = Column(Integer, primary_key=True)
+    session_uid = Column(String(64), nullable=False, unique=True)
+    filename = Column(String(300), nullable=False)
+    stored_path = Column(String(500), nullable=False)
+    output_path = Column(String(500), default="")
+    camera_id = Column(Integer, ForeignKey("cameras.id"))
+
+    #: queued | running | completed | failed | cancelled
+    status = Column(String(20), default="queued")
+    error = Column(Text, default="")
+
+    total_frames = Column(Integer, default=0)
+    processed_frames = Column(Integer, default=0)
+    analysed_frames = Column(Integer, default=0)
+    duration_seconds = Column(Float, default=0.0)
+    source_fps = Column(Float, default=0.0)
+    width = Column(Integer, default=0)
+    height = Column(Integer, default=0)
+    size_bytes = Column(Integer, default=0)
+
+    detections_total = Column(Integer, default=0)
+    persons_seen = Column(Integer, default=0)
+    vehicles_seen = Column(Integer, default=0)
+    alerts_generated = Column(Integer, default=0)
+    processing_fps = Column(Float, default=0.0)
+
+    created_at = Column(String(50), default="")
+    created_at_ist = Column(String(64), default="")
+    completed_at = Column(String(50), default="")
+    completed_at_ist = Column(String(64), default="")
+
+    __table_args__ = (Index("ix_sessions_created", "created_at"),)
+
+    def __repr__(self) -> str:
+        return f"<AnalysisSession {self.session_uid} {self.status}>"

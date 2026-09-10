@@ -93,6 +93,10 @@ class FaceRecognizer:
         self._frame_count = 0
         self._last_processed_frame = -1
         self._inference_lock = threading.Lock()
+        self._providers: list[str] = []
+        #: Debounce keys for face events, so one person in view produces one
+        #: event rather than one per cadence tick.
+        self._event_debounce: dict[tuple, float] = {}
 
         # track_id -> (watchlist_id, watchlist_name, similarity, matched,
         #              last_seen_monotonic)
@@ -112,14 +116,39 @@ class FaceRecognizer:
     # ------------------------------------------------------------------ #
 
     def _init_model(self) -> None:
-        """Initialize InsightFace model (buffalo_l = SCRFD + ArcFace)."""
+        """
+        Initialise InsightFace (buffalo_l = SCRFD detector + ArcFace embedder).
+
+        ``det_size`` is configurable and defaults to 320 rather than 640: on
+        640x384 CCTV frames the larger input costs 4x the pixels for no recall
+        benefit, and SCRFD at 640 was the single largest latency spike in the
+        original pipeline.  A CUDA execution provider is used when onnxruntime
+        exposes one, falling back to CPU silently.
+        """
         try:
-            self._app = insightface.app.FaceAnalysis(
-                name="buffalo_l",
-                providers=["CPUExecutionProvider"],
+            available = []
+            try:
+                import onnxruntime as ort
+
+                available = list(ort.get_available_providers())
+            except Exception:
+                pass
+            providers = (
+                ["CUDAExecutionProvider", "CPUExecutionProvider"]
+                if "CUDAExecutionProvider" in available
+                else ["CPUExecutionProvider"]
             )
-            self._app.prepare(ctx_id=0, det_size=(640, 640))
-            log.info("InsightFace model loaded (SCRFD + ArcFace)")
+
+            self._app = insightface.app.FaceAnalysis(
+                name="buffalo_l", providers=providers
+            )
+            det = max(128, int(settings.FACE_DET_SIZE))
+            self._app.prepare(ctx_id=0, det_size=(det, det))
+            self._providers = providers
+            log.info(
+                "InsightFace loaded (SCRFD + ArcFace) det_size=%d providers=%s",
+                det, providers,
+            )
         except Exception as e:
             log.error("Failed to load InsightFace: %s", e)
             self._enabled = False
@@ -452,11 +481,24 @@ class FaceRecognizer:
         person_map: dict[int, tuple[int, int, int, int]],
         min_height: int,
     ) -> list[tuple]:
-        """Run face detection inside each person bbox, with full-frame fallback."""
+        """
+        Run face detection inside each person bbox, with full-frame fallback.
+
+        The number of crops is capped by ``FACE_MAX_CROPS_PER_TICK`` and the
+        largest (nearest) people are processed first.  Without this cap a busy
+        frame with eight people cost eight full SCRFD passes, turning a single
+        analytics frame into a multi-second stall.
+        """
         results: list[tuple] = []
         seen_regions: list[tuple[int, int, int, int]] = []
 
-        for track_id, bbox in person_map.items():
+        def _box_area(item):
+            _tid, (bx1, by1, bx2, by2) = item
+            return (bx2 - bx1) * (by2 - by1)
+
+        ordered = sorted(person_map.items(), key=_box_area, reverse=True)
+        limit = max(1, int(settings.FACE_MAX_CROPS_PER_TICK))
+        for track_id, bbox in ordered[:limit]:
             x1, y1, x2, y2 = map(int, bbox)
             # Expand slightly so a hat/forehead is not excluded.
             h, w = frame.shape[:2]
@@ -534,20 +576,17 @@ class FaceRecognizer:
     # ------------------------------------------------------------------ #
 
     def draw_matches(self, frame: np.ndarray, matches: list[FaceMatch]) -> np.ndarray:
-        """Draw face boxes and watchlist matches on frame."""
-        out = frame.copy()
-        for m in matches:
-            x1, y1, x2, y2 = m.bbox
-            if m.matched:
-                color = (0, 0, 255)  # Red for watchlist match
-                label = f"WATCHLIST: {m.watchlist_name} ({m.similarity:.2f})"
-            else:
-                color = (0, 255, 0)  # Green for unknown
-                label = f"Face ({m.similarity:.2f})"
+        """
+        Draw face boxes in place (kept for the standalone test endpoint).
 
-            cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
-            cv2.putText(out, label, (x1, max(12, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-        return out
+        The live pipeline renders via :mod:`cv.overlay`; this no longer copies
+        the frame, which used to add a full-frame allocation per annotated
+        frame on the hot path.
+        """
+        from cv import overlay as ov
+
+        ov.draw_faces(frame, matches)
+        return frame
 
     @staticmethod
     def _normalize_embedding(embedding: np.ndarray) -> np.ndarray:
@@ -600,13 +639,92 @@ class FaceRecognizer:
     def clear_track_cache(self) -> None:
         self._track_match_cache.clear()
 
+    # ------------------------------------------------------------------ #
+    # Pipeline integration
+    # ------------------------------------------------------------------ #
+
+    def cached_matches(self, detections: Optional[list]) -> list[FaceMatch]:
+        """Public accessor for cached per-track matches between cadence ticks."""
+        return self._cached_matches_for_frame(detections)
+
+    def build_event(self, match: FaceMatch):
+        """
+        Turn a face result into a debounced event, or ``None``.
+
+        A watchlist hit is reported as an identification. Everything else is
+        reported strictly as ``face_detected`` — the system never claims an
+        identity it did not match above threshold.
+        """
+        from cv.rules import Alert as RuleAlert
+
+        now = time.monotonic()
+        track_id = int(match.track_id) if match.track_id is not None else 0
+
+        if match.matched and match.watchlist_name:
+            key = ("watchlist", match.watchlist_id, track_id)
+            window = settings.FACE_ALERT_DEBOUNCE_SECONDS
+            alert_type = "watchlist_match"
+            description = (
+                f"Watchlist subject '{match.watchlist_name}' identified "
+                f"(cosine similarity {match.similarity:.2f}, "
+                f"threshold {self._similarity_threshold:.2f})"
+            )
+            details = {
+                "watchlist_id": match.watchlist_id,
+                "watchlist_name": match.watchlist_name,
+                "similarity": round(float(match.similarity), 4),
+                "threshold": self._similarity_threshold,
+                "bbox": list(match.bbox),
+            }
+        else:
+            if not settings.FACE_DETECTION_ALERTS:
+                return None
+            # A cached rebuild carries no fresh detector score; only report a
+            # face event for an actual detection.
+            if match.det_score <= 0.0:
+                return None
+            key = ("face", track_id, 0)
+            window = settings.FACE_DETECT_DEBOUNCE_SECONDS
+            alert_type = "face_detected"
+            description = (
+                f"Face detected (detector score {match.det_score:.2f}). "
+                f"No watchlist match above threshold "
+                f"{self._similarity_threshold:.2f} — identity not established."
+            )
+            details = {
+                "det_score": round(float(match.det_score), 4),
+                "best_similarity": round(float(match.similarity), 4),
+                "threshold": self._similarity_threshold,
+                "bbox": list(match.bbox),
+                "identified": False,
+            }
+
+        last = self._event_debounce.get(key, 0.0)
+        if now - last < window:
+            return None
+        self._event_debounce[key] = now
+        if len(self._event_debounce) > 512:
+            self._event_debounce = {
+                k: v for k, v in self._event_debounce.items() if now - v < 300
+            }
+
+        return RuleAlert(
+            rule_name="face", rule_type="face", track_id=track_id,
+            alert_type=alert_type, description=description, details=details,
+        )
+
     def get_metrics(self) -> dict:
         return {
             "enabled": self._enabled,
+            "available": INSIGHTFACE_AVAILABLE,
             "watchlist_count": len(self._watchlist),
             "threshold": self._similarity_threshold,
             "cached_tracks": len(self._track_match_cache),
             "last_processed_frame": self._last_processed_frame,
+            "det_size": settings.FACE_DET_SIZE,
+            "providers": self._providers,
+            "cadence_frames": settings.FACE_RECOGNITION_EVERY_N_FRAMES,
+            "max_crops_per_tick": settings.FACE_MAX_CROPS_PER_TICK,
         }
 
 

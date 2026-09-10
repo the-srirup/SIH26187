@@ -1,12 +1,51 @@
-ultralytics>=8.3.0
-opencv-python>=4.10.0
+# IBVAP — Intelligent Border Video Analytics Platform
+# ---------------------------------------------------------------------------
+# Core runtime. Install with:
+#     pip install -r requirements.txt
+#
+# GPU NOTE ------------------------------------------------------------------
+# The default PyPI `torch` is a CPU-only build. On a machine with an NVIDIA
+# GPU install the CUDA build FIRST, or inference silently runs on the CPU at
+# roughly a third of the speed:
+#
+#     pip install --index-url https://download.pytorch.org/whl/cu126 \
+#                 torch torchvision
+#
+# torchvision must come from the same CUDA index as torch — a CPU torchvision
+# paired with a CUDA torch fails at NMS with "torchvision::nms not implemented
+# for CUDA". IBVAP detects that at start-up and falls back to CPU rather than
+# crashing, and /api/system/info reports which device is really in use.
+# ---------------------------------------------------------------------------
+
+# --- Detection & tracking ---------------------------------------------------
+ultralytics>=8.3.0,<9          # YOLO11 + ByteTrack
+torch>=2.2                     # installed via the CUDA index above for GPU
+torchvision>=0.17
+
+# --- Computer vision & geometry ---------------------------------------------
+opencv-python>=4.10.0          # capture, encode, overlay, CLAHE
+numpy>=1.26
+shapely>=2.0.0                 # zone/polygon geometry for the rules engine
+lap>=0.5.12                    # ByteTrack's linear assignment solver
+
+# --- Web layer ---------------------------------------------------------------
 fastapi>=0.115.0
-uvicorn[standard]>=0.30.0
-sqlalchemy>=2.0.0
-python-multipart>=0.0.9
-numpy>=2.0.0
-shapely>=2.0.0
-insightface>=0.9.3
-onnxruntime>=1.19.0
-easyocr>=1.7.0
+uvicorn[standard]>=0.30.0      # [standard] provides the websockets implementation
+python-multipart>=0.0.9        # multipart form parsing for uploads
 pydantic-settings>=2.5.0
+
+# --- Persistence -------------------------------------------------------------
+sqlalchemy>=2.0.0              # SQLite at the edge, PostgreSQL at HQ
+
+# --- Monitoring --------------------------------------------------------------
+psutil>=5.9                    # CPU/RAM sampling for benchmark.py and system info
+
+# --- Optional subsystems -----------------------------------------------------
+# Both degrade gracefully: if the import fails the feature reports itself as
+# unavailable in /api/system/info and the surveillance pipeline is unaffected.
+insightface>=0.7.3             # SCRFD face detection + ArcFace embeddings
+onnxruntime>=1.19.0            # InsightFace runtime (onnxruntime-gpu for CUDA)
+easyocr>=1.7.0                 # ANPR optical character recognition
+
+# --- Testing (not required to run the platform) ------------------------------
+# pip install pytest httpx
