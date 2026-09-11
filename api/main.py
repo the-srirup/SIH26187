@@ -24,6 +24,7 @@ import json
 import logging
 import os
 import tempfile
+import threading
 import time
 from contextlib import asynccontextmanager
 from datetime import timedelta
@@ -1043,6 +1044,44 @@ def get_stats(
 # --------------------------------------------------------------------------- #
 
 
+class _StreamSlots:
+    """
+    Per-camera MJPEG viewer budget.
+
+    Counting is done here rather than inside the generator because a generator
+    that is never iterated (client vanished between accept and first read) would
+    otherwise leak its slot forever.
+    """
+
+    def __init__(self) -> None:
+        self._counts: dict[int, int] = {}
+        self._lock = threading.Lock()
+
+    def acquire(self, camera_id: int) -> bool:
+        limit = max(1, int(settings.MAX_STREAM_CLIENTS))
+        with self._lock:
+            current = self._counts.get(camera_id, 0)
+            if current >= limit:
+                return False
+            self._counts[camera_id] = current + 1
+            return True
+
+    def release(self, camera_id: int) -> None:
+        with self._lock:
+            current = self._counts.get(camera_id, 0) - 1
+            if current > 0:
+                self._counts[camera_id] = current
+            else:
+                self._counts.pop(camera_id, None)
+
+    def snapshot(self) -> dict[int, int]:
+        with self._lock:
+            return dict(self._counts)
+
+
+_stream_slots = _StreamSlots()
+
+
 async def _mjpeg_stream(camera_id: int, request: Request):
     """
     Async MJPEG generator.
@@ -1100,8 +1139,28 @@ async def stream_camera(camera_id: int, request: Request):
     if not exists:
         raise HTTPException(404, "Camera not found")
 
+    # Enforce the viewer cap. ``MAX_STREAM_CLIENTS`` was configured but never
+    # actually applied, so an unbounded number of MJPEG connections could be
+    # opened against one camera — trivially, by a dashboard whose tiles were
+    # reconnecting in a loop. Each one holds a generator, a socket and a slot in
+    # the server's connection budget, so the cap has to be real for the
+    # reconnect backoff on the client to be worth anything.
+    if not _stream_slots.acquire(camera_id):
+        raise HTTPException(
+            503,
+            f"Too many viewers on camera {camera_id} "
+            f"(limit {settings.MAX_STREAM_CLIENTS}). Close another view and retry.",
+        )
+
+    async def _guarded():
+        try:
+            async for chunk in _mjpeg_stream(camera_id, request):
+                yield chunk
+        finally:
+            _stream_slots.release(camera_id)
+
     return StreamingResponse(
-        _mjpeg_stream(camera_id, request),
+        _guarded(),
         media_type="multipart/x-mixed-replace; boundary=frame",
         headers={"Cache-Control": "no-store, no-cache", "Pragma": "no-cache",
                  "X-Accel-Buffering": "no"},
@@ -1350,6 +1409,149 @@ def cancel_analysis(session_id: str):
     if not AnalysisManager.get().cancel(session_id):
         raise HTTPException(404, "No running analysis with that id")
     return {"ok": True, "session_id": session_id}
+
+
+# --------------------------------------------------------------------------- #
+# ANPR and face detection records
+# --------------------------------------------------------------------------- #
+
+
+def _detection_evidence_url(kind: str, row_id: int, path: str) -> Optional[str]:
+    return f"/api/{kind}/{row_id}/evidence" if path else None
+
+
+@app.get("/api/anpr/detections")
+def list_anpr_detections(
+    camera_id: Optional[int] = Query(None),
+    plate: Optional[str] = Query(None, description="Exact or partial plate text"),
+    status: Optional[str] = Query(None, description="published | uncertain"),
+    hours: int = Query(168, ge=1, le=8760),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db_session),
+):
+    """
+    Plate readings, newest first.
+
+    This queries the typed ``anpr_detections`` table rather than pattern-matching
+    the alert log's JSON, so "every sighting of this registration" is an indexed
+    lookup instead of a scan that can match the wrong field.
+    """
+    since = (now_utc() - timedelta(hours=hours)).isoformat()
+    query = db.query(models.ANPRDetection).filter(
+        models.ANPRDetection.timestamp >= since
+    )
+    if camera_id is not None:
+        query = query.filter(models.ANPRDetection.camera_id == camera_id)
+    if plate:
+        needle = plate.replace(" ", "").upper()
+        query = query.filter(models.ANPRDetection.plate_text.like(f"%{needle}%"))
+    if status:
+        query = query.filter(models.ANPRDetection.processing_status == status)
+
+    total = query.count()
+    rows = (query.order_by(desc(models.ANPRDetection.id))
+            .offset(offset).limit(limit).all())
+    names = _camera_names(db)
+    return {
+        "total": total,
+        "count": len(rows),
+        "offset": offset,
+        "detections": [{
+            "id": r.id,
+            "camera_id": r.camera_id,
+            "camera_name": names.get(r.camera_id, f"CAM-{r.camera_id:02d}"),
+            "alert_id": r.alert_id,
+            "timestamp": r.timestamp,
+            "timestamp_ist": r.timestamp_ist,
+            "plate_text": r.plate_text,
+            "plate_display": r.plate_display or r.plate_text,
+            "plate_raw": r.plate_raw,
+            "confidence": round(float(r.confidence or 0.0), 3),
+            "format_verified": bool(r.format_verified),
+            "votes": r.votes,
+            "consensus": bool(r.consensus),
+            "vehicle_class": r.vehicle_class,
+            "vehicle_track_id": r.vehicle_track_id,
+            "status": r.processing_status,
+            "source_type": r.source_type,
+            "has_evidence": bool(r.evidence_path),
+            "evidence_url": _detection_evidence_url("anpr", r.id, r.evidence_path),
+            "evidence_sha256": r.evidence_sha256,
+        } for r in rows],
+    }
+
+
+@app.get("/api/anpr/detections/{detection_id}/evidence")
+def get_anpr_evidence(detection_id: int, db: Session = Depends(get_db_session)):
+    row = db.query(models.ANPRDetection).filter(
+        models.ANPRDetection.id == detection_id).first()
+    if not row or not row.evidence_path:
+        raise HTTPException(404, "No evidence image for this detection")
+    return _serve_evidence(row.evidence_path, "image/jpeg")
+
+
+@app.get("/api/faces/detections")
+def list_face_detections(
+    camera_id: Optional[int] = Query(None),
+    status: Optional[str] = Query(None, description="matched | unknown"),
+    hours: int = Query(168, ge=1, le=8760),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db_session),
+):
+    """
+    Face detections, newest first.
+
+    ``recognition_status`` is reported exactly as recorded: ``unknown`` means no
+    watchlist entry matched above threshold, never that a face was unclear.
+    """
+    since = (now_utc() - timedelta(hours=hours)).isoformat()
+    query = db.query(models.FaceDetection).filter(
+        models.FaceDetection.timestamp >= since
+    )
+    if camera_id is not None:
+        query = query.filter(models.FaceDetection.camera_id == camera_id)
+    if status:
+        query = query.filter(models.FaceDetection.recognition_status == status)
+
+    total = query.count()
+    rows = (query.order_by(desc(models.FaceDetection.id))
+            .offset(offset).limit(limit).all())
+    names = _camera_names(db)
+    return {
+        "total": total,
+        "count": len(rows),
+        "offset": offset,
+        "detections": [{
+            "id": r.id,
+            "camera_id": r.camera_id,
+            "camera_name": names.get(r.camera_id, f"CAM-{r.camera_id:02d}"),
+            "alert_id": r.alert_id,
+            "timestamp": r.timestamp,
+            "timestamp_ist": r.timestamp_ist,
+            "confidence": round(float(r.confidence or 0.0), 3),
+            "track_id": r.track_id,
+            "recognition_status": r.recognition_status,
+            "identity_id": r.identity_id,
+            "identity_name": r.identity_name,
+            "similarity": round(float(r.similarity or 0.0), 3),
+            "similarity_threshold": round(float(r.similarity_threshold or 0.0), 3),
+            "source_type": r.source_type,
+            "has_evidence": bool(r.evidence_path),
+            "evidence_url": _detection_evidence_url("faces", r.id, r.evidence_path),
+            "evidence_sha256": r.evidence_sha256,
+        } for r in rows],
+    }
+
+
+@app.get("/api/faces/detections/{detection_id}/evidence")
+def get_face_evidence(detection_id: int, db: Session = Depends(get_db_session)):
+    row = db.query(models.FaceDetection).filter(
+        models.FaceDetection.id == detection_id).first()
+    if not row or not row.evidence_path:
+        raise HTTPException(404, "No evidence image for this detection")
+    return _serve_evidence(row.evidence_path, "image/jpeg")
 
 
 # --------------------------------------------------------------------------- #

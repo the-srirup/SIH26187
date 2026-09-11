@@ -359,6 +359,46 @@ class _InferenceRequest:
     error: Optional[Exception] = None
 
 
+def _precision_kwargs(use_half: bool) -> dict:
+    """
+    Express FP16 in whichever form the installed ultralytics understands.
+
+    ultralytics 8.4 replaced ``half=`` with a unified ``quantize=`` scheme
+    (16 = FP16, 8 = INT8, None = FP32) and warns on the old name. That warning
+    is emitted **inside every predict call**, so on a 15 fps feed it printed
+    fifteen identical deprecation lines per second per camera, which is exactly
+    the per-frame log spam that makes a real fault invisible in an incident
+    review. Detected once at import rather than probed per call.
+    """
+    if not use_half:
+        return {}
+    return {"quantize": 16} if _SUPPORTS_QUANTIZE else {"half": True}
+
+
+def _detect_quantize_support() -> bool:
+    try:
+        from ultralytics.cfg import get_cfg  # noqa: F401
+        import ultralytics.cfg as _cfg
+
+        return "quantize" in getattr(_cfg, "CFG_INT_KEYS", set()) or _cfg_has_quantize()
+    except Exception:
+        return False
+
+
+def _cfg_has_quantize() -> bool:
+    """True when the packaged default config declares ``quantize``."""
+    try:
+        import ultralytics.cfg as _cfg
+        from ultralytics.utils import DEFAULT_CFG_DICT
+
+        return "quantize" in DEFAULT_CFG_DICT
+    except Exception:
+        return False
+
+
+_SUPPORTS_QUANTIZE = _detect_quantize_support()
+
+
 class Detector:
     """
     Shared YOLO model with adaptive batched inference.
@@ -565,8 +605,8 @@ class Detector:
             max_det=settings.MAX_DETECTIONS,
             classes=settings.DETECT_CLASSES or None,
             device=self.device,
-            half=self.half,
             verbose=False,
+            **_precision_kwargs(self.half),
         )
         return [self._parse(result) for result in results]
 
@@ -625,8 +665,8 @@ class Detector:
                     max_det=settings.MAX_DETECTIONS,
                     classes=settings.DETECT_CLASSES or None,
                     device=self.device,
-                    half=self.half,
                     verbose=False,
+                    **_precision_kwargs(self.half),
                 )[0]
             xyxy, conf, cls = self._parse(results)
 

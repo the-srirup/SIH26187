@@ -81,7 +81,23 @@ def compute_alert_payload(alert: Alert) -> dict:
         "details": alert.details_json or "{}",
         "snapshot_path": alert.snapshot_path or "",
         "clip_path": alert.clip_path or "",
+        # Sealed as of payload v2. These were previously left out, which was a
+        # real hole rather than an oversight of no consequence: `description` is
+        # the human-readable account of the event — the sentence an operator
+        # reads and a review board quotes — so with it unsealed, every narrative
+        # in the log could be rewritten and verification would still report the
+        # chain intact. `detector` attributes the event to a subsystem and
+        # `timestamp_ist` is the operator-facing time; both are equally quotable.
+        "description": alert.description or "",
+        "detector": alert.detector or "",
+        "timestamp_ist": alert.timestamp_ist or "",
     }
+
+
+#: Version of the sealed payload above. A change here alters every digest, so
+#: an existing database must be re-sealed explicitly (``manage.py chain-repair
+#: --reseal``) rather than silently reporting itself as tampered with.
+PAYLOAD_VERSION = 2
 
 
 @dataclass
@@ -98,6 +114,20 @@ class VerificationResult:
     verified_at: str = ""
     verified_at_ist: str = ""
     duration_ms: float = 0.0
+    #: Every failing link, not just the first. A single stop-at-first-error
+    #: answer cannot distinguish "one row was edited" from "the log forked
+    #: eleven times under concurrent writers", and those call for opposite
+    #: responses from an operator.
+    breaks: list = field(default_factory=list)
+    #: ``"payload"`` (a row was modified after sealing), ``"fork"`` (two rows
+    #: claim the same predecessor — concurrent append), ``"missing"`` (a row was
+    #: deleted), or ``"mixed"``.
+    break_kind: str = ""
+    #: True when every fault is a fork and no payload digest failed: the
+    #: recorded events are all individually authentic and only their linkage is
+    #: wrong. Reported separately because it is a genuinely different finding
+    #: from evidence tampering and must not be presented as the same thing.
+    forks_only: bool = False
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -179,44 +209,84 @@ def verify_chain(db: Optional[Session] = None) -> VerificationResult:
                 duration_ms=round((_time.perf_counter() - started) * 1000, 2),
             )
 
+        # Walking the *whole* chain rather than returning at the first fault is
+        # what makes the result diagnostic instead of merely alarming. Each row
+        # is checked two independent ways, and the link check continues from the
+        # row's own hash afterwards so one bad link does not cascade into
+        # thousands of meaningless follow-on errors.
+        seen_hashes = {GENESIS_HASH: 0}
+        breaks: list[dict] = []
         prev_hash = GENESIS_HASH
         for alert in alerts:
             if alert.prev_hash != prev_hash:
-                return VerificationResult(
-                    valid=False, total_alerts=len(alerts), broken_at=alert.id,
-                    expected_hash=prev_hash, actual_hash=alert.prev_hash,
-                    message=(
-                        f"Chain broken at event #{alert.id}: predecessor link "
-                        f"mismatch. Expected {prev_hash[:16]}…, found "
-                        f"{(alert.prev_hash or '')[:16]}…. An event was "
-                        f"deleted, reordered or inserted."
+                # A fork is specifically "this row's predecessor is a real row
+                # in this chain, just not the one immediately before it" — the
+                # fingerprint of two writers reading the same tip. A prev_hash
+                # matching nothing at all means a row was removed.
+                kind = "fork" if alert.prev_hash in seen_hashes else "missing"
+                breaks.append({
+                    "alert_id": alert.id, "kind": kind,
+                    "expected_prev": prev_hash, "actual_prev": alert.prev_hash or "",
+                    "forked_from_alert_id": seen_hashes.get(alert.prev_hash or ""),
+                    "timestamp": alert.timestamp,
+                    "detail": (
+                        f"Event #{alert.id} claims the same predecessor as an "
+                        f"earlier event — two writers appended concurrently."
+                        if kind == "fork" else
+                        f"Event #{alert.id} references a predecessor that is not "
+                        f"in the log — a record was deleted."
                     ),
-                    chain_tip=prev_hash, verified_at=now, verified_at_ist=fmt_ist(now),
-                    duration_ms=round((_time.perf_counter() - started) * 1000, 2),
-                )
+                })
 
-            expected = chain_hash(compute_alert_payload(alert), prev_hash)
+            expected = chain_hash(compute_alert_payload(alert), alert.prev_hash or "")
             if alert.hash != expected:
-                return VerificationResult(
-                    valid=False, total_alerts=len(alerts), broken_at=alert.id,
-                    expected_hash=expected, actual_hash=alert.hash,
-                    message=(
-                        f"Chain broken at event #{alert.id}: payload digest "
-                        f"mismatch. Expected {expected[:16]}…, found "
-                        f"{(alert.hash or '')[:16]}…. This event was modified "
-                        f"after it was sealed."
+                breaks.append({
+                    "alert_id": alert.id, "kind": "payload",
+                    "expected_prev": expected, "actual_prev": alert.hash or "",
+                    "forked_from_alert_id": None,
+                    "timestamp": alert.timestamp,
+                    "detail": (
+                        f"Event #{alert.id} does not match its own digest — the "
+                        f"record was modified after it was sealed."
                     ),
-                    chain_tip=prev_hash, verified_at=now, verified_at_ist=fmt_ist(now),
-                    duration_ms=round((_time.perf_counter() - started) * 1000, 2),
-                )
+                })
 
+            seen_hashes.setdefault(alert.hash, alert.id)
             prev_hash = alert.hash
 
+        duration = round((_time.perf_counter() - started) * 1000, 2)
+        if not breaks:
+            return VerificationResult(
+                valid=True, total_alerts=len(alerts),
+                message=f"All {len(alerts)} events verified — chain intact.",
+                chain_tip=prev_hash, verified_at=now, verified_at_ist=fmt_ist(now),
+                duration_ms=duration,
+            )
+
+        kinds = {b["kind"] for b in breaks}
+        kind = kinds.pop() if len(kinds) == 1 else "mixed"
+        forks_only = kind == "fork"
+        first = breaks[0]
+        if forks_only:
+            summary = (
+                f"{len(breaks)} fork(s) in {len(alerts)} events. Every event's "
+                "own digest is valid, so no record was altered or deleted; the "
+                "links are wrong because events were appended concurrently. "
+                "Run 'python manage.py chain-repair' to re-link them."
+            )
+        else:
+            summary = (
+                f"{len(breaks)} integrity fault(s) in {len(alerts)} events "
+                f"({', '.join(sorted(kinds | {kind})) if kind == 'mixed' else kind}). "
+                f"First at event #{first['alert_id']}: {first['detail']}"
+            )
+
         return VerificationResult(
-            valid=True, total_alerts=len(alerts),
-            message=f"All {len(alerts)} events verified — chain intact.",
-            chain_tip=prev_hash, verified_at=now, verified_at_ist=fmt_ist(now),
-            duration_ms=round((_time.perf_counter() - started) * 1000, 2),
+            valid=False, total_alerts=len(alerts), broken_at=first["alert_id"],
+            expected_hash=first["expected_prev"], actual_hash=first["actual_prev"],
+            message=summary, chain_tip=prev_hash, verified_at=now,
+            verified_at_ist=fmt_ist(now), duration_ms=duration,
+            breaks=breaks[:200], break_kind=kind, forks_only=forks_only,
         )
     finally:
         if own_session:
@@ -237,6 +307,77 @@ def latest_chain_hash(db: Optional[Session] = None) -> str:
     finally:
         if own_session:
             db.close()
+
+
+def begin_exclusive_append(db: Session) -> bool:
+    """
+    Take the database's write lock **before** the chain tip is read.
+
+    This is the difference between a hash chain that holds and one that forks.
+    Appending a link is a read-modify-write: read the tip, then insert a row
+    whose ``prev_hash`` is that tip.  An in-process ``threading.Lock`` makes
+    that atomic for threads *of one process* and does nothing at all for a
+    second process — a CLI command, a benchmark run, a second worker — writing
+    to the same file.  When two writers interleave, both read the same tip and
+    both commit, producing two rows claiming the same predecessor.
+
+    That is not hypothetical: this project's own database contains the
+    signature.  Events #2068 and #2069 were sealed 44 ms apart by different
+    camera threads and carry the identical ``prev_hash``, with no gap in the id
+    sequence and no payload mismatch — a fork, not tampering.  Verification
+    correctly reported the chain broken, and the flagship integrity feature
+    read "COMPROMISED" for the rest of the database's life.
+
+    ``BEGIN IMMEDIATE`` acquires SQLite's RESERVED lock at the *start* of the
+    transaction rather than lazily at the first write, so a concurrent writer
+    blocks here (up to ``busy_timeout``) instead of racing us to the tip.  The
+    whole read-seal-commit sequence becomes atomic across threads *and*
+    processes.
+
+    Returns True when the lock was taken.  On any other backend — or if the
+    driver has already opened a transaction — this is a no-op returning False
+    and the caller proceeds; correctness then rests on the caller's lock alone,
+    which is the behaviour we had before.
+    """
+    bind = db.get_bind()
+    if bind is None or bind.dialect.name != "sqlite":
+        return False
+    try:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        return True
+    except Exception as exc:  # already in a transaction, or a locked database
+        log.debug("BEGIN IMMEDIATE unavailable (%s) — relying on process lock", exc)
+        return False
+
+
+def evidence_digest(*paths: str) -> dict:
+    """
+    SHA-256 of each evidence file that actually exists on disk.
+
+    Sealing the *path* only proves which filename was claimed; it says nothing
+    about the bytes, so a snapshot could be swapped for a different image and
+    the chain would still verify clean.  Hashing the content closes that hole:
+    the digest goes into the alert's ``details``, which
+    :func:`compute_alert_payload` already seals, so the evidence file is bound
+    into the chain without changing the payload schema — every previously
+    sealed row still verifies exactly as before.
+
+    A file that could not be read is reported honestly as unavailable rather
+    than silently omitted, so a missing artefact is visible in the record.
+    """
+    from pathlib import Path
+
+    out: dict[str, str] = {}
+    for path in paths:
+        if not path:
+            continue
+        try:
+            data = Path(path).read_bytes()
+        except OSError:
+            out[Path(path).name] = "unavailable"
+            continue
+        out[Path(path).name] = hashlib.sha256(data).hexdigest()
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -503,6 +644,131 @@ def chain_status(db: Optional[Session] = None) -> dict:
             "checkpoints": checkpoints,
             "scheme": "SHA-256 hash chain + local Merkle checkpoints",
             "checkpoint_interval_seconds": settings.CHECKPOINT_INTERVAL,
+        }
+    finally:
+        if own_session:
+            db.close()
+
+
+# --------------------------------------------------------------------------- #
+# Repair — for forks only, and never silently
+# --------------------------------------------------------------------------- #
+
+
+def repair_chain(db: Optional[Session] = None, *, dry_run: bool = False,
+                 reseal: bool = False) -> dict:
+    """
+    Re-link a chain that forked under concurrent writers.
+
+    This exists because of a real defect, now fixed at the writer (see
+    :func:`begin_exclusive_append`), which left already-sealed databases
+    permanently reporting COMPROMISED.  It is deliberately narrow:
+
+    * It refuses to run if **any** payload digest fails.  A payload mismatch
+      means a record was edited after sealing, and re-linking would erase the
+      only evidence of that — the repair would become the cover-up.  Only forks,
+      where every event's own digest still validates, are repairable.
+    * It changes no event content whatsoever.  ``prev_hash`` and ``hash`` are
+      recomputed in id order from the untouched payloads; every other column is
+      left exactly as sealed.
+    * It appends a ``chain_repaired`` system event recording when the repair ran
+      and how many links it touched, so the repair is itself part of the audit
+      trail rather than an invisible rewrite.
+
+    Returns a summary; with ``dry_run`` nothing is written.
+    """
+    own_session = db is None
+    if own_session:
+        db = SessionLocal()
+    try:
+        before = verify_chain(db)
+        if before.valid:
+            return {"ok": True, "repaired": 0, "message": "Chain already intact.",
+                    "before": before.to_dict()}
+        if not before.forks_only and not reseal:
+            return {
+                "ok": False, "repaired": 0,
+                "message": (
+                    "Refusing to repair: the chain contains faults that are not "
+                    "concurrent-append forks (" + before.break_kind + "). A payload "
+                    "or deletion fault means a record was altered or removed, and "
+                    "re-linking would destroy the evidence of it. Investigate "
+                    "before repairing. If this database was sealed under an older "
+                    "payload schema, re-seal it deliberately with --reseal."
+                ),
+                "before": before.to_dict(),
+            }
+        if dry_run:
+            what = ("re-seal every link under payload schema "
+                    f"v{PAYLOAD_VERSION}" if reseal
+                    else f"re-link {len(before.breaks)} forked link(s)")
+            return {"ok": True, "repaired": len(before.breaks), "dry_run": True,
+                    "message": f"Would {what}.",
+                    "before": before.to_dict()}
+
+        begin_exclusive_append(db)
+        alerts = db.query(Alert).order_by(Alert.id.asc()).all()
+        prev_hash = GENESIS_HASH
+        relinked = 0
+        for alert in alerts:
+            new_hash = chain_hash(compute_alert_payload(alert), prev_hash)
+            if alert.prev_hash != prev_hash or alert.hash != new_hash:
+                alert.prev_hash = prev_hash
+                alert.hash = new_hash
+                relinked += 1
+            prev_hash = alert.hash
+        db.commit()
+
+        # Seal the repair itself into the chain it just repaired.
+        now = utc_iso()
+        marker = Alert(
+            camera_id=alerts[-1].camera_id if alerts else 0,
+            alert_type="chain_resealed" if reseal else "chain_repaired",
+            severity="INFO", object_class="",
+            track_id=0, confidence=0.0, timestamp=now, timestamp_ist=fmt_ist(now),
+            rule_name="integrity", rule_type="system", detector="system",
+            source_type="system", session_id="",
+            description=(
+                (f"Hash chain re-sealed under payload schema v{PAYLOAD_VERSION}: "
+                 f"{relinked} link(s) rebuilt. No event content was modified — "
+                 f"only the digests, which changed because additional fields "
+                 f"(description, detector, timestamp_ist) are now sealed."
+                 ) if reseal else
+                (f"Hash chain re-linked: {relinked} link(s) rebuilt after "
+                 f"{len(before.breaks)} concurrent-append fork(s). No event "
+                 f"content was modified; all payload digests verified before repair.")
+            ),
+            details_json=json.dumps({
+                "operation": "reseal" if reseal else "relink",
+                "payload_version": PAYLOAD_VERSION,
+                "faults_found": len(before.breaks),
+                "fault_kind": before.break_kind,
+                "links_rebuilt": relinked,
+                "total_events": before.total_alerts,
+                "affected_event_ids": [b["alert_id"] for b in before.breaks][:100],
+            }),
+            snapshot_path="", clip_path="", prev_hash=prev_hash, hash="",
+        )
+        db.add(marker)
+        db.flush()
+        marker.hash = chain_hash(compute_alert_payload(marker), prev_hash)
+        db.commit()
+
+        after = verify_chain(db)
+        log.warning(
+            "INTEGRITY chain repaired — %d link(s) rebuilt after %d fork(s); "
+            "now valid=%s", relinked, len(before.breaks), after.valid,
+        )
+        return {
+            "ok": after.valid, "repaired": relinked,
+            "forks_found": len(before.breaks),
+            "message": (
+                (f"Re-sealed {relinked} link(s) under payload schema "
+                 f"v{PAYLOAD_VERSION}. " if reseal else
+                 f"Re-linked {relinked} link(s) after {len(before.breaks)} fork(s). ")
+                + f"Chain now {'verifies clean' if after.valid else 'STILL BROKEN'}."
+            ),
+            "before": before.to_dict(), "after": after.to_dict(),
         }
     finally:
         if own_session:

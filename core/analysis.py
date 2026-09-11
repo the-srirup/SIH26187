@@ -326,7 +326,7 @@ class AnalysisJob:
         recognizer = analyzer._face()
         if recognizer is not None:
             for match in result.faces:
-                alert = recognizer.build_event(match)
+                alert = recognizer.build_event(match, analyzer.source_id)
                 if alert is None:
                     continue
                 if events.record(
@@ -342,7 +342,7 @@ class AnalysisJob:
         processor = analyzer._anpr_processor()
         if processor is not None:
             for plate in result.plates:
-                alert = processor.build_event(plate)
+                alert = processor.build_event(plate, analyzer.source_id)
                 if alert is None:
                     continue
                 if events.record(

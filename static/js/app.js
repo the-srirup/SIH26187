@@ -120,6 +120,7 @@ const IBVAP = (() => {
       grid.innerHTML =
         '<div class="placeholder"><p>No cameras registered.</p>' +
         '<p class="muted">Add an RTSP/HTTP stream, a webcam index, or a video file.</p></div>';
+      state.tiles.forEach((t) => t.destroy?.());
       state.tiles.clear();
       return;
     }
@@ -133,8 +134,9 @@ const IBVAP = (() => {
     // Remove tiles for cameras that no longer exist.
     [...state.tiles.keys()].forEach((id) => {
       if (!seen.has(id)) {
-        state.tiles.get(id).root.remove();
-        state.tiles.delete(id);
+        const tile = state.tiles.get(id);
+        state.tiles.delete(id);          // delete first: stops the retry loop
+        tile.destroy?.();
       }
     });
     grid.querySelector('.placeholder')?.remove();
@@ -172,8 +174,33 @@ const IBVAP = (() => {
       </div>`;
 
     const img = root.querySelector('img');
-    img.src = `/stream/${cam.id}?t=${Date.now()}`;
-    img.onerror = () => { img.src = `/stream/${cam.id}?t=${Date.now()}`; };
+    // Reconnect with exponential backoff, and stop entirely once the camera is
+    // gone from our state.
+    //
+    // This used to be `img.onerror = () => { img.src = ... }` with no delay at
+    // all. An <img> pointed at a stream that errors immediately — a removed
+    // camera returning 404, a source that will not open — fires onerror, which
+    // assigns src, which errors again, as fast as the browser can loop. That is
+    // a self-inflicted denial of service: the tab pins a core rendering nothing
+    // while the server answers thousands of requests a second, which is the
+    // "the site lags / removing a camera behaves unpredictably" symptom, seen
+    // from the client side rather than the pipeline.
+    let retryDelay = 1000;
+    let retryTimer = null;
+    const connect = () => {
+      img.src = `/stream/${cam.id}?t=${Date.now()}`;
+    };
+    img.onload = () => { retryDelay = 1000; };
+    img.onerror = () => {
+      if (retryTimer) return;                   // one retry in flight at a time
+      if (!state.tiles.has(cam.id)) return;     // camera removed — do not retry
+      retryTimer = setTimeout(() => {
+        retryTimer = null;
+        if (state.tiles.has(cam.id)) connect();
+      }, retryDelay);
+      retryDelay = Math.min(retryDelay * 2, 30000);
+    };
+    connect();
 
     const [fence, restart, events, remove] = root.querySelectorAll('.camera-tools .btn');
     fence.onclick = () => openFence(cam.id, cam.name);
@@ -184,6 +211,17 @@ const IBVAP = (() => {
     $('camera-grid').appendChild(root);
     state.tiles.set(cam.id, {
       root,
+      // Detaching the element is not enough to end an MJPEG request: the
+      // response never completes, so the browser can hold the connection (and
+      // the server-side generator) open on a camera that no longer exists.
+      // Clearing the handler first, then the src, is what actually closes it.
+      destroy() {
+        if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
+        img.onerror = null;
+        img.onload = null;
+        img.src = '';
+        root.remove();
+      },
       dot: root.querySelector('.camera-badge .dot'),
       status: root.querySelector('.b-status'),
       night: root.querySelector('.camera-night'),
@@ -198,8 +236,17 @@ const IBVAP = (() => {
     cameraStats.forEach((s) => {
       const tile = state.tiles.get(s.camera_id);
       if (!tile) return;
-      tile.dot.className = `dot ${s.online ? 'dot-ok' : 'dot-down'}`;
-      tile.status.textContent = s.online ? 'LIVE' : 'OFFLINE';
+      // Show the lifecycle state, not just online/offline. "Connecting" and
+      // "Error" used to render identically as a red OFFLINE dot, so an operator
+      // could not tell a stream that needs a few more seconds from one whose
+      // URL is wrong.
+      const colour = { green: 'dot-ok', amber: 'dot-warn', red: 'dot-down',
+                       grey: 'dot-idle' }[s.state_colour] || 'dot-down';
+      tile.dot.className = `dot ${colour}`;
+      tile.status.textContent = s.online
+        ? 'LIVE'
+        : (s.state_label || 'OFFLINE').toUpperCase();
+      tile.status.title = s.state_detail || '';
       tile.root.classList.toggle('offline', !s.online);
       tile.night.hidden = !s.night_mode;
       if (s.night_mode && s.scene) {
@@ -251,8 +298,9 @@ const IBVAP = (() => {
     )) return;
     try {
       const result = await api(`/api/cameras/${id}`, { method: 'DELETE' });
-      state.tiles.get(id)?.root.remove();
-      state.tiles.delete(id);
+      const tile = state.tiles.get(id);
+      state.tiles.delete(id);            // delete first: stops the retry loop
+      tile?.destroy?.();
       toast(result.detail || `Removed ${name}`, 'ok', 6500);
       await loadCameras();
     } catch (err) {

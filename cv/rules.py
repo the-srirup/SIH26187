@@ -712,6 +712,16 @@ class LoiterRule(BaseRule):
             classes = list(settings.LOITER_CLASSES or [])
         self.classes = {c.lower() for c in classes}
         self._state: dict[int, _LoiterState] = {}
+        #: Longest dwell this rule has actually observed, and how many visits it
+        #: has seen. Without this the rule is silent in exactly the case an
+        #: operator most needs to understand: nobody has yet stayed long enough.
+        #: "No alert" and "the threshold is set above anything that happens
+        #: here" look identical from the outside, and the second is a
+        #: configuration mistake the operator can fix — but only if they can see
+        #: it. Reported through the camera's stats, never as a fabricated alert.
+        self.longest_dwell_seen = 0.0
+        self.visits_seen = 0
+        self.alerts_raised = 0
 
     # -- description ---------------------------------------------------- #
     @property
@@ -726,7 +736,15 @@ class LoiterRule(BaseRule):
                 "dwell_seconds": self.dwell_seconds,
                 "exit_grace_seconds": self.exit_grace,
                 "realert_seconds": self.realert_seconds,
-                "classes": sorted(self.classes) or "all"}
+                "classes": sorted(self.classes) or "all",
+                "longest_dwell_seen": round(self.longest_dwell_seen, 1),
+                "visits_seen": self.visits_seen,
+                "alerts_raised": self.alerts_raised,
+                # The operator-facing explanation of a quiet zone.
+                "threshold_reachable": (
+                    self.longest_dwell_seen >= self.dwell_seconds
+                    if self.visits_seen else None
+                )}
 
     # -- evaluation ----------------------------------------------------- #
     def update(self, track_id: int, foot_point: tuple[int, int], **kwargs) -> Optional[Alert]:
@@ -764,6 +782,7 @@ class LoiterRule(BaseRule):
             self._state[track_id] = _LoiterState(
                 entered_at=now, last_inside=now, last_seen=now
             )
+            self.visits_seen += 1
             return None
 
         state.outside_since = None
@@ -775,6 +794,8 @@ class LoiterRule(BaseRule):
             return None
 
         dwell = now - state.entered_at
+        if dwell > self.longest_dwell_seen:
+            self.longest_dwell_seen = dwell
         if dwell < self.dwell_seconds:
             return None
 
@@ -785,6 +806,7 @@ class LoiterRule(BaseRule):
                 return None
 
         state.alerted_at = now
+        self.alerts_raised += 1
         return Alert(
             rule_name=self.name, rule_type=self.rule_type, track_id=track_id,
             alert_type="loiter", timestamp=now,
@@ -871,13 +893,21 @@ class NightMovementRule(BaseRule):
         )
         #: Net displacement required, as a fraction of ``min_travel``.
         self.net_ratio = float(settings.NIGHT_MOVEMENT_NET_RATIO)
+        #: Speed-based qualifier, for objects that cross the frame faster than
+        #: they can be observed for the full distance window.
+        self.min_speed = float(settings.NIGHT_MOVEMENT_MIN_SPEED)
+        self.min_observation = float(settings.NIGHT_MOVEMENT_MIN_OBSERVATION)
+        self.min_net_floor = float(settings.NIGHT_MOVEMENT_MIN_NET_FLOOR)
         self._state: dict[int, _NightState] = {}
 
     def describe(self) -> dict:
         return {**super().describe(),
                 "min_travel_px": self.min_travel,
                 "window_seconds": self.window_seconds,
-                "debounce_seconds": self.debounce_seconds}
+                "debounce_seconds": self.debounce_seconds,
+                "min_speed_px_s": self.min_speed,
+                "min_observation_seconds": self.min_observation,
+                "min_net_floor_px": self.min_net_floor}
 
     def update(self, track_id: int, foot_point: tuple[int, int], **kwargs) -> Optional[Alert]:
         now = _resolve_time(kwargs.get("timestamp"))
@@ -917,8 +947,36 @@ class NightMovementRule(BaseRule):
         # across the scene. (Pacing on the spot is loitering, and the loiter
         # rule is what reports it.)
         net = distance(points[0], points[-1])
-        if travelled < self.min_travel or net < self.min_travel * self.net_ratio:
+        observed = state.trail[-1][0] - state.trail[0][0]
+
+        # Two ways to qualify, because one absolute distance threshold is biased
+        # by how long the object happens to stay in view.
+        #
+        # This is the measured cause of "night detection works for people but
+        # not vehicles". On this project's night clip a person is tracked for
+        # 4.2 s and accumulates 338 px — trivially over the 45 px bar — while a
+        # car is detected at higher confidence (0.75) but tracked for only 0.8 s
+        # and accumulates 37 px, and is rejected. The car was never the problem:
+        # a pedestrian dawdles through frame for seconds, a vehicle crosses it
+        # in under one, so a pure distance test quietly encodes "slow, long-lived
+        # subject" as its definition of movement.
+        #
+        # So a *rate* qualifies too: 37 px in 0.8 s is 46 px/s, which is
+        # sustained movement by any reading. The rate is computed from net
+        # displacement rather than path length precisely so box jitter — which
+        # inflates path while going nowhere — cannot satisfy it, and it still
+        # requires a real observation window and a floor on net displacement so
+        # a one-frame flicker cannot trigger an alert.
+        by_distance = travelled >= self.min_travel and net >= self.min_travel * self.net_ratio
+        by_speed = (
+            observed >= self.min_observation
+            and len(points) >= 3
+            and net >= self.min_net_floor
+            and (net / max(observed, 1e-6)) >= self.min_speed
+        )
+        if not (by_distance or by_speed):
             return None
+        qualifier = "distance" if by_distance else "speed"
         if state.alerted_at is not None and now - state.alerted_at < self.debounce_seconds:
             return None
 
@@ -929,11 +987,14 @@ class NightMovementRule(BaseRule):
             alert_type="night_movement", timestamp=now,
             description=(
                 f"Movement detected in a dark scene "
-                f"({travelled:.0f}px travelled, {net:.0f}px net, in {window:.1f}s)"
+                f"({travelled:.0f}px travelled, {net:.0f}px net, in {window:.1f}s"
+                f", {net / max(window, 1e-6):.0f}px/s — qualified by {qualifier})"
             ),
             details={
                 "travelled_px": round(travelled, 1),
                 "net_displacement_px": round(net, 1),
+                "speed_px_per_s": round(net / max(window, 1e-6), 1),
+                "qualified_by": qualifier,
                 "min_travel_px": self.min_travel,
                 "window_seconds": round(window, 2),
                 "night_source": kwargs.get("night_source", "darkness"),
@@ -1001,6 +1062,16 @@ class RuleEngine:
 
     def get_rules(self) -> list[BaseRule]:
         return list(self._rules.values())
+
+    def diagnostics(self) -> list[dict]:
+        """
+        What each armed rule has actually observed.
+
+        Exposed so a zone that has raised no alerts can explain itself. A silent
+        rule is ambiguous — correctly quiet, or configured past anything that
+        happens in this scene — and only the rule knows which.
+        """
+        return [rule.describe() for rule in self._rules.values()]
 
     def reset_state(self) -> None:
         """

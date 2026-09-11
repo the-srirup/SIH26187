@@ -91,7 +91,11 @@ class FaceRecognizer:
         self._similarity_threshold = settings.FACE_SIMILARITY_THRESHOLD
         self._enabled = INSIGHTFACE_AVAILABLE
         self._frame_count = 0
-        self._last_processed_frame = -1
+        #: Per-stream cadence bookkeeping. This recognizer is a process-wide
+        #: singleton, so a single counter was advanced by whichever camera
+        #: happened to call last: with four cameras the cadence gate fired for
+        #: one of them and starved the rest.
+        self._last_processed_frame: dict[str, int] = {}
         self._inference_lock = threading.Lock()
         self._providers: list[str] = []
         #: Debounce keys for face events, so one person in view produces one
@@ -102,8 +106,12 @@ class FaceRecognizer:
         #              last_seen_monotonic)
         # This cache stops expensive ArcFace embedding on every frame for the
         # same person. We only refresh after a configurable TTL.
+        #: Keyed by ``(source_id, track_id)``. Track ids are unique only within
+        #: one camera, so a bare track id let camera 2's subject inherit camera
+        #: 1's identity match — a false identification across cameras, which in
+        #: a border-security log is the most damaging error the system could make.
         self._track_match_cache: dict[
-            int, tuple[Optional[int], Optional[str], float, bool, float]
+            tuple, tuple[Optional[int], Optional[str], float, bool, float]
         ] = {}
 
         if self._enabled:
@@ -350,13 +358,34 @@ class FaceRecognizer:
         detections: Optional[list] = None,
         frame_number: Optional[int] = None,
         force: bool = False,
+        source_frame: Optional[np.ndarray] = None,
+        source_id: str = "default",
     ) -> list[FaceMatch]:
         """
         Detect faces in a frame and match against the watchlist.
 
         When ``detections`` is provided we use YOLO person boxes to associate
         face embeddings with track-ids and cache similarly.
+
+        ``source_frame`` is the camera's frame *before* the resize to analytics
+        resolution, and supplying it is the difference between this stage
+        working and returning nothing at all.
+
+        Faces were previously searched for in the 640x384 analytics frame.
+        Measured on this project's own footage, a person at realistic range
+        occupies a bbox about 81 px tall there, which puts their face at roughly
+        11-13 px — far below ``FACE_MIN_HEIGHT`` (32), and below what SCRFD can
+        resolve in any case.  Every face was therefore discarded before it was
+        ever embedded, which is why 2370 recorded events contained not one face.
+        The detail was not missing from the camera; it was thrown away by the
+        resize a stage earlier.  On a 1080p feed the same face is ~38 px tall.
+
+        Detection and matching therefore run on the highest-resolution pixels
+        available, while returned bounding boxes are mapped back to analytics
+        coordinates so the overlay, the rules and the evidence crop all keep
+        working in one coordinate system.
         """
+        stream = str(source_id)
         self._frame_count = frame_number if frame_number is not None else self._frame_count + 1
 
         if not self._enabled or self._app is None:
@@ -369,13 +398,29 @@ class FaceRecognizer:
         # We still refresh every N frames. For immediate tests/API calls force
         # can be used to bypass the cadence.
         cadence_ok = (
-            self._frame_count - self._last_processed_frame
+            self._frame_count - self._last_processed_frame.get(stream, -10_000)
             >= settings.FACE_RECOGNITION_EVERY_N_FRAMES
         )
         if not force and not cadence_ok:
-            return self._cached_matches_for_frame(detections)
+            return self._cached_matches_for_frame(detections, stream)
 
-        self._last_processed_frame = self._frame_count
+        self._last_processed_frame[stream] = self._frame_count
+
+        # Prefer the pre-resize frame. ``scale`` converts analytics coordinates
+        # to source coordinates; face boxes are divided back out afterwards so
+        # every consumer still sees analytics coordinates.
+        # Per-axis scales, not one. The analytics frame is 640x384 (aspect
+        # 1.667) while a typical camera is 16:9 (1.778), so the resize is not
+        # uniform: 1920/640 = 3.000 horizontally but 1080/384 = 2.8125
+        # vertically. Scaling both axes by the width ratio puts a face box ~11 px
+        # too high at 1080p — enough to crop a forehead instead of a face.
+        search_frame, scale = frame, (1.0, 1.0)
+        if source_frame is not None and getattr(source_frame, "size", 0):
+            src_h, src_w = source_frame.shape[:2]
+            frm_h, frm_w = frame.shape[:2]
+            if src_w > frm_w and frm_w > 0 and frm_h > 0:
+                search_frame = source_frame
+                scale = (src_w / float(frm_w), src_h / float(frm_h))
 
         # Build track_id -> person bbox map. We prefer to crop/search around
         # people only when person detections are available. If none are
@@ -390,9 +435,13 @@ class FaceRecognizer:
         with self._inference_lock:
             try:
                 if person_map:
-                    faces_and_tracks = self._detect_in_person_boxes(frame, person_map, min_height)
+                    faces_and_tracks = self._detect_in_person_boxes(
+                        search_frame, person_map, min_height, scale=scale
+                    )
                 else:
-                    faces_and_tracks = self._detect_full_frame(frame, min_height)
+                    faces_and_tracks = self._detect_full_frame(
+                        search_frame, min_height, scale=scale
+                    )
             except Exception as e:
                 log.error("Face detection failed: %s", e)
                 return []
@@ -417,7 +466,7 @@ class FaceRecognizer:
             matches.append(match)
 
             if track_id is not None:
-                self._track_match_cache[track_id] = (
+                self._track_match_cache[(stream, track_id)] = (
                     match.watchlist_id,
                     match.watchlist_name,
                     match.similarity,
@@ -427,7 +476,8 @@ class FaceRecognizer:
 
         return matches
 
-    def _cached_matches_for_frame(self, detections: Optional[list]) -> list[FaceMatch]:
+    def _cached_matches_for_frame(self, detections: Optional[list],
+                                  source_id: str = "default") -> list[FaceMatch]:
         """
         Rebuild FaceMatch results from cached track-id data between actual
         inference frames. This keeps streaming pipelines lightweight.
@@ -441,12 +491,12 @@ class FaceRecognizer:
         for det in detections:
             if getattr(det, "class_name", "").lower() != "person":
                 continue
-            cached = self._track_match_cache.get(det.track_id)
+            cached = self._track_match_cache.get((str(source_id), det.track_id))
             if not cached:
                 continue
             watchlist_id, name, sim, matched, last_seen = cached
             if now - last_seen > ttl:
-                self._track_match_cache.pop(det.track_id, None)
+                self._track_match_cache.pop((str(source_id), det.track_id), None)
                 continue
             bbox = tuple(map(int, det.bbox))
             matches.append(
@@ -463,14 +513,18 @@ class FaceRecognizer:
             )
         return matches
 
-    def _detect_full_frame(self, frame: np.ndarray, min_height: int) -> list[tuple]:
+    def _detect_full_frame(self, frame: np.ndarray, min_height: int,
+                           scale: tuple[float, float] = (1.0, 1.0)) -> list[tuple]:
         """
         Run SCRFD on the full frame, returning ``(face, track_id, bbox)``.
         No YOLO track association is available, so ``track_id`` is None.
+
+        ``scale`` is the source-to-analytics ratio; boxes are divided by it so
+        callers always receive analytics coordinates.
         """
         faces = self._safe_face_get(frame)
         return [
-            (face, None, self._bbox_from_face(face))
+            (face, None, self._bbox_from_face(face, scale=scale))
             for face in faces
             if self._face_height(face) >= min_height
         ]
@@ -480,6 +534,7 @@ class FaceRecognizer:
         frame: np.ndarray,
         person_map: dict[int, tuple[int, int, int, int]],
         min_height: int,
+        scale: tuple[float, float] = (1.0, 1.0),
     ) -> list[tuple]:
         """
         Run face detection inside each person bbox, with full-frame fallback.
@@ -499,7 +554,11 @@ class FaceRecognizer:
         ordered = sorted(person_map.items(), key=_box_area, reverse=True)
         limit = max(1, int(settings.FACE_MAX_CROPS_PER_TICK))
         for track_id, bbox in ordered[:limit]:
-            x1, y1, x2, y2 = map(int, bbox)
+            # Person boxes arrive in analytics coordinates; the frame we are
+            # searching may be the larger source frame.
+            sx, sy = scale
+            x1, y1 = int(bbox[0] * sx), int(bbox[1] * sy)
+            x2, y2 = int(bbox[2] * sx), int(bbox[3] * sy)
             # Expand slightly so a hat/forehead is not excluded.
             h, w = frame.shape[:2]
             crop_x1 = max(0, x1 - int((x2 - x1) * 0.15))
@@ -510,13 +569,21 @@ class FaceRecognizer:
                 continue
 
             crop = frame[crop_y1:crop_y2, crop_x1:crop_x2]
+            # SCRFD is run at a fixed det_size, so a small crop is letterboxed
+            # up to it anyway; upscaling a genuinely tiny person crop first
+            # gives the detector more to work with at no extra inference cost.
+            crop = self._upscale_for_detection(crop, min_height)
+            crop_scale = crop.shape[1] / float(max(1, crop_x2 - crop_x1))
             faces = self._safe_face_get(crop)
             for face in faces:
                 if self._face_height(face) < min_height:
                     continue
 
-                # Convert crop-local bbox back to full-frame coordinates.
-                face_bbox = self._bbox_from_face(face, offset=(crop_x1, crop_y1))
+                # Crop-local -> search-frame -> analytics coordinates.
+                face_bbox = self._bbox_from_face(
+                    face, offset=(crop_x1, crop_y1), scale=scale,
+                    pre_scale=crop_scale,
+                )
                 results.append((face, track_id, face_bbox))
                 seen_regions.append(face_bbox)
 
@@ -525,7 +592,7 @@ class FaceRecognizer:
         # geometry. This preserves recall without running full-frame every
         # cadence tick.
         if not results:
-            full_results = self._detect_full_frame(frame, min_height)
+            full_results = self._detect_full_frame(frame, min_height, scale=scale)
             for face, _, face_bbox in full_results:
                 best_track_id = self._associate_face_bbox(face_bbox, person_map)
                 results.append((face, best_track_id, face_bbox))
@@ -619,16 +686,54 @@ class FaceRecognizer:
         )
 
     @staticmethod
+    def _upscale_for_detection(crop: np.ndarray, min_height: int) -> np.ndarray:
+        """
+        Enlarge a small person crop so the face within it clears ``min_height``.
+
+        SCRFD letterboxes whatever it is given up to its configured ``det_size``,
+        so feeding it a 60 px crop wastes most of that budget on padding. Scaling
+        the crop first costs one resize and no extra inference, and is capped so
+        a near-field subject is never needlessly blown up.
+        """
+        h, w = crop.shape[:2]
+        if h <= 0 or w <= 0:
+            return crop
+        # A face is roughly a seventh of a standing body; size the crop so that
+        # seventh lands comfortably above the minimum.
+        wanted = float(min_height) * 7.0 * 1.2
+        if h >= wanted:
+            return crop
+        factor = min(4.0, wanted / float(h))
+        if factor <= 1.05:
+            return crop
+        return cv2.resize(crop, (max(1, int(w * factor)), max(1, int(h * factor))),
+                          interpolation=cv2.INTER_CUBIC)
+
+    @staticmethod
     def _bbox_from_face(
         face,
         offset: tuple[int, int] = (0, 0),
+        scale: tuple[float, float] = (1.0, 1.0),
+        pre_scale: float = 1.0,
     ) -> tuple[int, int, int, int]:
+        """
+        Map a face box back to analytics coordinates.
+
+        Three frames are in play: the crop SCRFD actually saw (possibly
+        upscaled by ``pre_scale``), the search frame it was cut from, and the
+        analytics frame everything downstream works in (``scale`` smaller than
+        the search frame). Undoing both in one place keeps the overlay, the
+        rules and the evidence crop from each having to know about the resize.
+        """
         x1, y1, x2, y2 = face.bbox
+        pre = float(pre_scale) or 1.0
+        sx = float(scale[0]) or 1.0
+        sy = float(scale[1]) or 1.0
         return (
-            int(x1) + offset[0],
-            int(y1) + offset[1],
-            int(x2) + offset[0],
-            int(y2) + offset[1],
+            int((x1 / pre + offset[0]) / sx),
+            int((y1 / pre + offset[1]) / sy),
+            int((x2 / pre + offset[0]) / sx),
+            int((y2 / pre + offset[1]) / sy),
         )
 
     @staticmethod
@@ -643,11 +748,12 @@ class FaceRecognizer:
     # Pipeline integration
     # ------------------------------------------------------------------ #
 
-    def cached_matches(self, detections: Optional[list]) -> list[FaceMatch]:
+    def cached_matches(self, detections: Optional[list],
+                       source_id: str = "default") -> list[FaceMatch]:
         """Public accessor for cached per-track matches between cadence ticks."""
-        return self._cached_matches_for_frame(detections)
+        return self._cached_matches_for_frame(detections, source_id)
 
-    def build_event(self, match: FaceMatch):
+    def build_event(self, match: FaceMatch, source_id: str = "default"):
         """
         Turn a face result into a debounced event, or ``None``.
 
@@ -661,7 +767,7 @@ class FaceRecognizer:
         track_id = int(match.track_id) if match.track_id is not None else 0
 
         if match.matched and match.watchlist_name:
-            key = ("watchlist", match.watchlist_id, track_id)
+            key = (str(source_id), "watchlist", match.watchlist_id, track_id)
             window = settings.FACE_ALERT_DEBOUNCE_SECONDS
             alert_type = "watchlist_match"
             description = (
@@ -683,7 +789,7 @@ class FaceRecognizer:
             # face event for an actual detection.
             if match.det_score <= 0.0:
                 return None
-            key = ("face", track_id, 0)
+            key = (str(source_id), "face", track_id, 0)
             window = settings.FACE_DETECT_DEBOUNCE_SECONDS
             alert_type = "face_detected"
             description = (
@@ -720,7 +826,7 @@ class FaceRecognizer:
             "watchlist_count": len(self._watchlist),
             "threshold": self._similarity_threshold,
             "cached_tracks": len(self._track_match_cache),
-            "last_processed_frame": self._last_processed_frame,
+            "last_processed_frame": dict(self._last_processed_frame),
             "det_size": settings.FACE_DET_SIZE,
             "providers": self._providers,
             "cadence_frames": settings.FACE_RECOGNITION_EVERY_N_FRAMES,

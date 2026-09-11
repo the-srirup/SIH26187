@@ -167,6 +167,104 @@ def store_source_video(temp_path: Path, original_name: str) -> tuple[Path, dict]
     return stored, probe
 
 
+#: Network schemes a live camera source may use. A bare path to an existing
+#: video file is also accepted (see :func:`validate_live_url`) because that is
+#: the documented demo source; ``file://`` is not, since it buys nothing over a
+#: plain path and only widens what a URL string can reach.
+_ALLOWED_SCHEMES = ("rtsp://", "rtsps://", "http://", "https://")
+
+#: Container types a local file source may use.
+_VIDEO_SUFFIXES = {".mp4", ".avi", ".mkv", ".mov", ".m4v", ".webm", ".mjpeg", ".mjpg"}
+
+
+def validate_live_url(url: str) -> str:
+    """
+    Check a live camera URL before anything tries to open it.
+
+    Rejecting a malformed URL here, synchronously, is worth doing precisely
+    because the failure mode otherwise is so poor: the row is created, a capture
+    thread starts, FFmpeg blocks on an unroutable host, and the operator sees a
+    camera tile that never loads and a dashboard that has grown sluggish, with
+    nothing anywhere saying the URL was wrong.
+
+    The check that actually bites in practice is the bracket one. This project's
+    own database contains::
+
+        rtsp://[akulsharma]:[Akulsharma@17]@[192.168.1.2]:554/stream1
+
+    — credentials pasted with the placeholder brackets left in. In RFC 3986
+    square brackets delimit an IPv6 literal, so that host is not "192.168.1.2"
+    and never resolves; it simply hangs.
+    """
+    text = (url or "").strip()
+    if not text:
+        raise SourceError("Camera source is required")
+
+    # A webcam index is a first-class source.
+    if text.isdigit():
+        if not (0 <= int(text) <= 15):
+            raise SourceError("Webcam index must be between 0 and 15")
+        return text
+
+    from core.youtube import available as youtube_available, is_youtube_url
+
+    if is_youtube_url(text):
+        if not youtube_available():
+            raise SourceError(
+                "YouTube sources need yt-dlp. Install it with: pip install yt-dlp"
+            )
+        return text
+
+    low = text.lower()
+    if not low.startswith(_ALLOWED_SCHEMES):
+        # A local video file is a supported source — `manage.py camera-add --url
+        # samples/sample_border_scenario.mp4` is the documented demo path, and
+        # LiveSource already paces and loops a file correctly. Accept it when it
+        # genuinely exists; a path that does not resolve is a typo, and saying so
+        # now is far better than starting a capture thread that can never open
+        # anything and reporting it as a camera that is merely "offline".
+        candidate = Path(text)
+        if candidate.exists():
+            if candidate.is_dir():
+                raise SourceError(f"'{text}' is a directory, not a video file")
+            if candidate.suffix.lower() not in _VIDEO_SUFFIXES:
+                raise SourceError(
+                    f"'{candidate.suffix or candidate.name}' is not a supported "
+                    f"video type ({', '.join(sorted(_VIDEO_SUFFIXES))})"
+                )
+            return text
+        raise SourceError(
+            f"'{text}' is not a reachable source. Use an RTSP/HTTP(S) URL, a "
+            f"YouTube link, a webcam index (e.g. 0), or the path of an existing "
+            f"video file. To upload a video, use 'Add video source' instead."
+        )
+
+    if "[" in text or "]" in text:
+        raise SourceError(
+            "Remove the square brackets from the URL — they are placeholders. "
+            "Write it as rtsp://user:password@192.168.1.2:554/stream1 "
+            "(brackets are reserved for IPv6 addresses, so the host never resolves)."
+        )
+    if " " in text:
+        raise SourceError("Camera URL must not contain spaces")
+
+    # Must have a host after the scheme.
+    scheme, _, remainder = text.partition("://")
+    host = remainder.split("/")[0].split("@")[-1]
+    if not host or host.startswith(":"):
+        raise SourceError(f"No host found in the URL after '{scheme}://'")
+    return text
+
+
+def find_duplicate(db: Session, url: str) -> Optional[Camera]:
+    """An existing, non-archived camera already using this exact source."""
+    return (
+        db.query(Camera)
+        .filter(Camera.url == url, Camera.is_deleted.is_(False))
+        .first()
+    )
+
+
 def register_camera(
     db: Session,
     *,
@@ -175,14 +273,39 @@ def register_camera(
     location: str = "",
     is_active: bool = True,
     source_kind: str = KIND_LIVE,
+    validate: bool = True,
+    allow_duplicate: bool = False,
 ) -> Camera:
-    """Create and persist a camera row (of any kind)."""
+    """
+    Create and persist a camera row (of any kind).
+
+    Duplicates are rejected rather than silently accepted.  Registering one URL
+    twice used to produce two independent camera rows, each with its own capture
+    thread, decoder, analytics thread, tracker and rule engine, all doing
+    identical work on identical pixels — this database still holds four such
+    rows (``CYCLE-1``..``CYCLE-4``, all pointed at the same sample clip).  On a
+    machine already near its inference budget that is the difference between a
+    responsive dashboard and a stalled one, and the operator has no way to tell
+    the copies apart afterwards.
+    """
     name = (name or "").strip()
     url = (url or "").strip()
     if not name:
         raise SourceError("Camera name is required")
     if not url:
         raise SourceError("Camera source is required")
+    if validate and source_kind == KIND_LIVE:
+        url = validate_live_url(url)
+
+    if not allow_duplicate:
+        existing = find_duplicate(db, url)
+        if existing is not None:
+            raise SourceError(
+                f"This source is already registered as camera #{existing.id} "
+                f"“{existing.name}”. Remove that camera first, or use it "
+                f"directly — running two pipelines over one feed doubles the load "
+                f"without adding coverage."
+            )
 
     camera = Camera(
         name=name[:120],
@@ -324,6 +447,7 @@ def retire_camera(db: Session, camera_id: int) -> dict:
 
 __all__ = [
     "KIND_LIVE", "KIND_FILE", "KIND_UPLOAD", "SourceError",
+    "validate_live_url", "find_duplicate",
     "visible_cameras", "get_live_camera", "startup_cameras",
     "store_source_video", "register_camera", "retire_camera",
     "is_managed_source_file",

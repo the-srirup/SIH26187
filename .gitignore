@@ -37,6 +37,14 @@ Thumbs.db
 
 # Runtime / generated artifacts
 alerts.db
+# SQLite WAL sidecars. These were tracked, which is why they appeared to be
+# "deleted" whenever the database was closed cleanly: SQLite checkpoints the WAL
+# into the main file and removes them. A WAL is a transient journal, never
+# source, and committing one only produces confusing diffs.
+alerts.db-wal
+alerts.db-shm
+*.db-wal
+*.db-shm
 alerts/
 clips/
 videos/

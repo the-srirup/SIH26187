@@ -236,3 +236,124 @@ class AnalysisSession(Base):
 
     def __repr__(self) -> str:
         return f"<AnalysisSession {self.session_uid} {self.status}>"
+
+
+class ANPRDetection(Base):
+    """
+    A licence plate reading, stored as structured data rather than only as text.
+
+    The alert log already carries every plate read as a ``anpr_detection``
+    event, but an event is a *narrative* row: its payload is JSON and its
+    purpose is the audit chain.  Answering the questions an operator actually
+    asks of ANPR — "has this plate passed any camera this week", "show every
+    read of KA01F1234", "which vehicles crossed after 2 a.m." — against JSON
+    text is both slow and unreliable.
+
+    This table is the queryable projection of the same reading: one row per
+    published plate, indexed by plate text, camera and time, and linked back to
+    the sealed alert it came from.  The alert remains the evidentiary record;
+    this is the index over it, which is why ``alert_id`` is not nullable for
+    anything the pipeline writes.
+    """
+
+    __tablename__ = "anpr_detections"
+
+    id = Column(Integer, primary_key=True)
+    camera_id = Column(Integer, ForeignKey("cameras.id"), nullable=False)
+    #: The sealed event this reading belongs to — the tamper-evident record.
+    alert_id = Column(Integer, ForeignKey("alerts.id"))
+
+    timestamp = Column(String(50), nullable=False)
+    timestamp_ist = Column(String(64), default="")
+
+    #: Normalised, no spaces: "MH12AB1234".
+    plate_text = Column(String(24), nullable=False)
+    #: Grouped for display: "MH 12 AB 1234".
+    plate_display = Column(String(32), default="")
+    #: What OCR returned before grammar correction, kept so the record shows
+    #: what the recogniser actually saw rather than only the tidied result.
+    plate_raw = Column(String(32), default="")
+    confidence = Column(Float, default=0.0)
+    #: True when the reading matches the Indian registration grammar.
+    format_verified = Column(Boolean, default=False)
+    #: How many independent frames agreed on this reading.
+    votes = Column(Integer, default=1)
+    consensus = Column(Boolean, default=False)
+
+    vehicle_class = Column(String(32), default="")
+    vehicle_track_id = Column(Integer, default=0)
+
+    evidence_path = Column(String(500), default="")
+    #: SHA-256 of the evidence image, so the crop cannot be swapped silently.
+    evidence_sha256 = Column(String(64), default="")
+
+    #: live | upload | system
+    source_type = Column(String(20), default="live")
+    session_id = Column(String(64), default="")
+    #: published | uncertain — an uncertain read is recorded for review but is
+    #: never presented as an identified registration.
+    processing_status = Column(String(20), default="published")
+
+    camera = relationship("Camera")
+
+    __table_args__ = (
+        Index("ix_anpr_plate", "plate_text"),
+        Index("ix_anpr_timestamp", "timestamp"),
+        Index("ix_anpr_camera_time", "camera_id", "timestamp"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<ANPRDetection {self.plate_text} cam={self.camera_id}>"
+
+
+class FaceDetection(Base):
+    """
+    A detected face, and whether an identity was established for it.
+
+    ``recognition_status`` is deliberately explicit rather than implied by a
+    nullable identity column.  The system detects far more faces than it can
+    identify, and the difference matters: "a face was seen here" and "this
+    person was seen here" are very different claims to put in a border-security
+    record.  ``unknown`` means the face did not match any watchlist entry above
+    threshold — never that the subject is unidentifiable.
+    """
+
+    __tablename__ = "face_detections"
+
+    id = Column(Integer, primary_key=True)
+    camera_id = Column(Integer, ForeignKey("cameras.id"), nullable=False)
+    alert_id = Column(Integer, ForeignKey("alerts.id"))
+
+    timestamp = Column(String(50), nullable=False)
+    timestamp_ist = Column(String(64), default="")
+
+    #: SCRFD detector score for the face itself.
+    confidence = Column(Float, default=0.0)
+    #: YOLO person track this face was associated with, 0 if unassociated.
+    track_id = Column(Integer, default=0)
+
+    #: matched | unknown
+    recognition_status = Column(String(20), default="unknown")
+    identity_id = Column(Integer, ForeignKey("watchlist_entries.id"))
+    identity_name = Column(String(120), default="")
+    #: Cosine similarity against the best watchlist candidate, matched or not.
+    similarity = Column(Float, default=0.0)
+    similarity_threshold = Column(Float, default=0.0)
+
+    bbox_json = Column(String(120), default="")
+    evidence_path = Column(String(500), default="")
+    evidence_sha256 = Column(String(64), default="")
+
+    source_type = Column(String(20), default="live")
+    session_id = Column(String(64), default="")
+
+    camera = relationship("Camera")
+
+    __table_args__ = (
+        Index("ix_face_timestamp", "timestamp"),
+        Index("ix_face_camera_time", "camera_id", "timestamp"),
+        Index("ix_face_identity", "identity_id"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<FaceDetection {self.recognition_status} cam={self.camera_id}>"

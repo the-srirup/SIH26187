@@ -317,7 +317,10 @@ class FrameAnalyzer:
         vehicles = [d for d in detections if d.is_vehicle]
 
         # -- face (cadenced, person-gated) -------------------------------- #
-        self._faces = self._run_face(work, detections, persons)
+        # The pre-resize frame goes to the face stage for the same reason it
+        # goes to ANPR: a face is ~1/7 of a person, so at 640x384 it is barely a
+        # dozen pixels tall and SCRFD never had anything to work with.
+        self._faces = self._run_face(work, detections, persons, source_frame)
 
         # -- ANPR (cadenced, vehicle-gated) ------------------------------- #
         self._plates = self._run_anpr(work, vehicles, source_frame)
@@ -438,18 +441,21 @@ class FrameAnalyzer:
                 )
         return condition
 
-    def _run_face(self, frame: np.ndarray, detections: list, persons: list) -> list:
+    def _run_face(self, frame: np.ndarray, detections: list, persons: list,
+                  source_frame: Optional[np.ndarray] = None) -> list:
         recognizer = self._face()
         if recognizer is None or not getattr(recognizer, "_enabled", False):
             return []
         if not persons:
             return []
         if self._frame_index - self._last_face_frame < settings.FACE_RECOGNITION_EVERY_N_FRAMES:
-            return recognizer.cached_matches(detections)
+            return recognizer.cached_matches(detections, self.source_id)
         self._last_face_frame = self._frame_index
         try:
             return recognizer.recognize(frame, detections=detections,
-                                        frame_number=self._frame_index)
+                                        frame_number=self._frame_index,
+                                        source_frame=source_frame,
+                                        source_id=self.source_id)
         except Exception as exc:
             log.warning("[%s] face stage failed: %s", self.source_id, exc)
             return []
@@ -464,13 +470,14 @@ class FrameAnalyzer:
             # a full-frame candidate search plus OCR here, every single frame.
             return []
         if self._frame_index - self._last_anpr_frame < settings.ANPR_EVERY_N_FRAMES:
-            return processor.cached_detections()
+            return processor.cached_detections(self.source_id)
         self._last_anpr_frame = self._frame_index
         try:
             return processor.recognize_plates(
                 frame, vehicle_detections=vehicles,
                 frame_number=self._frame_index,
                 source_frame=source_frame,
+                source_id=self.source_id,
             )
         except Exception as exc:
             log.warning("[%s] ANPR stage failed: %s", self.source_id, exc)

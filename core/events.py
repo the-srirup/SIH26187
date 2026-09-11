@@ -7,12 +7,18 @@ Responsibilities:
 2. Capture evidence (snapshot + contextual clip) and record the paths.
 3. Publish the alert to live subscribers (the WebSocket layer) immediately.
 
-Ordering matters for the hash chain.  A row's hash covers its evidence paths,
-so paths must be final *before* the hash is computed.  We therefore insert to
-obtain the primary key, write evidence using that key, then seal the row with
-its hash — all inside a single transaction, and all under a per-process chain
-lock so two camera threads can never interleave and produce two rows claiming
-the same predecessor.
+Ordering matters for the hash chain.  A row's hash covers its evidence paths
+and the SHA-256 of the evidence bytes, so both must be final *before* the hash
+is computed.  We therefore insert to obtain the primary key, write evidence
+using that key, hash that evidence, then seal the row — all inside a single
+transaction that holds the **database** write lock from before the chain tip is
+read (see :func:`core.hashchain.begin_exclusive_append`).
+
+A per-process ``threading.Lock`` is not sufficient on its own and this project
+has the scar to prove it: appending a link is a read-modify-write, so a second
+*process* touching the same database file read the same tip and produced two
+rows claiming the same predecessor.  The process lock is kept as the cheap
+fast path; the database lock is what makes the invariant actually hold.
 
 Publication is decoupled from persistence: the pipeline never waits on an
 asyncio loop, and a slow WebSocket client can never stall a camera thread.
@@ -30,7 +36,10 @@ import numpy as np
 from core.config import settings
 from core.database import SessionLocal
 from core.evidence import save_snapshot
-from core.hashchain import chain_hash, compute_alert_payload, latest_chain_hash
+from core.hashchain import (
+    begin_exclusive_append, chain_hash, compute_alert_payload,
+    evidence_digest, latest_chain_hash,
+)
 from core.models import Alert
 from core.timeutil import fmt_ist, utc_iso
 from cv.rules import Alert as RuleAlert, severity_for
@@ -178,6 +187,14 @@ class EventManager:
         db = SessionLocal()
         try:
             with self._chain_lock:
+                # The process lock above orders *our* threads. It cannot order a
+                # second process — a CLI command, a benchmark, an extra worker —
+                # writing the same file, and appending a link is a
+                # read-modify-write, so two writers that both read the tip both
+                # commit rows claiming the same predecessor. Taking SQLite's
+                # RESERVED lock up front makes read-seal-commit atomic against
+                # every writer, not just the ones sharing our interpreter.
+                begin_exclusive_append(db)
                 prev_hash = latest_chain_hash(db)
 
                 row = Alert(
@@ -216,9 +233,21 @@ class EventManager:
 
                 row.snapshot_path = snapshot_path
                 row.clip_path = clip_path
+
+                # Seal the evidence *bytes*, not just its filename. Hashing the
+                # path alone proves only which file was claimed — swap the JPEG
+                # afterwards and the chain still verifies clean. The digests ride
+                # in details, which the payload already covers, so the evidence
+                # is bound into the chain without altering the sealed schema and
+                # every previously sealed row still verifies unchanged.
+                if snapshot_path or clip_path:
+                    digests = evidence_digest(snapshot_path, clip_path)
+                    if digests:
+                        details["evidence_sha256"] = digests
+
                 row.details_json = json.dumps(details, default=str)
 
-                # Hash last: it covers the finalised evidence paths.
+                # Hash last: it covers the finalised evidence paths and digests.
                 row.hash = chain_hash(compute_alert_payload(row), prev_hash)
                 db.commit()
 

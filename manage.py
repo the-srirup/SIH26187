@@ -292,11 +292,42 @@ def cmd_integrity(_args) -> int:
         print()
         print(f"  {result.message}")
         if not result.valid:
-            print(f"  Broken at     : event #{result.broken_at}")
-            print(f"  Expected      : {result.expected_hash}")
-            print(f"  Stored        : {result.actual_hash}")
+            print(f"  Fault type    : {result.break_kind}")
+            print(f"  Faults found  : {len(result.breaks)}")
+            print(f"  First at      : event #{result.broken_at}")
+            for brk in result.breaks[:10]:
+                origin = brk.get("forked_from_alert_id")
+                print(f"    - #{brk['alert_id']:<6} {brk['kind']:<8}"
+                      + (f" (shares predecessor with #{origin})" if origin else ""))
+            if len(result.breaks) > 10:
+                print(f"    … and {len(result.breaks) - 10} more")
+            if result.forks_only:
+                print()
+                print("  Every event's own digest is valid — no record was altered")
+                print("  or deleted. Re-link with: python manage.py chain-repair")
         print()
         return 0 if result.valid else 2
+    finally:
+        db.close()
+
+
+def cmd_chain_repair(args) -> int:
+    """Re-link a chain forked by concurrent writers. Refuses real tampering."""
+    from core.hashchain import repair_chain
+
+    db = _session()
+    try:
+        result = repair_chain(db, dry_run=args.dry_run, reseal=args.reseal)
+        print()
+        print(f"  {result['message']}")
+        if not result["ok"]:
+            print()
+            return 2
+        if not args.dry_run and result.get("repaired"):
+            print(f"  Links rebuilt : {result['repaired']}")
+            print("  A 'chain_repaired' event was appended recording this repair.")
+        print()
+        return 0
     finally:
         db.close()
 
@@ -455,6 +486,16 @@ def main() -> int:
     p_alerts.add_argument("--type")
 
     sub.add_parser("integrity", help="verify the tamper-evident hash chain")
+    p_repair = sub.add_parser(
+        "chain-repair",
+        help="re-link a hash chain forked by concurrent writers (refuses tampering)",
+    )
+    p_repair.add_argument("--dry-run", action="store_true",
+                          help="report what would be re-linked without writing")
+    p_repair.add_argument("--reseal", action="store_true",
+                          help="re-seal every event under the current payload "
+                               "schema (needed once after the schema version "
+                               "changes; recorded in the log as a reseal)")
     sub.add_parser("checkpoint", help="seal a Merkle checkpoint")
     sub.add_parser("stats", help="show event and storage statistics")
     sub.add_parser("sweep", help="enforce evidence retention now")

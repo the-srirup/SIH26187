@@ -131,6 +131,15 @@ class Settings(BaseSettings):
     LOOP_FILE_SOURCES: bool = True
     #: JPEG quality for the MJPEG stream (encoded once per frame, shared).
     JPEG_QUALITY: int = 72
+    #: How far above its nominal frame rate a LIVE source may be decoded.
+    #:
+    #: A buffered network stream (YouTube Live HLS especially) hands FFmpeg
+    #: whole segments at once, and an unpaced capture loop will decode them as
+    #: fast as the CPU allows — measured at 370-750 fps on a 30 fps stream,
+    #: which starved the analytics thread feeding off it down to 1.5 fps and
+    #: made the whole dashboard sluggish. Headroom above 1.0 still lets a source
+    #: that fell behind sprint back to the live edge.
+    LIVE_CAPTURE_HEADROOM: float = 1.5
 
     # ------------------------------------------------------------------ #
     # Night detection — VISUAL, not clock-based
@@ -213,6 +222,21 @@ class Settings(BaseSettings):
     #: some of the scene.
     NIGHT_MOVEMENT_NET_RATIO: float = 0.6
     NIGHT_MOVEMENT_DEBOUNCE: float = 45.0      # seconds before a track re-alerts
+    #: Alternative, rate-based qualifier for the night-movement rule.
+    #:
+    #: A pure distance threshold measured over a 6 s window silently encodes
+    #: "slow, long-lived subject". Measured on this project's night footage a
+    #: person is tracked 4.2 s and travels 338 px, while a car — detected at
+    #: *higher* confidence — is tracked 0.8 s and travels 37 px, and was
+    #: rejected. That is the whole of "night detection works for people but not
+    #: vehicles": a vehicle crosses the frame faster than the rule watches it.
+    #:
+    #: 40 px/s of NET displacement is motion no jitter can fake (jitter
+    #: inflates path length, not net), and the two floors below keep a one-frame
+    #: flicker from qualifying.
+    NIGHT_MOVEMENT_MIN_SPEED: float = 40.0         # px/s of net displacement
+    NIGHT_MOVEMENT_MIN_OBSERVATION: float = 0.4    # s the track must be watched
+    NIGHT_MOVEMENT_MIN_NET_FLOOR: float = 20.0     # px net, absolute floor
 
     # ------------------------------------------------------------------ #
     # Rules / analytics
@@ -427,12 +451,21 @@ class Settings(BaseSettings):
     def clip_post_frames(self) -> int:
         return max(1, int(self.CLIP_POST_SECONDS * self.TARGET_FPS))
 
+    #: Structured, dated evidence tree for ANPR crops and face crops:
+    #: ``evidence/<kind>/camera_<id>/<YYYY>/<MM>/``. Kept separate from the flat
+    #: snapshot directory because these artefacts are produced per detection
+    #: rather than per alert, and a single BOP generates tens of thousands a
+    #: month — a flat folder makes both retention sweeps and an investigator's
+    #: "that afternoon, that camera" search impractical.
+    EVIDENCE_DIR: Path = ALERTS_DIR / "evidence"
+
     @property
     def evidence_roots(self) -> tuple[Path, ...]:
         """Directories the API is permitted to serve files from."""
         return (
             self.SNAPSHOTS_DIR.resolve(),
             self.CLIPS_DIR.resolve(),
+            self.EVIDENCE_DIR.resolve(),
             self.VIDEOS_DIR.resolve(),
             self.PROCESSED_DIR.resolve(),
             self.SOURCES_DIR.resolve(),
@@ -442,8 +475,8 @@ class Settings(BaseSettings):
         """Create runtime directories that don't yet exist."""
         for d in (
             self.ALERTS_DIR, self.CLIPS_DIR, self.SNAPSHOTS_DIR,
-            self.VIDEOS_DIR, self.PROCESSED_DIR, self.SOURCES_DIR,
-            self.STATIC_DIR, self.LOG_DIR,
+            self.EVIDENCE_DIR, self.VIDEOS_DIR, self.PROCESSED_DIR,
+            self.SOURCES_DIR, self.STATIC_DIR, self.LOG_DIR,
         ):
             d.mkdir(parents=True, exist_ok=True)
 

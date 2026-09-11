@@ -44,8 +44,20 @@ psutil>=5.9                    # CPU/RAM sampling for benchmark.py and system in
 # Both degrade gracefully: if the import fails the feature reports itself as
 # unavailable in /api/system/info and the surveillance pipeline is unaffected.
 insightface>=0.7.3             # SCRFD face detection + ArcFace embeddings
-onnxruntime>=1.19.0            # InsightFace runtime (onnxruntime-gpu for CUDA)
+onnxruntime>=1.19.0            # InsightFace runtime — see the GPU note below
 easyocr>=1.7.0                 # ANPR optical character recognition
+yt-dlp>=2024.1.1               # resolves YouTube / YouTube Live to a stream URL
+
+# FACE-STAGE GPU NOTE --------------------------------------------------------
+# `onnxruntime` above is the CPU build, and InsightFace will silently use it
+# even on a CUDA machine — /api/system/info reports the providers actually in
+# use, and the face stage costs ~19 ms/frame on CPU versus a few ms on GPU.
+# On an NVIDIA host, replace it:
+#
+#     pip uninstall -y onnxruntime && pip install onnxruntime-gpu
+#
+# The platform runs correctly either way; this is throughput, not correctness.
+# ---------------------------------------------------------------------------
 
 # --- Testing (not required to run the platform) ------------------------------
 # pip install pytest httpx

@@ -87,6 +87,12 @@ p { margin: 0; }
 .dot-ok      { background: var(--ok);     box-shadow: 0 0 8px var(--ok); }
 .dot-pending { background: var(--warn);   box-shadow: 0 0 8px var(--warn); }
 .dot-down    { background: var(--danger); box-shadow: 0 0 8px var(--danger); }
+/* Connecting/stopping: amber and pulsing, so "working on it" reads differently
+   from "failed" at a glance across a wall of tiles. */
+.dot-warn    { background: var(--warn);   box-shadow: 0 0 8px var(--warn);
+               animation: dot-pulse 1.4s ease-in-out infinite; }
+.dot-idle    { background: var(--text-faint); }
+@keyframes dot-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
 
 .clock-block { display: flex; flex-direction: column; line-height: 1.15; }
 .clock { font-family: var(--mono); font-size: 17px; font-weight: 600; letter-spacing: .02em; }

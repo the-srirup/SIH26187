@@ -30,6 +30,7 @@ import numpy as np
 
 from core.analytics import AnalysisResult, FrameAnalyzer, LowLightEnhancer
 from core.config import settings
+from core import detections
 from core.database import SessionLocal
 from core.evidence import ClipRecorder
 from core.events import EventManager
@@ -146,6 +147,46 @@ class FrameBuffer:
 # --------------------------------------------------------------------------- #
 
 
+class CameraState:
+    """
+    Explicit lifecycle states for one camera.
+
+    Before this, "is the camera working?" had exactly two answers — a boolean
+    ``is_online`` — which cannot distinguish a camera that is still opening its
+    stream from one whose URL is wrong from one the operator stopped on purpose.
+    All three rendered as the same red dot, so the dashboard could not tell an
+    operator whether to wait, fix the URL, or do nothing.
+
+    Transitions::
+
+        CREATED -> CONNECTING -> CONNECTED -> PROCESSING
+                        ^            |            |
+                        |            v            v
+                        +--------- ERROR <--------+
+                                     |
+                       STOPPING -> STOPPED
+    """
+
+    CREATED = "created"
+    CONNECTING = "connecting"
+    CONNECTED = "connected"
+    PROCESSING = "processing"
+    ERROR = "error"
+    STOPPING = "stopping"
+    STOPPED = "stopped"
+
+    #: What the dashboard shows for each state.
+    LABELS = {
+        CREATED: ("Created", "grey"),
+        CONNECTING: ("Connecting", "amber"),
+        CONNECTED: ("Connected", "green"),
+        PROCESSING: ("Processing", "green"),
+        ERROR: ("Error", "red"),
+        STOPPING: ("Stopping", "amber"),
+        STOPPED: ("Stopped", "grey"),
+    }
+
+
 class CameraProcessor:
     """Full live pipeline for a single camera."""
 
@@ -191,6 +232,9 @@ class CameraProcessor:
         self._is_night = False
         self._scene = None
         self._online = False
+        self._state = CameraState.CREATED
+        self._state_since = time.time()
+        self._state_detail = ""
         self._started_at = 0.0
         self._offline_announced = False
         self._last_status_write = 0.0
@@ -240,11 +284,28 @@ class CameraProcessor:
     # ------------------------------------------------------------------ #
     # Lifecycle
     # ------------------------------------------------------------------ #
+    def _set_state(self, state: str, detail: str = "") -> None:
+        """Record a lifecycle transition, logging only genuine changes."""
+        if state == self._state and detail == self._state_detail:
+            return
+        previous = self._state
+        self._state = state
+        self._state_detail = detail
+        self._state_since = time.time()
+        log.info("CAMERA_STATE cam=%d (%s) %s -> %s%s",
+                 self.camera_id, self.name, previous.upper(), state.upper(),
+                 f" — {detail}" if detail else "")
+
+    @property
+    def state(self) -> str:
+        return self._state
+
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
             return
         self._running = True
         self._started_at = time.time()
+        self._set_state(CameraState.CONNECTING)
         self.source.start()
         self._thread = threading.Thread(
             target=self._run, name=f"analytics-cam{self.camera_id}", daemon=True
@@ -252,16 +313,42 @@ class CameraProcessor:
         self._thread.start()
         log.info("Camera %d (%s) started — source=%s", self.camera_id, self.name, self.url)
 
-    def stop(self) -> None:
+    def stop(self, join_timeout: float = 5.0) -> None:
+        """
+        Tear the camera down deterministically.
+
+        Order is chosen so the *observable* effects are immediate and the slow
+        part cannot delay them. Clearing ``_running`` and dropping the shared
+        frame buffer happen first and take microseconds, which is what actually
+        guarantees the removal contract: no further frame can be published for
+        this camera and no further event can be sealed against it, whether or not
+        the worker threads have finished unwinding yet.
+
+        Only then do we join. A capture thread parked inside an FFmpeg read
+        cannot be interrupted from outside, so the join is bounded and a thread
+        that overruns is reported rather than waited on indefinitely — it exits
+        on its own once the bounded FFmpeg timeout expires, and it can no longer
+        affect anything, because it has nowhere left to publish.
+        """
+        self._set_state(CameraState.STOPPING)
         self._running = False
+        FrameBuffer.get().drop(self.camera_id)
+
         self.source.stop()
         if self._thread:
-            self._thread.join(timeout=5.0)
+            self._thread.join(timeout=join_timeout)
+            if self._thread.is_alive():
+                log.warning(
+                    "CAMERA_STOP_SLOW cam=%d (%s): analytics thread still "
+                    "unwinding after %.1fs — it is detached and can no longer "
+                    "publish frames or events",
+                    self.camera_id, self.name, join_timeout,
+                )
             self._thread = None
         self.clips.close()
-        FrameBuffer.get().drop(self.camera_id)
         self._set_online(False, persist=True)
-        log.info("Camera %d (%s) stopped", self.camera_id, self.name)
+        self._set_state(CameraState.STOPPED)
+        log.info("CAMERA_STOPPED cam=%d (%s)", self.camera_id, self.name)
 
     # ------------------------------------------------------------------ #
     # Analytics loop
@@ -282,6 +369,8 @@ class CameraProcessor:
 
             self._last_frame_id = frame_id
             self._set_online(True)
+            if self._state != CameraState.PROCESSING:
+                self._set_state(CameraState.PROCESSING)
 
             # A looping video file or a reconnected stream is a discontinuity:
             # track ids are reissued and every object appears to teleport. Rule
@@ -329,11 +418,15 @@ class CameraProcessor:
         # window produced a false alert on every single restart.
         if not self.source.ever_connected:
             if time.time() - self._started_at < settings.CAMERA_TIMEOUT:
+                self._set_state(CameraState.CONNECTING,
+                                self.source.stats.last_error)
                 time.sleep(0.2)
                 return
 
         if self._online or not self._offline_announced:
             self._set_online(False, persist=True)
+            self._set_state(CameraState.ERROR,
+                            self.source.stats.last_error or "no frames received")
             self._offline_announced = True
             card = np.zeros((settings.FRAME_HEIGHT, settings.FRAME_WIDTH, 3), np.uint8)
             ov.draw_offline(card, self.name, self.source.stats.last_error)
@@ -385,10 +478,10 @@ class CameraProcessor:
         if recognizer is None:
             return
         for match in result.faces:
-            alert = recognizer.build_event(match)
+            alert = recognizer.build_event(match, str(self.camera_id))
             if alert is None:
                 continue
-            self.events.record(
+            payload = self.events.record(
                 camera_id=self.camera_id,
                 rule_alert=alert,
                 frame=result.frame,
@@ -399,6 +492,16 @@ class CameraProcessor:
                 camera_name=self.name,
                 source_type="live",
             )
+            # Structured row + face crop, keyed to the sealed alert. The crop is
+            # cut from the *clean* frame: an evidence image with the HUD and
+            # bounding boxes burned into it is not the face the camera saw.
+            detections.record_face(
+                match, camera_id=self.camera_id,
+                alert_id=(payload or {}).get("id"),
+                frame=result.raw_frame,
+                source_type="live",
+                threshold=recognizer._similarity_threshold,
+            )
 
     def _handle_anpr_events(self, result: AnalysisResult) -> None:
         if not result.plates:
@@ -407,10 +510,10 @@ class CameraProcessor:
         if processor is None:
             return
         for plate in result.plates:
-            alert = processor.build_event(plate)
+            alert = processor.build_event(plate, str(self.camera_id))
             if alert is None:
                 continue
-            self.events.record(
+            payload = self.events.record(
                 camera_id=self.camera_id,
                 rule_alert=alert,
                 frame=result.frame,
@@ -419,6 +522,12 @@ class CameraProcessor:
                 object_class=plate.vehicle_class or "vehicle",
                 confidence=float(plate.text_confidence),
                 camera_name=self.name,
+                source_type="live",
+            )
+            detections.record_plate(
+                plate, camera_id=self.camera_id,
+                alert_id=(payload or {}).get("id"),
+                frame=result.raw_frame,
                 source_type="live",
             )
 
@@ -506,6 +615,11 @@ class CameraProcessor:
             "location": self.location,
             "url": self.url,
             "online": self.is_online,
+            "state": self._state,
+            "state_label": CameraState.LABELS.get(self._state, (self._state, "grey"))[0],
+            "state_colour": CameraState.LABELS.get(self._state, (self._state, "grey"))[1],
+            "state_detail": self._state_detail,
+            "state_seconds": round(time.time() - self._state_since, 1),
             "fps": round(self._fps, 1),
             "frames_analysed": self._frames_analysed,
             "inference_ms": round(self._inference_ms, 1),
@@ -523,6 +637,8 @@ class CameraProcessor:
                       if self._scene is not None else None),
             "uptime_seconds": round(time.time() - self._started_at, 1) if self._started_at else 0,
             "rules": len(self.analyzer.rule_shapes),
+            # Live per-rule observations, so a quiet zone can say why.
+            "rule_diagnostics": self.analyzer.rules.diagnostics(),
             "active_clips": self.clips.active_clips,
             "source": self.source.describe(),
         }
@@ -640,6 +756,6 @@ class CameraManager:
 # Backwards-compatible re-export: older imports expect these from core.camera.
 ClipWriter = ClipRecorder
 __all__ = [
-    "FrameBuffer", "CameraProcessor", "CameraManager",
+    "FrameBuffer", "CameraProcessor", "CameraManager", "CameraState",
     "ClipRecorder", "ClipWriter", "LowLightEnhancer",
 ]

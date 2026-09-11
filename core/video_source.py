@@ -59,16 +59,71 @@ def _parse_source(url: str):
     return text
 
 
+#: FFmpeg open/read timeouts, in microseconds, pushed in via the environment
+#: variable OpenCV's FFmpeg backend reads.
+#:
+#: Without this, ``cv2.VideoCapture`` on an unreachable RTSP host blocks the
+#: calling thread for FFmpeg's default timeout — which on Windows can be
+#: minutes, and for some transports is unbounded. That is the mechanism behind
+#: "the site lags when I add a live camera": a mistyped or unreachable camera
+#: URL parked a thread indefinitely, and because a stopped source only joins its
+#: capture thread for a few seconds, every retry leaked another stuck thread and
+#: another open socket. Bounding the open is what makes a bad URL a fast, clean
+#: error instead of a slow resource leak.
+_FFMPEG_OPEN_TIMEOUT_US = 8_000_000    # 8 s to establish
+_FFMPEG_READ_TIMEOUT_US = 8_000_000    # 8 s without data before giving up
+
+
+def _apply_ffmpeg_timeouts() -> None:
+    """Set FFmpeg transport timeouts before a capture is opened."""
+    import os
+
+    existing = os.environ.get("OPENCV_FFMPEG_CAPTURE_OPTIONS")
+    if existing:
+        return  # respect an operator's explicit tuning
+    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "|".join((
+        "rtsp_transport;tcp",                      # UDP silently blackholes
+        f"timeout;{_FFMPEG_READ_TIMEOUT_US}",      # newer FFmpeg
+        f"stimeout;{_FFMPEG_OPEN_TIMEOUT_US}",     # older FFmpeg
+        "reconnect;1",
+        "reconnect_streamed;1",
+        "reconnect_delay_max;4",
+    ))
+
+
+def resolve_source_url(url: str) -> str:
+    """
+    Turn whatever the operator registered into something FFmpeg can open.
+
+    This is the single junction where the source kinds converge.  An RTSP, HTTP
+    or file URL is already openable and passes through untouched; a YouTube link
+    is a *web page* and is resolved to a direct media URL first.  Everything
+    downstream — decode, analytics, rules, ANPR, face, evidence — is identical
+    for all of them, which is the point: there is one pipeline, not one per
+    source type.
+    """
+    from core.youtube import YouTubeResolver, is_youtube_url
+
+    text = str(url or "").strip()
+    if not is_youtube_url(text):
+        return text
+    # Raises YouTubeError with an operator-facing message, which the capture
+    # thread turns into the source's last_error.
+    return YouTubeResolver.get().resolve(text).url
+
+
 def open_capture(url: str) -> Optional[cv2.VideoCapture]:
     """
     Open a video source, returning ``None`` rather than raising.
 
     RTSP gets a short buffer so a reconnect does not replay several seconds of
-    stale video before catching up.
+    stale video before catching up, and a bounded FFmpeg timeout so an
+    unreachable host fails in seconds rather than parking the thread.
     """
+    _apply_ffmpeg_timeouts()
     src = _parse_source(url)
     try:
-        if isinstance(src, str) and src.lower().startswith("rtsp"):
+        if isinstance(src, str) and src.lower().startswith(("rtsp", "http")):
             cap = cv2.VideoCapture(src, cv2.CAP_FFMPEG)
         else:
             cap = cv2.VideoCapture(src)
@@ -152,6 +207,10 @@ class LiveSource:
         #: Set once a frame has ever arrived, so the pipeline can tell
         #: "still starting up" apart from "was up, now down".
         self._ever_connected = False
+        #: What the URL actually resolved to (differs from ``url`` only for
+        #: YouTube). Kept for diagnostics; never shown raw to the operator,
+        #: since a signed playback URL is long and carries credentials.
+        self._resolved_url = ""
         #: Incremented every time a finite file restarts from the beginning, and
         #: every time a dropped stream is reopened. Consumers watch this to know
         #: their tracking and rule state has become meaningless: at a loop seam
@@ -178,6 +237,15 @@ class LiveSource:
             self._thread = None
         self._release()
 
+    def _invalidate_resolution(self) -> None:
+        """Force the next attempt to re-resolve (YouTube signatures expire)."""
+        try:
+            from core.youtube import YouTubeResolver, is_youtube_url
+            if is_youtube_url(self.url):
+                YouTubeResolver.get().invalidate(self.url)
+        except Exception:
+            pass
+
     def _release(self) -> None:
         cap, self._cap = self._cap, None
         if cap is not None:
@@ -195,8 +263,23 @@ class LiveSource:
                     continue
 
             if self._frame_interval:
-                # Emit at the file's own rate so a recorded clip behaves like
-                # the camera that produced it.
+                # Emit at (or near) the source's own rate.
+                #
+                # This used to apply only to files, on the reasoning that a real
+                # camera already emits in real time. Network streams do not.
+                # A YouTube Live HLS feed hands FFmpeg whole buffered segments,
+                # so this loop decoded it at 370-750 fps — measured — while the
+                # analytics thread it was feeding fell to 1.5 fps. Nothing was
+                # queueing and nothing was leaking: the capture thread was simply
+                # burning every core it could reach decoding frames that were
+                # thrown away microseconds later, and starving the rest of the
+                # process. That is the "adding a live camera makes the site lag"
+                # report, reproduced exactly.
+                #
+                # A live source is paced with headroom rather than pinned, so it
+                # can still out-run real time briefly to regain the live edge
+                # after a stall; a file is paced exactly, because playing a
+                # recording faster than it was shot is never what is wanted.
                 wait = self._next_frame_due - time.time()
                 if wait > 0:
                     time.sleep(min(wait, 0.25))
@@ -247,12 +330,28 @@ class LiveSource:
             return False
         self._last_open_attempt = now
 
-        cap = open_capture(self.url)
+        # Resolve here, on the capture thread, not at registration time: a
+        # YouTube playback URL expires after a few hours, so a reconnect must
+        # re-resolve rather than retry a dead signature. It also keeps a slow
+        # network round trip off the request path entirely.
+        try:
+            target = resolve_source_url(self.url)
+        except Exception as exc:
+            self.stats.connected = False
+            self.stats.last_error = str(exc)[:300]
+            log.warning("[%s] cannot resolve source: %s", self.name, exc)
+            return False
+        self._resolved_url = target
+
+        cap = open_capture(target)
         if cap is None:
             if self.stats.connected or not self.stats.last_error:
-                log.warning("[%s] cannot open source '%s'", self.name, self.url)
+                log.warning("CAMERA_OPEN_FAILED [%s] '%s'", self.name, self.url)
             self.stats.connected = False
             self.stats.last_error = f"Cannot open source: {self.url}"
+            # A resolved YouTube URL that will not open is usually a stale
+            # signature; drop it so the next attempt resolves afresh.
+            self._invalidate_resolution()
             return False
 
         self._cap = cap
@@ -268,8 +367,15 @@ class LiveSource:
         # A positive frame count means a finite file rather than a live feed.
         total = float(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
         self._is_file = total > 0
-        if self._is_file and 0 < self.stats.source_fps < 240:
-            self._frame_interval = 1.0 / self.stats.source_fps
+        if 0 < self.stats.source_fps < 240:
+            # A file plays at exactly its own rate. A live source is allowed
+            # some headroom so it can catch back up to the live edge after a
+            # stall, but is still bounded — an unbounded decoder on a buffered
+            # network stream is a CPU sink, not a faster camera.
+            rate = self.stats.source_fps
+            if not self._is_file:
+                rate *= max(1.0, float(settings.LIVE_CAPTURE_HEADROOM))
+            self._frame_interval = 1.0 / rate
         else:
             self._frame_interval = 0.0
         self._next_frame_due = time.time()
@@ -277,7 +383,9 @@ class LiveSource:
         log.info(
             "[%s] connected — %dx%d @ %.1f fps%s",
             self.name, self.stats.width, self.stats.height, self.stats.source_fps,
-            " (file, paced to source rate)" if self._frame_interval else "",
+            (" (file, paced to source rate)" if self._is_file
+             else f" (paced to {1.0 / self._frame_interval:.0f} fps)")
+            if self._frame_interval else " (unpaced — source reports no frame rate)",
         )
         return True
 
@@ -309,6 +417,7 @@ class LiveSource:
         self._release()
         self.stats.connected = False
         self.stats.last_error = "Stream ended or dropped — reconnecting"
+        self._invalidate_resolution()
         return False
 
     def _track_fps(self, now: float) -> None:
@@ -355,6 +464,35 @@ class LiveSource:
         return self._generation
 
     @property
+    def kind(self) -> str:
+        """``youtube`` / ``rtsp`` / ``http`` / ``webcam`` / ``file``."""
+        from core.youtube import is_youtube_url
+
+        text = str(self.url).strip()
+        if is_youtube_url(text):
+            return "youtube"
+        if text.isdigit():
+            return "webcam"
+        low = text.lower()
+        if low.startswith("rtsp"):
+            return "rtsp"
+        if low.startswith(("http://", "https://")):
+            return "http"
+        return "file"
+
+    @property
+    def youtube_info(self) -> Optional[dict]:
+        """Resolved YouTube metadata, when this is a YouTube source."""
+        try:
+            from core.youtube import YouTubeResolver, is_youtube_url
+            if not is_youtube_url(self.url):
+                return None
+            cached = YouTubeResolver.get().cached(self.url)
+            return cached.describe() if cached else {"resolved": False}
+        except Exception:
+            return None
+
+    @property
     def ever_connected(self) -> bool:
         """False until the first frame arrives — distinguishes 'starting up'
         from 'went down', so startup never raises a spurious OFFLINE alert."""
@@ -377,6 +515,8 @@ class LiveSource:
             "loops": bool(self._is_file and self.loop_files),
             "generation": self._generation,
             "last_error": s.last_error,
+            "kind": self.kind,
+            "youtube": self.youtube_info,
         }
 
 
