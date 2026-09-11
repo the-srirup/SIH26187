@@ -51,6 +51,10 @@ from core.config import settings
 from core.database import SessionLocal, init_db
 from core.evidence import evidence_usage, is_safe_evidence_path, sweep_evidence
 from core.events import EventManager, serialize_alert_row
+from core.sources import (
+    KIND_FILE, KIND_LIVE, SourceError, get_live_camera, register_camera,
+    retire_camera, startup_cameras, store_source_video, visible_cameras,
+)
 from core.hashchain import (
     chain_status, create_checkpoint, export_integrity_certificate_to_json,
     generate_integrity_certificate, latest_chain_hash, list_checkpoints,
@@ -188,16 +192,19 @@ async def lifespan(app: FastAPI):
 
     db = SessionLocal()
     try:
-        cameras = (
-            db.query(models.Camera)
-            .filter(models.Camera.is_active.is_(True),
-                    models.Camera.source_kind != "upload")
-            .all()
-        )
+        cameras = startup_cameras(db)
         manager = CameraManager.get()
+        started = 0
         for cam in cameras:
-            manager.add_camera(cam)
-        log.info("Auto-started %d camera(s)", len(cameras))
+            # One unreachable source must not prevent the others from starting.
+            if manager.add_camera(cam) is not None:
+                started += 1
+            else:
+                log.warning("Camera %d (%s) could not be started at boot",
+                            cam.id, cam.name)
+        log.info("Auto-started %d of %d camera(s)", started, len(cameras))
+    except Exception as exc:
+        log.exception("Camera auto-start failed: %s", exc)
     finally:
         db.close()
 
@@ -402,13 +409,47 @@ def system_info(db: Session = Depends(get_db_session)):
         "detector": detector_metrics,
         "face": get_face_recognizer().get_metrics(),
         "anpr": get_anpr_processor().get_metrics(),
+        #: Canonical analytics frame size. Rule coordinates live in this space,
+        #: so the dashboard sizes its drawing canvas from here rather than
+        #: hard-coding it — otherwise retuning FRAME_WIDTH/FRAME_HEIGHT would
+        #: silently misplace every zone and tripwire drawn afterwards.
+        "frame": {"width": settings.FRAME_WIDTH, "height": settings.FRAME_HEIGHT},
+        "limits": {
+            "upload_max_mb": settings.UPLOAD_MAX_MB,
+            "allowed_extensions": settings.UPLOAD_ALLOWED_EXTENSIONS,
+            "max_stream_clients": settings.MAX_STREAM_CLIENTS,
+        },
         "pipeline": {
             "frame_size": f"{settings.FRAME_WIDTH}x{settings.FRAME_HEIGHT}",
             "target_fps": settings.TARGET_FPS,
             "inference_imgsz": settings.INFERENCE_IMGSZ,
             "confidence": settings.DEFAULT_CONFIDENCE,
             "debounce_seconds": settings.DEBOUNCE_SECONDS,
-            "night_hours_ist": f"{settings.NIGHT_START_HOUR:02d}:00–{settings.NIGHT_END_HOUR:02d}:00",
+        },
+        #: Night detection is visual. Reporting the thresholds (and the fact
+        #: that the clock is only an optional hint) keeps the dashboard honest
+        #: about how the decision is actually made.
+        "night_detection": {
+            "mode": "forced" if settings.FORCE_NIGHT_MODE else "visual",
+            "enter_threshold": settings.NIGHT_DARKNESS_ENTER,
+            "exit_threshold": settings.NIGHT_DARKNESS_EXIT,
+            "confirm_frames_to_night": settings.NIGHT_CONFIRM_FRAMES,
+            "confirm_frames_to_day": settings.DAY_CONFIRM_FRAMES,
+            "detects_infrared": settings.NIGHT_DETECT_INFRARED,
+            "clock_used_as_hint_only": settings.NIGHT_USE_CLOCK_HINT,
+            "clock_window_ist": (
+                f"{settings.NIGHT_START_HOUR:02d}:00–{settings.NIGHT_END_HOUR:02d}:00"
+                if settings.NIGHT_USE_CLOCK_HINT else "not used"
+            ),
+        },
+        "rules": {
+            "loiter_seconds": settings.LOITER_SECONDS,
+            "loiter_exit_grace_seconds": settings.LOITER_EXIT_GRACE_SECONDS,
+            "zone_presence_seconds": settings.ZONE_PRESENCE_SECONDS,
+            "zone_boundary_margin_px": settings.ZONE_BOUNDARY_MARGIN,
+            "zone_exit_grace_seconds": settings.ZONE_EXIT_GRACE_SECONDS,
+            "crossing_rearm_seconds": settings.CROSSING_REARM_SECONDS,
+            "alert_cooldowns": settings.ALERT_COOLDOWNS,
         },
         "cameras": manager.stats(),
         "aggregate": manager.aggregate(),
@@ -439,6 +480,7 @@ def system_time():
 
 
 def serialize_camera(cam: models.Camera, proc=None) -> dict:
+    kind = cam.source_kind or KIND_LIVE
     data = {
         "id": cam.id,
         "name": cam.name,
@@ -446,7 +488,15 @@ def serialize_camera(cam: models.Camera, proc=None) -> dict:
         "location": cam.location or "",
         "is_active": bool(cam.is_active),
         "is_online": bool(cam.is_online),
-        "source_kind": cam.source_kind or "live",
+        "source_kind": kind,
+        #: The dashboard labels a recorded source as such, so nobody mistakes a
+        #: looping video file for a live feed from the border.
+        "is_file_source": kind == KIND_FILE,
+        "source_label": {
+            KIND_FILE: "VIDEO FILE",
+            "upload": "OFFLINE ANALYSIS",
+        }.get(kind, "LIVE FEED"),
+        "source_name": Path(cam.url).name if kind == KIND_FILE else cam.url,
         "stream_url": f"/stream/{cam.id}",
         "snapshot_url": f"/api/cameras/{cam.id}/snapshot",
     }
@@ -461,13 +511,10 @@ def list_cameras(
     include_uploads: bool = Query(False),
     db: Session = Depends(get_db_session),
 ):
-    query = db.query(models.Camera)
-    if not include_uploads:
-        query = query.filter(models.Camera.source_kind != "upload")
     manager = CameraManager.get()
     return [
         serialize_camera(cam, manager.get_camera(cam.id))
-        for cam in query.order_by(models.Camera.id.asc()).all()
+        for cam in visible_cameras(db, include_uploads=include_uploads)
     ]
 
 
@@ -479,27 +526,109 @@ def create_camera(
     is_active: bool = Form(True),
     db: Session = Depends(get_db_session),
 ):
-    name, url = name.strip(), url.strip()
-    if not name or not url:
-        raise HTTPException(400, "Camera name and URL are required")
-
-    cam = models.Camera(
-        name=name[:120], url=url[:500], location=location.strip()[:200],
-        is_active=is_active, is_online=False, source_kind="live",
-        created_at=utc_iso(),
-    )
-    db.add(cam)
-    db.commit()
-    db.refresh(cam)
+    """Register a network camera: RTSP / HTTP URL, or a webcam index."""
+    try:
+        cam = register_camera(
+            db, name=name, url=url, location=location,
+            is_active=is_active, source_kind=KIND_LIVE,
+        )
+    except SourceError as exc:
+        raise HTTPException(400, str(exc))
 
     proc = CameraManager.get().add_camera(cam) if is_active else None
-    log.info("Camera added: %s (%s)", cam.name, cam.url)
     return serialize_camera(cam, proc)
+
+
+@app.post("/api/cameras/upload", status_code=201)
+async def create_camera_from_video(
+    file: UploadFile = File(...),
+    name: str = Form(...),
+    location: str = Form(""),
+    is_active: bool = Form(True),
+    loop: bool = Form(True),
+):
+    """
+    Register an **MP4 file as a camera source**.
+
+    The file becomes a first-class source: it is stored under
+    ``videos/sources/``, registered with ``source_kind="file"`` and started on
+    the same pipeline as an RTSP stream, so it appears in the Live Camera grid
+    and gets the same detection, tracking, zones, tripwires, ANPR, events and
+    evidence.  ``LiveSource`` paces it to its own frame rate and loops it at
+    EOF, so it behaves like the camera that recorded it rather than being
+    decoded as fast as the CPU allows.
+
+    This is distinct from ``/api/analysis/upload``, which analyses a recording
+    once, offline, and produces a report.
+    """
+    if not (name or "").strip():
+        raise HTTPException(400, "Camera name is required")
+
+    limit = settings.UPLOAD_MAX_MB * 1024 * 1024
+    settings.SOURCES_DIR.mkdir(parents=True, exist_ok=True)
+    tmp_fd, tmp_name = tempfile.mkstemp(suffix=".mp4", dir=str(settings.SOURCES_DIR))
+    tmp_path = Path(tmp_name)
+    written = 0
+    try:
+        # Streamed to disk in bounded chunks — a large upload is never held in
+        # memory, and the size cap is enforced while receiving rather than after.
+        with os.fdopen(tmp_fd, "wb") as handle:
+            while chunk := await file.read(1024 * 1024):
+                written += len(chunk)
+                if written > limit:
+                    raise SourceError(
+                        f"File exceeds the {settings.UPLOAD_MAX_MB} MB limit."
+                    )
+                handle.write(chunk)
+    except SourceError as exc:
+        tmp_path.unlink(missing_ok=True)
+        raise HTTPException(413, str(exc))
+    except Exception as exc:
+        tmp_path.unlink(missing_ok=True)
+        log.exception("Video source upload failed: %s", exc)
+        raise HTTPException(500, "Upload failed while writing to disk")
+    finally:
+        await file.close()
+
+    try:
+        stored, probe = await asyncio.to_thread(
+            store_source_video, tmp_path, file.filename or "source.mp4"
+        )
+    except SourceError as exc:
+        raise HTTPException(400, str(exc))
+
+    db = SessionLocal()
+    try:
+        try:
+            cam = register_camera(
+                db, name=name, url=str(stored), location=location,
+                is_active=is_active, source_kind=KIND_FILE,
+            )
+        except SourceError as exc:
+            stored.unlink(missing_ok=True)
+            raise HTTPException(400, str(exc))
+
+        proc = CameraManager.get().add_camera(cam) if is_active else None
+        payload = serialize_camera(cam, proc)
+    finally:
+        db.close()
+
+    payload["video"] = {
+        "filename": Path(stored).name,
+        "width": probe.get("width"),
+        "height": probe.get("height"),
+        "fps": round(float(probe.get("fps") or 0.0), 2),
+        "frame_count": probe.get("frame_count"),
+        "duration_seconds": probe.get("duration_seconds"),
+        "size_mb": round(float(probe.get("size_bytes", 0)) / (1024 * 1024), 2),
+        "loops": bool(loop),
+    }
+    return payload
 
 
 @app.get("/api/cameras/{camera_id}")
 def get_camera(camera_id: int, db: Session = Depends(get_db_session)):
-    cam = db.query(models.Camera).filter(models.Camera.id == camera_id).first()
+    cam = get_live_camera(db, camera_id)
     if not cam:
         raise HTTPException(404, "Camera not found")
     return serialize_camera(cam, CameraManager.get().get_camera(camera_id))
@@ -514,7 +643,7 @@ def update_camera(
     is_active: Optional[bool] = Form(None),
     db: Session = Depends(get_db_session),
 ):
-    cam = db.query(models.Camera).filter(models.Camera.id == camera_id).first()
+    cam = get_live_camera(db, camera_id)
     if not cam:
         raise HTTPException(404, "Camera not found")
 
@@ -543,20 +672,24 @@ def update_camera(
 
 @app.delete("/api/cameras/{camera_id}")
 def delete_camera(camera_id: int, db: Session = Depends(get_db_session)):
-    cam = db.query(models.Camera).filter(models.Camera.id == camera_id).first()
-    if not cam:
-        raise HTTPException(404, "Camera not found")
-    CameraManager.get().remove_camera(camera_id)
-    name = cam.name
-    db.delete(cam)
-    db.commit()
-    log.info("Camera removed: %s", name)
-    return {"ok": True, "removed": camera_id}
+    """
+    Remove a camera: stop its threads, release its handles, drop its rules.
+
+    Delegates to :func:`core.sources.retire_camera`, which tears the runtime
+    down before touching the database and preserves sealed evidence.  The call
+    is idempotent — removing an already-removed camera returns success rather
+    than 404, so a double-click or a retried request cannot produce an error.
+    """
+    try:
+        return retire_camera(db, camera_id)
+    except Exception as exc:
+        log.exception("Camera removal failed for %d: %s", camera_id, exc)
+        raise HTTPException(500, f"Could not remove camera: {exc}")
 
 
 @app.post("/api/cameras/{camera_id}/restart")
 def restart_camera(camera_id: int, db: Session = Depends(get_db_session)):
-    cam = db.query(models.Camera).filter(models.Camera.id == camera_id).first()
+    cam = get_live_camera(db, camera_id)
     if not cam:
         raise HTTPException(404, "Camera not found")
     manager = CameraManager.get()
@@ -633,7 +766,7 @@ def _validate_geometry(rule_type: str, geometry) -> list:
 
 @app.get("/api/cameras/{camera_id}/rules")
 def list_rules(camera_id: int, db: Session = Depends(get_db_session)):
-    if not db.query(models.Camera).filter(models.Camera.id == camera_id).first():
+    if get_live_camera(db, camera_id) is None:
         raise HTTPException(404, "Camera not found")
     rules = db.query(models.Rule).filter(models.Rule.camera_id == camera_id).all()
     return [serialize_rule(r) for r in rules]
@@ -649,7 +782,7 @@ def create_rule(
     is_active: bool = Form(True),
     db: Session = Depends(get_db_session),
 ):
-    if not db.query(models.Camera).filter(models.Camera.id == camera_id).first():
+    if get_live_camera(db, camera_id) is None:
         raise HTTPException(404, "Camera not found")
 
     try:
@@ -958,7 +1091,10 @@ async def stream_camera(camera_id: int, request: Request):
     """MJPEG stream — drops straight into any ``<img src>``."""
     db = SessionLocal()
     try:
-        exists = db.query(models.Camera.id).filter(models.Camera.id == camera_id).first()
+        # An archived camera has no stream. Checking here is what stops a
+        # browser tab left open on a removed camera from holding a connection
+        # that quietly resurrects it in the UI.
+        exists = get_live_camera(db, camera_id) is not None
     finally:
         db.close()
     if not exists:
@@ -1382,7 +1518,7 @@ async def test_face_on_camera(camera_id: int):
     """Run face detection on a camera's current frame — a diagnostic probe."""
     from cv.face import get_face_recognizer
 
-    frame = FrameBuffer.get().get_frame(camera_id)
+    frame = FrameBuffer.get().get_clean_frame(camera_id)
     if frame is None:
         raise HTTPException(404, "No frame available for this camera")
 
@@ -1431,7 +1567,7 @@ async def test_anpr_on_camera(camera_id: int):
     """Run plate localisation + OCR on a camera's current frame."""
     from cv.anpr import get_anpr_processor
 
-    frame = FrameBuffer.get().get_frame(camera_id)
+    frame = FrameBuffer.get().get_clean_frame(camera_id)
     if frame is None:
         raise HTTPException(404, "No frame available for this camera")
 

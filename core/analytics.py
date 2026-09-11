@@ -36,6 +36,7 @@ from core.timeutil import is_night as clock_is_night
 from cv import overlay as ov
 from cv.detector import Detection, Detector, ObjectTracker
 from cv.rules import Alert as RuleAlert, NightMovementRule, RuleEngine
+from cv.scene import SceneCondition, SceneIlluminationEstimator
 
 log = logging.getLogger("ibvap.analytics")
 
@@ -107,6 +108,9 @@ class AnalysisResult:
     timestamp: float = 0.0
     is_night: bool = False
     night_source: str = ""
+    #: Full illumination measurement behind the night decision, so the UI can
+    #: show *why* a camera is in night mode instead of asserting that it is.
+    scene: Optional[SceneCondition] = None
     enhanced: bool = False
     inference_ms: float = 0.0
     total_ms: float = 0.0
@@ -142,6 +146,8 @@ class FrameAnalyzer:
         self.tracker = ObjectTracker(frame_rate=frame_rate)
         self.rules = RuleEngine(camera_id=self.source_id)
         self.enhancer = LowLightEnhancer()
+        #: Night is decided from this camera's own pixels, never from the clock.
+        self.scene = SceneIlluminationEstimator()
 
         self.enable_face = settings.FACE_ENABLED if enable_face is None else enable_face
         self.enable_anpr = settings.ANPR_ENABLED if enable_anpr is None else enable_anpr
@@ -156,6 +162,11 @@ class FrameAnalyzer:
 
         # Per-track first-sighting bookkeeping for presence events.
         self._announced_tracks: dict[int, float] = {}
+        #: Per-class floor. Track ids churn whenever objects occlude one another,
+        #: so a purely per-track debounce cannot stop the flood: the old build
+        #: issued a fresh "HUMAN DETECTED" for every new id, and the event log
+        #: shows 20 ids inside 50 seconds of sample footage.
+        self._announced_classes: dict[str, float] = {}
 
         self._face_recognizer = None
         self._anpr = None
@@ -181,24 +192,42 @@ class FrameAnalyzer:
             geom = row.get("geometry") or []
             params = row.get("params") or {}
             name = row.get("name") or f"{rtype}_{row.get('id', '?')}"
+            # Operator-tunable knobs travel in the rule's params JSON, so a
+            # dwell threshold or a reference point can be changed per rule from
+            # the UI without touching global configuration. Anything absent
+            # falls back to the configured default.
+            reference = params.get("reference_point") or "foot"
+            classes = params.get("classes") or None
             try:
                 if rtype == "line" and len(geom) >= 2:
-                    self.rules.add_rule(FenceRule(name, *geom[0], *geom[1]))
+                    self.rules.add_rule(FenceRule(
+                        name, *geom[0], *geom[1],
+                        reference=reference, classes=classes,
+                        rearm_seconds=params.get("rearm_seconds"),
+                    ))
                 elif rtype == "zone" and len(geom) >= 3:
-                    self.rules.add_rule(
-                        ZoneRule(name, geom, params.get("presence_seconds"))
-                    )
+                    self.rules.add_rule(ZoneRule(
+                        name, geom, params.get("presence_seconds"),
+                        reference=reference, classes=classes,
+                        margin=params.get("boundary_margin"),
+                        exit_grace=params.get("exit_grace_seconds"),
+                        exit_alerts=params.get("exit_alerts"),
+                    ))
                 elif rtype == "loiter" and len(geom) >= 3:
-                    self.rules.add_rule(
-                        LoiterRule(name, geom, params.get("dwell_seconds"))
-                    )
+                    self.rules.add_rule(LoiterRule(
+                        name, geom, params.get("dwell_seconds"),
+                        reference=reference, classes=classes,
+                        margin=params.get("boundary_margin"),
+                        exit_grace=params.get("exit_grace_seconds"),
+                        realert_seconds=params.get("realert_seconds"),
+                    ))
                 elif rtype == "direction" and len(geom) >= 2:
-                    self.rules.add_rule(
-                        DirectionRule(
-                            name, *geom[0], *geom[1],
-                            allowed_direction=params.get("allowed_direction", "entry"),
-                        )
-                    )
+                    self.rules.add_rule(DirectionRule(
+                        name, *geom[0], *geom[1],
+                        allowed_direction=params.get("allowed_direction", "entry"),
+                        reference=reference, classes=classes,
+                        rearm_seconds=params.get("rearm_seconds"),
+                    ))
                 else:
                     continue
             except Exception as exc:
@@ -206,7 +235,8 @@ class FrameAnalyzer:
                 continue
 
             self._rule_shapes.append(
-                {"type": rtype, "name": name, "geometry": geom, "active": True}
+                {"type": rtype, "name": name, "geometry": geom,
+                 "params": params, "active": True}
             )
 
         # Night movement is a standing rule, not an operator-drawn shape.
@@ -257,15 +287,26 @@ class FrameAnalyzer:
         self._frame_index += 1
 
         # -- preprocess: resize to the analytics resolution --------------- #
+        # The pre-resize frame is retained (by reference — no copy) purely so
+        # ANPR can crop plate pixels from it. Detection and tracking are happy
+        # at 640x384, but OCR accuracy on small text is governed by glyph
+        # height, and a 1080p feed carries three times the linear detail that
+        # the resize is about to discard.
+        source_frame = frame
         if frame.shape[1] != settings.FRAME_WIDTH or frame.shape[0] != settings.FRAME_HEIGHT:
             frame = cv2.resize(
                 frame, settings.frame_size, interpolation=cv2.INTER_LINEAR
             )
 
-        night, night_source = self._night_state(frame)
+        scene = self._night_state(frame)
+        night, night_source = scene.is_night, scene.source
+
         work = frame
         enhanced = False
-        if night and self.enhancer.is_dark():
+        # Enhance based on measured brightness, not on the night latch: an IR
+        # camera is latched to night but its image is already bright, and running
+        # CLAHE on it would only amplify sensor noise.
+        if scene.mean_luma < settings.LOW_LIGHT_THRESHOLD:
             work, enhanced = self.enhancer.maybe_enhance(frame)
 
         # -- detect + track ----------------------------------------------- #
@@ -279,10 +320,15 @@ class FrameAnalyzer:
         self._faces = self._run_face(work, detections, persons)
 
         # -- ANPR (cadenced, vehicle-gated) ------------------------------- #
-        self._plates = self._run_anpr(work, vehicles)
+        self._plates = self._run_anpr(work, vehicles, source_frame)
 
         # -- rules --------------------------------------------------------- #
-        context = {"is_night": night, "night_source": night_source}
+        context = {
+            "is_night": night,
+            "night_source": night_source,
+            "scene_darkness": round(scene.darkness, 3),
+            "mean_luma": round(scene.mean_luma, 1),
+        }
         alerts = self.rules.update(detections, timestamp=now, context=context)
         alerts.extend(self._presence_alerts(detections, now))
 
@@ -328,6 +374,7 @@ class FrameAnalyzer:
             timestamp=now,
             is_night=night,
             night_source=night_source,
+            scene=scene,
             enhanced=enhanced,
             inference_ms=inference_ms,
             total_ms=(time.perf_counter() - t_start) * 1000.0,
@@ -338,17 +385,58 @@ class FrameAnalyzer:
     # ------------------------------------------------------------------ #
     # Stage helpers
     # ------------------------------------------------------------------ #
-    def _night_state(self, frame: np.ndarray) -> tuple[bool, str]:
-        """Decide whether night analytics apply, and say why."""
+    def _night_state(self, frame: np.ndarray) -> SceneCondition:
+        """
+        Decide whether night analytics apply, from **what the camera sees**.
+
+        This is the inversion of the original logic.  It used to read::
+
+            if clock_is_night(now):        # 23:00 -> night, unconditionally
+                return True, "clock"
+            if dark(frame):
+                return True, "luminance"
+
+        so at 23:00 every camera in the deployment was declared night — a
+        floodlit checkpost included — and at noon a camera inside an unlit
+        culvert was declared day.  The clock was consulted first and the pixels
+        only as a fallback, which is backwards: the scene is the observation and
+        the clock is not.
+
+        Now the measurement decides (see :mod:`cv.scene`, which fuses dark-pixel
+        fraction, mean luma and colour saturation, then latches the result over
+        several frames).  The clock survives only as an optional *hint* that can
+        slightly lower the threshold for a borderline scene, and it is disabled
+        by default.  A bright scene is never called night, whatever the hour.
+        """
+        condition = self.scene.measure(frame)
+
         if settings.FORCE_NIGHT_MODE:
-            self.enhancer.measure_luma(frame)
-            return True, "forced"
-        if clock_is_night(None, settings.NIGHT_START_HOUR, settings.NIGHT_END_HOUR):
-            self.enhancer.measure_luma(frame)
-            return True, "clock"
-        if settings.NIGHT_BY_LUMINANCE and self.enhancer.is_dark(frame):
-            return True, "luminance"
-        return False, ""
+            # Explicit operator override for demonstrating the night rule with
+            # daytime footage. Reported honestly as "forced" so the dashboard
+            # never presents an override as a measurement.
+            return SceneCondition(
+                is_night=True, source="forced", darkness=condition.darkness,
+                mean_luma=condition.mean_luma, dark_fraction=condition.dark_fraction,
+                saturation=condition.saturation, infrared=condition.infrared,
+                streak=condition.streak, samples=condition.samples,
+            )
+
+        if (not condition.is_night
+                and settings.NIGHT_USE_CLOCK_HINT
+                and clock_is_night(None, settings.NIGHT_START_HOUR,
+                                   settings.NIGHT_END_HOUR)):
+            # A hint, not a trigger: it can only promote a scene that is already
+            # close to the darkness threshold, never a bright one.
+            threshold = settings.NIGHT_DARKNESS_ENTER - settings.NIGHT_CLOCK_HINT_BONUS
+            if condition.darkness >= threshold:
+                return SceneCondition(
+                    is_night=True, source="darkness+clock-hint",
+                    darkness=condition.darkness, mean_luma=condition.mean_luma,
+                    dark_fraction=condition.dark_fraction,
+                    saturation=condition.saturation, infrared=condition.infrared,
+                    streak=condition.streak, samples=condition.samples,
+                )
+        return condition
 
     def _run_face(self, frame: np.ndarray, detections: list, persons: list) -> list:
         recognizer = self._face()
@@ -366,7 +454,8 @@ class FrameAnalyzer:
             log.warning("[%s] face stage failed: %s", self.source_id, exc)
             return []
 
-    def _run_anpr(self, frame: np.ndarray, vehicles: list) -> list:
+    def _run_anpr(self, frame: np.ndarray, vehicles: list,
+                  source_frame: Optional[np.ndarray] = None) -> list:
         processor = self._anpr_processor()
         if processor is None or not processor.is_available():
             return []
@@ -379,7 +468,9 @@ class FrameAnalyzer:
         self._last_anpr_frame = self._frame_index
         try:
             return processor.recognize_plates(
-                frame, vehicle_detections=vehicles, frame_number=self._frame_index
+                frame, vehicle_detections=vehicles,
+                frame_number=self._frame_index,
+                source_frame=source_frame,
             )
         except Exception as exc:
             log.warning("[%s] ANPR stage failed: %s", self.source_id, exc)
@@ -408,9 +499,22 @@ class FrameAnalyzer:
             last = self._announced_tracks.get(det.track_id)
             if last is not None and now - last < settings.PRESENCE_DEBOUNCE_SECONDS:
                 continue
-            self._announced_tracks[det.track_id] = now
 
             kind = "human_detected" if det.is_person else "vehicle_detected"
+
+            # A per-class floor on top of the per-track debounce. Track ids are
+            # reissued whenever objects occlude one another, so "one event per
+            # track" alone does not bound the event rate — the old log shows a
+            # fresh HUMAN DETECTED for each of 20 ids inside 50 seconds. This is
+            # a rate limit, not a filter: a genuinely new subject arriving after
+            # the cooldown still produces its own event.
+            class_last = self._announced_classes.get(kind)
+            if (class_last is not None
+                    and now - class_last < settings.PRESENCE_CLASS_COOLDOWN_SECONDS):
+                continue
+
+            self._announced_tracks[det.track_id] = now
+            self._announced_classes[kind] = now
             out.append(
                 RuleAlert(
                     rule_name="detection",
@@ -434,7 +538,23 @@ class FrameAnalyzer:
             }
         return out
 
-    def reset_tracking(self) -> None:
-        """Restart tracking — used when a source reconnects or a file loops."""
+    def reset_tracking(self, *, reset_scene: bool = False) -> None:
+        """
+        Restart tracking — used when a source reconnects or a file loops.
+
+        Rule state must be dropped alongside the tracker. A looping video file
+        reissues track ids and every object appears to teleport across the frame
+        at the seam; a fence rule holding the previous lap's trajectory would
+        manufacture a phantom crossing on the first frame of the new lap.
+
+        The illumination estimator is kept by default — a reconnecting camera is
+        still pointed at the same scene, so discarding a converged measurement
+        would only re-introduce a latch delay. A genuinely new source passes
+        ``reset_scene=True``.
+        """
         self.tracker.reset()
+        self.rules.reset_state()
         self._announced_tracks.clear()
+        self._announced_classes.clear()
+        if reset_scene:
+            self.scene.reset()

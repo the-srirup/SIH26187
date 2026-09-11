@@ -152,6 +152,12 @@ class LiveSource:
         #: Set once a frame has ever arrived, so the pipeline can tell
         #: "still starting up" apart from "was up, now down".
         self._ever_connected = False
+        #: Incremented every time a finite file restarts from the beginning, and
+        #: every time a dropped stream is reopened. Consumers watch this to know
+        #: their tracking and rule state has become meaningless: at a loop seam
+        #: every object jumps to a new position, which a fence rule holding the
+        #: previous lap's trajectory would happily report as a crossing.
+        self._generation = 0
 
     # -- lifecycle ------------------------------------------------------ #
     def start(self) -> None:
@@ -251,6 +257,9 @@ class LiveSource:
 
         self._cap = cap
         self.stats.reconnects += 1
+        # A reopened stream is a discontinuity like a loop seam.
+        if self._ever_connected:
+            self._generation += 1
         self.stats.width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
         self.stats.height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
         self.stats.source_fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
@@ -283,6 +292,9 @@ class LiveSource:
                     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                     ok, frame = cap.read()
                     if ok and frame is not None:
+                        self._generation += 1
+                        log.debug("[%s] video file looped (generation %d)",
+                                  self.name, self._generation)
                         with self._new_frame:
                             self._frame = frame
                             self._frame_id += 1
@@ -338,6 +350,11 @@ class LiveSource:
         return (time.time() - self.stats.last_frame_at) < settings.CAMERA_TIMEOUT
 
     @property
+    def generation(self) -> int:
+        """Bumped on every loop restart or reconnect — a tracking discontinuity."""
+        return self._generation
+
+    @property
     def ever_connected(self) -> bool:
         """False until the first frame arrives — distinguishes 'starting up'
         from 'went down', so startup never raises a spurious OFFLINE alert."""
@@ -356,6 +373,9 @@ class LiveSource:
             "resolution": f"{s.width}x{s.height}" if s.width else "—",
             "source_fps": round(s.source_fps, 2),
             "paced": bool(self._frame_interval),
+            "is_file": bool(self._is_file),
+            "loops": bool(self._is_file and self.loop_files),
+            "generation": self._generation,
             "last_error": s.last_error,
         }
 

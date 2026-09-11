@@ -42,15 +42,37 @@ class Camera(Base):
     location = Column(String(200), default="")
     is_active = Column(Boolean, default=True)
     is_online = Column(Boolean, default=False)
-    #: "live" (camera / RTSP / file loop) or "upload" (analysis session source)
+    #: "live"   — RTSP / HTTP / webcam index
+    #: "file"   — an MP4 registered as a first-class camera source
+    #: "upload" — the pseudo-source that owns offline analysis events
     source_kind = Column(String(20), default="live")
     created_at = Column(String(40), default="")
 
+    #: Soft-delete marker. Removing a camera must not destroy its events: the
+    #: alert log is a SHA-256 hash chain, and deleting rows from the middle of
+    #: it invalidates every subsequent row, so integrity verification would fail
+    #: forever afterwards. A removed camera that still owns events is therefore
+    #: archived — hidden from every listing, never auto-started, its stream gone
+    #: — while its sealed evidence stays verifiable. A camera with no events is
+    #: deleted outright. See ``retire_camera``.
+    is_deleted = Column(Boolean, default=False, nullable=False)
+    deleted_at = Column(String(40), default="")
+
+    #: Rules are configuration and are removed with the camera.
     rules = relationship("Rule", back_populates="camera", cascade="all, delete-orphan")
-    alerts = relationship("Alert", back_populates="camera", cascade="all, delete-orphan")
+    #: Alerts are evidence. ``passive_deletes`` keeps SQLAlchemy from issuing a
+    #: cascade that would silently shred the audit chain; the delete path checks
+    #: for dependants and archives instead.
+    alerts = relationship("Alert", back_populates="camera", passive_deletes=True)
+    sessions = relationship("AnalysisSession", back_populates="camera",
+                            passive_deletes=True)
 
     def __repr__(self) -> str:
         return f"<Camera {self.id} {self.name}>"
+
+    @property
+    def is_file_source(self) -> bool:
+        return (self.source_kind or "live") == "file"
 
 
 class Rule(Base):
@@ -178,6 +200,10 @@ class AnalysisSession(Base):
     filename = Column(String(300), nullable=False)
     stored_path = Column(String(500), nullable=False)
     output_path = Column(String(500), default="")
+    #: The camera whose rules this run inherited, or the upload pseudo-source.
+    #: This foreign key is what made "Remove Camera" fail with
+    #: ``FOREIGN KEY constraint failed``: the ORM had no relationship for it, so
+    #: no cascade applied and SQLite rejected the parent DELETE outright.
     camera_id = Column(Integer, ForeignKey("cameras.id"))
 
     #: queued | running | completed | failed | cancelled
@@ -203,6 +229,8 @@ class AnalysisSession(Base):
     created_at_ist = Column(String(64), default="")
     completed_at = Column(String(50), default="")
     completed_at_ist = Column(String(64), default="")
+
+    camera = relationship("Camera", back_populates="sessions")
 
     __table_args__ = (Index("ix_sessions_created", "created_at"),)
 

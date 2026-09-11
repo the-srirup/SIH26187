@@ -216,15 +216,27 @@ class ObjectTracker:
     def __init__(self, frame_rate: Optional[int] = None) -> None:
         from types import SimpleNamespace
 
+        self._frame_rate = int(frame_rate or settings.TARGET_FPS) or 1
+
+        # ``track_buffer`` is how many *frames* a lost track survives before it
+        # is discarded. Expressing that as a raw frame count makes its real
+        # meaning depend on the analytics cadence: 45 frames is 3 s at 15 FPS
+        # but 1.5 s at 30 FPS, so retuning TARGET_FPS silently halved how long a
+        # track survived an occlusion. The intent is a *duration*, so it is
+        # configured in seconds and converted per stream here.
+        buffer_frames = max(
+            int(settings.TRACK_BUFFER_MIN_FRAMES),
+            int(round(self._frame_rate * settings.TRACK_LOST_SECONDS)),
+        )
         self._args = SimpleNamespace(
             track_high_thresh=settings.TRACK_HIGH_THRESH,
             track_low_thresh=settings.TRACK_LOW_THRESH,
             new_track_thresh=settings.NEW_TRACK_THRESH,
-            track_buffer=settings.TRACK_BUFFER,
+            track_buffer=buffer_frames,
             match_thresh=settings.MATCH_THRESH,
             fuse_score=True,
         )
-        self._frame_rate = frame_rate or settings.TARGET_FPS
+        self.track_buffer_frames = buffer_frames
         self._tracker = self._new_tracker()
         self._smoothed: dict[int, np.ndarray] = {}
         self._age: dict[int, int] = {}
@@ -235,7 +247,15 @@ class ObjectTracker:
 
         with self._id_lock:
             preserved = getattr(BaseTrack, "_count", 0)
-            tracker = BYTETracker(self._args)
+            # Older ultralytics took ``frame_rate`` and derived
+            # ``max_time_lost = frame_rate / 30 * track_buffer`` from it; current
+            # versions dropped the parameter and use ``track_buffer`` directly as
+            # a frame count. Support both rather than pinning a version — the
+            # duration is already baked into track_buffer above either way.
+            try:
+                tracker = BYTETracker(self._args, frame_rate=self._frame_rate)
+            except TypeError:
+                tracker = BYTETracker(self._args)
             BaseTrack._count = preserved
         return tracker
 
@@ -643,7 +663,24 @@ class Detector:
         """
         xyxy, conf, cls, _ = self.raw_detect(frame)
         if tracker is None:
-            return self.detect(frame)
+            # Reuse the boxes we already have. Calling self.detect() here ran a
+            # second forward pass over the same frame for no benefit.
+            out: list[Detection] = []
+            for i in range(len(xyxy)):
+                x1, y1, x2, y2 = (int(v) for v in xyxy[i])
+                class_id = int(cls[i])
+                out.append(
+                    Detection(
+                        track_id=i,
+                        class_id=class_id,
+                        class_name=self.names.get(class_id, str(class_id)),
+                        confidence=float(conf[i]),
+                        bbox=(x1, y1, x2, y2),
+                        foot=((x1 + x2) // 2, y2),
+                        draw_bbox=(x1, y1, x2, y2),
+                    )
+                )
+            return out
         return tracker.update(xyxy, conf, cls, self.names)
 
     # ------------------------------------------------------------------ #

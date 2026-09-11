@@ -357,15 +357,90 @@ def test_models_create_cleanly(db, camera):
     assert db.query(Rule).count() == 1
 
 
-def test_deleting_a_camera_cascades_to_its_rules_and_alerts(db, camera):
+def test_retiring_a_camera_with_no_events_deletes_the_row(db, camera):
+    """A camera that never recorded anything is removed outright."""
+    from core.sources import retire_camera
+
+    db.add(Rule(camera_id=camera.id, rule_type="line",
+                geometry="[[0,0],[1,1]]", params="{}", name="r"))
+    db.commit()
+
+    result = retire_camera(db, camera.id)
+    assert result["mode"] == "deleted"
+    assert db.query(Rule).count() == 0
+    assert db.query(Camera).filter(Camera.id == camera.id).first() is None
+
+
+def test_retiring_a_camera_preserves_its_sealed_evidence(db, camera):
+    """
+    Removing a camera must NOT delete its alerts.
+
+    This replaces a test that asserted the opposite. The alert log is a SHA-256
+    hash chain in which each row's hash covers its predecessor's, so deleting a
+    camera's rows from the middle of the chain invalidates every row after them
+    and integrity verification fails permanently. Routine camera removal must
+    not be able to corrupt the audit log, so a camera that owns events is
+    archived rather than deleted: its rules go, its runtime stops, it vanishes
+    from every listing, and its evidence stays verifiable.
+    """
+    from core.hashchain import verify_chain
+    from core.sources import retire_camera, visible_cameras
+
     db.add(Rule(camera_id=camera.id, rule_type="line",
                 geometry="[[0,0],[1,1]]", params="{}", name="r"))
     db.commit()
     _seal(db, camera.id)
-    db.delete(camera)
-    db.commit()
+    _seal(db, camera.id)
+
+    result = retire_camera(db, camera.id)
+    assert result["mode"] == "archived"
+    assert result["alerts_retained"] == 2
+
+    # Configuration is gone; evidence is intact and still verifiable.
     assert db.query(Rule).count() == 0
-    assert db.query(Alert).count() == 0
+    assert db.query(Alert).count() == 2
+    assert verify_chain(db).valid
+
+    # And the camera is invisible to the operator, so it cannot come back.
+    assert camera.id not in {c.id for c in visible_cameras(db)}
+
+
+def test_retiring_a_camera_is_idempotent(db, camera):
+    """A double-click on Remove must not produce an error."""
+    from core.sources import retire_camera
+
+    first = retire_camera(db, camera.id)
+    second = retire_camera(db, camera.id)
+    assert first["ok"] and second["ok"]
+    assert second.get("already_removed") is True
+
+
+def test_retiring_a_camera_referenced_by_an_analysis_session(db, camera):
+    """
+    Regression for the reported "Remove Camera does not work".
+
+    ``analysis_sessions.camera_id`` is a foreign key to ``cameras.id`` with no
+    cascade, and SQLite enforces foreign keys, so deleting a camera that had
+    been used as the rule source for an uploaded video raised
+    ``FOREIGN KEY constraint failed``. The endpoint returned 500 — and since the
+    processor had already been stopped, the camera stopped streaming but
+    survived in the database and reappeared on the next refresh.
+    """
+    from core.models import AnalysisSession
+    from core.sources import retire_camera, visible_cameras
+
+    db.add(AnalysisSession(
+        session_uid="deadbeef", filename="clip.mp4",
+        stored_path="videos/clip.mp4", camera_id=camera.id, status="completed",
+    ))
+    db.commit()
+
+    result = retire_camera(db, camera.id)          # must not raise
+    assert result["ok"] is True
+    assert result["sessions_retained"] == 1
+    assert camera.id not in {c.id for c in visible_cameras(db)}
+    # The session — and its findings — survive.
+    assert db.query(AnalysisSession).count() == 1
 
 
 def test_alert_stores_both_utc_and_ist(db, camera):

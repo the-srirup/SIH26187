@@ -66,6 +66,11 @@ class FrameBuffer:
 
     def __init__(self) -> None:
         self._frames: dict[int, np.ndarray] = {}
+        #: The unannotated frame. Analysis probes (ANPR, face) must run on this,
+        #: never on the annotated one: the overlay burns the camera name and HUD
+        #: text into the image, and an OCR probe pointed at the annotated frame
+        #: cheerfully read the camera's own name back as a number plate.
+        self._clean: dict[int, np.ndarray] = {}
         self._jpegs: dict[int, bytes] = {}
         self._seq: dict[int, int] = {}
         self._lock = threading.Lock()
@@ -78,9 +83,12 @@ class FrameBuffer:
                 cls._instance = cls()
             return cls._instance
 
-    def publish(self, camera_id: int, frame: np.ndarray, jpeg: Optional[bytes] = None) -> None:
+    def publish(self, camera_id: int, frame: np.ndarray, jpeg: Optional[bytes] = None,
+                clean: Optional[np.ndarray] = None) -> None:
         with self._cond:
             self._frames[camera_id] = frame
+            if clean is not None:
+                self._clean[camera_id] = clean
             if jpeg is not None:
                 self._jpegs[camera_id] = jpeg
             self._seq[camera_id] = self._seq.get(camera_id, 0) + 1
@@ -93,6 +101,17 @@ class FrameBuffer:
     def get_frame(self, camera_id: int) -> Optional[np.ndarray]:
         with self._lock:
             return self._frames.get(camera_id)
+
+    def get_clean_frame(self, camera_id: int) -> Optional[np.ndarray]:
+        """
+        The unannotated frame — what an analysis probe must be given.
+
+        Note the explicit ``is None`` test: ``a or b`` on a numpy array calls
+        ``__bool__`` on it, which raises for anything larger than one element.
+        """
+        with self._lock:
+            frame = self._clean.get(camera_id)
+            return frame if frame is not None else self._frames.get(camera_id)
 
     def get_jpeg(self, camera_id: int) -> Optional[bytes]:
         with self._lock:
@@ -116,6 +135,7 @@ class FrameBuffer:
     def drop(self, camera_id: int) -> None:
         with self._cond:
             self._frames.pop(camera_id, None)
+            self._clean.pop(camera_id, None)
             self._jpegs.pop(camera_id, None)
             self._seq.pop(camera_id, None)
             self._cond.notify_all()
@@ -154,6 +174,9 @@ class CameraProcessor:
         self._running = False
         self._thread: Optional[threading.Thread] = None
         self._last_frame_id = -1
+        #: Last source generation the analytics saw. A change means the feed
+        #: restarted (file loop or reconnect) and per-track state is stale.
+        self._last_generation = 0
 
         # Runtime metrics — all measured, none fabricated.
         self._fps = 0.0
@@ -166,6 +189,7 @@ class CameraProcessor:
         self._person_count = 0
         self._vehicle_count = 0
         self._is_night = False
+        self._scene = None
         self._online = False
         self._started_at = 0.0
         self._offline_announced = False
@@ -259,6 +283,20 @@ class CameraProcessor:
             self._last_frame_id = frame_id
             self._set_online(True)
 
+            # A looping video file or a reconnected stream is a discontinuity:
+            # track ids are reissued and every object appears to teleport. Rule
+            # state carried across that seam would fabricate fence crossings and
+            # zone entries on the first frame of the new lap, which is exactly
+            # the kind of phantom event that makes an operator stop trusting the
+            # system. Drop tracking and rule state, keep the scene measurement
+            # (the camera is still pointed at the same place).
+            generation = self.source.generation
+            if generation != self._last_generation:
+                self._last_generation = generation
+                self.analyzer.reset_tracking()
+                log.info("Camera %d (%s): source restarted — tracking reset",
+                         self.camera_id, self.name)
+
             # Cadence limiter. The capture thread keeps draining regardless, so
             # skipping here sheds load without ever building a backlog.
             now = time.time()
@@ -313,7 +351,8 @@ class CameraProcessor:
         ok, encoded = cv2.imencode(
             ".jpg", result.frame, [cv2.IMWRITE_JPEG_QUALITY, settings.JPEG_QUALITY]
         )
-        buffer.publish(self.camera_id, result.frame, encoded.tobytes() if ok else None)
+        buffer.publish(self.camera_id, result.frame,
+                       encoded.tobytes() if ok else None, clean=result.raw_frame)
         if settings.EVIDENCE_ENABLED:
             self.clips.push(result.frame)
 
@@ -421,6 +460,7 @@ class CameraProcessor:
         self._person_count = result.person_count
         self._vehicle_count = result.vehicle_count
         self._is_night = result.is_night
+        self._scene = result.scene
 
     def _set_online(self, online: bool, persist: bool = False) -> None:
         changed = online != self._online
@@ -475,6 +515,12 @@ class CameraProcessor:
             "persons": self._person_count,
             "vehicles": self._vehicle_count,
             "night_mode": self._is_night,
+            # The measurement behind the night decision, so the dashboard can
+            # explain the state instead of merely asserting it.
+            "scene": ({**self._scene.to_dict(),
+                       "enter_threshold": settings.NIGHT_DARKNESS_ENTER,
+                       "exit_threshold": settings.NIGHT_DARKNESS_EXIT}
+                      if self._scene is not None else None),
             "uptime_seconds": round(time.time() - self._started_at, 1) if self._started_at else 0,
             "rules": len(self.analyzer.rule_shapes),
             "active_clips": self.clips.active_clips,

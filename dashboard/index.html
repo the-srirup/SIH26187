@@ -206,16 +206,42 @@
 <div class="modal" id="modal-camera" onclick="if(event.target===this)IBVAP.closeModal('modal-camera')">
   <div class="modal-box">
     <button class="modal-close" onclick="IBVAP.closeModal('modal-camera')">&times;</button>
-    <h2>Add Camera</h2>
+    <h2>Add Camera Source</h2>
     <form onsubmit="IBVAP.submitCamera(event)">
+      <label>Source type</label>
+      <div class="segmented" id="cam-kind">
+        <button class="seg active" type="button" data-kind="live"
+                onclick="IBVAP.setCameraKind('live')">IP Camera / RTSP</button>
+        <button class="seg" type="button" data-kind="file"
+                onclick="IBVAP.setCameraKind('file')">MP4 Video File</button>
+      </div>
+
       <label>Camera name</label>
       <input class="input" id="cam-name" required placeholder="BOP-02 SOUTH">
-      <label>Source URL</label>
-      <input class="input" id="cam-url" required placeholder="rtsp://192.168.1.10:554/stream  ·  0 for webcam  ·  path/to/file.mp4">
-      <p class="hint">Accepts RTSP/HTTP IP-camera streams, a local webcam index, or a video file path.</p>
+
+      <div id="cam-live-fields">
+        <label>Source URL</label>
+        <input class="input" id="cam-url" placeholder="rtsp://192.168.1.10:554/stream  ·  0 for webcam">
+        <p class="hint">RTSP/HTTP IP-camera stream, or a webcam index such as <code>0</code>.</p>
+      </div>
+
+      <div id="cam-file-fields" hidden>
+        <label>Video file</label>
+        <div class="upload-area upload-area-sm" id="cam-dropzone"
+             onclick="document.getElementById('cam-file').click()">
+          <input type="file" id="cam-file" accept="video/mp4,.mp4" hidden
+                 onchange="IBVAP.cameraFileChosen(event)">
+          <p id="cam-file-label">Drop an MP4 here or click to choose</p>
+        </div>
+        <p class="hint">The video is registered as a camera source and runs the
+          full analytics pipeline — detection, tracking, zones, tripwires, ANPR,
+          alerts and evidence. It loops continuously and is labelled
+          <b>VIDEO FILE</b> in the grid so it is never mistaken for a live feed.</p>
+      </div>
+
       <label>Location</label>
       <input class="input" id="cam-location" placeholder="Sector 4 — Checkpost Alpha">
-      <button class="btn btn-primary btn-block" type="submit">Add Camera</button>
+      <button class="btn btn-primary btn-block" type="submit" id="cam-submit">Add Camera</button>
     </form>
   </div>
 </div>
@@ -234,6 +260,8 @@
       <span class="fence-hint" id="fence-hint">Click two points to place a tripwire.</span>
     </div>
     <div class="fence-canvas-wrap">
+      <!-- Sized from /api/system/info at startup so rule coordinates always
+           match the analytics frame space exactly. -->
       <canvas id="fence-canvas" width="640" height="384"></canvas>
     </div>
     <div class="fence-options" id="fence-options"></div>

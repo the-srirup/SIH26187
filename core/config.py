@@ -42,6 +42,10 @@ class Settings(BaseSettings):
     SNAPSHOTS_DIR: Path = ALERTS_DIR / "snapshots"
     VIDEOS_DIR: Path = BASE_DIR / "videos"                    # uploaded sources
     PROCESSED_DIR: Path = BASE_DIR / "videos" / "processed"    # annotated renders
+    #: MP4 files registered as live camera sources. Kept separate from the
+    #: offline-analysis uploads so removing such a camera can safely delete its
+    #: own file without ever touching an evidence artefact or another session.
+    SOURCES_DIR: Path = BASE_DIR / "videos" / "sources"
     LOG_DIR: Path = BASE_DIR / "logs"
 
     #: Default camera feed used when seeding a fresh install.
@@ -86,9 +90,28 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------ #
     TRACK_HIGH_THRESH: float = 0.45
     TRACK_LOW_THRESH: float = 0.10
-    NEW_TRACK_THRESH: float = 0.50
-    TRACK_BUFFER: int = 45          # frames a lost track survives before removal
-    MATCH_THRESH: float = 0.85
+    #: Confidence needed to start a *new* track. Was 0.50, which is above the
+    #: score a motion-blurred car or scooter typically gets — such an object was
+    #: detected but never tracked, so it had no identity, triggered no rule and
+    #: appeared to the operator as a missed detection. 0.32 sits just above the
+    #: 0.30 detector floor so blurred fast movers get an identity immediately.
+    NEW_TRACK_THRESH: float = 0.32
+    #: How long a lost track survives before it is discarded, in SECONDS.
+    #: Configured as a duration because that is the actual intent — a subject
+    #: walking behind a truck is occluded for a couple of seconds regardless of
+    #: the analytics cadence. It is converted to a frame count per stream.
+    TRACK_LOST_SECONDS: float = 3.0
+    TRACK_BUFFER_MIN_FRAMES: int = 30
+    #: Retained for backward compatibility with existing .env files; the
+    #: effective value is derived from TRACK_LOST_SECONDS.
+    TRACK_BUFFER: int = 45
+    #: ByteTrack association gate. The cost is ``1 - IoU*score``, so 0.85 needed
+    #: ``IoU*score > 0.15`` — for a vehicle that moves more than its own length
+    #: between analysed frames IoU is 0 and association was impossible, which
+    #: is what produced 20 new track IDs in 50 seconds of sample footage.
+    #: Raising the gate lets the Kalman prediction carry fast objects; the
+    #: prediction (not raw overlap) then does the matching.
+    MATCH_THRESH: float = 0.92
     #: Exponential smoothing factor for drawn boxes (0 = off, 1 = no smoothing).
     #: Applied to rendering only — rule geometry uses the raw foot point.
     BOX_SMOOTHING: float = 0.55
@@ -110,37 +133,177 @@ class Settings(BaseSettings):
     JPEG_QUALITY: int = 72
 
     # ------------------------------------------------------------------ #
-    # Low-light / night
+    # Night detection — VISUAL, not clock-based
     # ------------------------------------------------------------------ #
-    NIGHT_START_HOUR: int = 19       # IST
+    # Night is decided from what the camera actually sees (see cv/scene.py).
+    # The old build asked the clock: at 23:00 every camera was declared "night"
+    # including one aimed at a floodlit checkpost, and a camera inside an unlit
+    # culvert was declared "day" at noon. The clock is not an observation.
+    #
+    # Three measured signals are fused into a 0-1 darkness score:
+    # dark-pixel fraction (weighted highest — it survives a streetlamp or
+    # headlights inflating the mean), normalised mean luma, and colour
+    # saturation / channel spread to recognise IR night-vision.
+    #
+    # Calibrated against this project's own footage: real daytime clips here
+    # score 0.00-0.05, a dark scene with a bright streetlamp scores ~0.90, and
+    # pitch black scores 1.00 — so the 0.55 threshold has a wide margin on
+    # both sides rather than sitting between two adjacent measurements.
+
+    #: Darkness score at or above which the scene becomes night.
+    NIGHT_DARKNESS_ENTER: float = 0.55
+    #: Score below which night is released. Lower than ENTER on purpose: the
+    #: gap is hysteresis, and it is what stops dusk from flickering for twenty
+    #: minutes between the two states.
+    NIGHT_DARKNESS_EXIT: float = 0.40
+    #: Consecutive agreeing frames before the night latch flips. One dark frame
+    #: (a truck's shadow, an auto-exposure hunt) must never arm night analytics.
+    NIGHT_CONFIRM_FRAMES: int = 12
+    #: Consecutive bright frames before night is released — deliberately slower
+    #: than arming it, so sweeping headlights cannot disarm night analytics.
+    DAY_CONFIRM_FRAMES: int = 20
+    #: A pixel below this grey value counts toward the dark-pixel fraction.
+    NIGHT_DARK_PIXEL_VALUE: int = 50
+    #: Mean luma treated as full daylight when normalising the luma term.
+    NIGHT_DAYLIGHT_LUMA: float = 110.0
+    #: Relative weights of the two brightness signals.
+    NIGHT_WEIGHT_DARK_FRACTION: float = 0.65
+    NIGHT_WEIGHT_LUMA: float = 0.35
+    #: EMA factor applied to the fused score (0 = frozen, 1 = no smoothing).
+    NIGHT_SMOOTHING: float = 0.25
+
+    #: Recognise IR / night-vision cameras, which output a *bright* but
+    #: colourless image that mean luma alone reads as daylight.
+    NIGHT_DETECT_INFRARED: bool = True
+    #: A true monochrome sensor gives saturation ~0 and per-pixel channel
+    #: spread ~0. Measured on this project's footage, genuinely desaturated
+    #: *colour* daylight still reads saturation ~7 and spread ~3.8, so these
+    #: ceilings separate the two cases with margin instead of guessing.
+    NIGHT_IR_SATURATION_MAX: float = 3.0
+    NIGHT_IR_CHANNEL_SPREAD_MAX: float = 1.5
+    NIGHT_IR_LUMA_MAX: float = 160.0
+    #: Darkness score attributed to a confirmed IR frame.
+    NIGHT_IR_SCORE: float = 0.75
+
+    #: Optional *hint* only — never a trigger. When true, the clock window can
+    #: nudge a borderline scene, but a bright scene is never called night.
+    NIGHT_USE_CLOCK_HINT: bool = False
+    #: How much the clock hint may lower the enter threshold, at most.
+    NIGHT_CLOCK_HINT_BONUS: float = 0.10
+    NIGHT_START_HOUR: int = 19       # IST — only used for the optional hint
     NIGHT_END_HOUR: int = 6          # IST
+
     #: Mean luma below which CLAHE enhancement kicks in.
     LOW_LIGHT_THRESHOLD: float = 80.0
     CLAHE_CLIP_LIMIT: float = 2.5
-    #: Force night analytics regardless of clock — for demoing with day footage.
+    #: Force night analytics regardless of the scene — for demonstrating the
+    #: night rule with daytime footage. Reported as night_source="forced" so
+    #: the dashboard never passes a forced state off as a measurement.
     FORCE_NIGHT_MODE: bool = False
-    #: Treat a visually dark frame as night even during daylight hours.
-    NIGHT_BY_LUMINANCE: bool = True
+
+    #: Night-movement rule: sustained travel required, measured within a
+    #: rolling window so a subject shuffling for ten minutes does not slowly
+    #: accumulate its way to an alert.
     NIGHT_MOVEMENT_MIN_TRAVEL: float = 45.0    # px of travel before alerting
-    NIGHT_MOVEMENT_DEBOUNCE: float = 45.0      # seconds per track
+    NIGHT_MOVEMENT_WINDOW: float = 6.0         # seconds the travel must occur in
+    #: Net displacement required, as a fraction of NIGHT_MOVEMENT_MIN_TRAVEL.
+    #: Path length alone is satisfied by a couple of pixels of box jitter
+    #: accumulating over a second, which would report a parked vehicle as
+    #: movement; requiring net displacement means the object actually crossed
+    #: some of the scene.
+    NIGHT_MOVEMENT_NET_RATIO: float = 0.6
+    NIGHT_MOVEMENT_DEBOUNCE: float = 45.0      # seconds before a track re-alerts
 
     # ------------------------------------------------------------------ #
     # Rules / analytics
     # ------------------------------------------------------------------ #
     #: Global per-(rule, track, event) cooldown — the alert debouncer.
     DEBOUNCE_SECONDS: float = 12.0
-    #: Consecutive confirmations on the new side/zone before a rule fires,
-    #: in frames of the analytics cadence.
+    #: Consecutive confirmations before a *zone* rule believes an entry, in
+    #: frames of the analytics cadence. Crossing rules do NOT use this: a
+    #: crossing is an instantaneous geometric event, and requiring N further
+    #: frames of persistence is exactly why fast vehicles were never reported.
     ANCHOR_CONFIRMATION_FRAMES: int = 3
-    LOITER_SECONDS: float = 15.0
+
+    # -- crossing rules (tripwire / direction) ------------------------- #
+    #: Minimum travel (px) between two observations for a crossing to count.
+    #: Rejects sub-pixel box jitter on a subject standing on the line.
+    CROSSING_MIN_DISPLACEMENT: float = 4.0
+    #: A track must be this many frames old before it can trigger a crossing,
+    #: so a one-frame false positive appearing across the line is ignored.
+    CROSSING_MIN_TRACK_AGE: int = 2
+    #: Seconds before the same track may report the same crossing direction
+    #: again — stops a subject loitering astride the line from machine-gunning
+    #: events, while a genuine cross-back in the other direction still fires.
+    CROSSING_REARM_SECONDS: float = 3.0
+    #: Ignore a crossing inferred across a gap longer than this (seconds). A
+    #: track reacquired after a long occlusion may have crossed and returned,
+    #: so claiming a single crossing would be a guess, not an observation.
+    CROSSING_MAX_GAP_SECONDS: float = 2.0
+
+    # -- zone rules (restricted area) ---------------------------------- #
+    #: Dead band (px) around a zone boundary. Inside it, a rule holds its
+    #: previous opinion instead of forming a new one — this is what stops the
+    #: enter/exit flapping that filled the old event log with pairs of
+    #: contradictory alerts a fraction of a second apart.
+    ZONE_BOUNDARY_MARGIN: float = 6.0
+    #: How long a track must be continuously outside before an exit is
+    #: declared. Absorbs a missed detection or a one-frame box wobble.
+    ZONE_EXIT_GRACE_SECONDS: float = 1.5
     #: Restricted-zone presence threshold (seconds) before a dwell alert.
     ZONE_PRESENCE_SECONDS: float = 5.0
+    #: Emit the low-severity "left the zone" event. Kept ON: with the exit
+    #: grace period in place this is now one informative event per genuine
+    #: departure (carrying the dwell time), not the flapping noise it used to
+    #: be — suppressing it would hide a legitimate event rather than fix one.
+    ZONE_EXIT_ALERTS_ENABLED: bool = True
+
+    # -- loitering ------------------------------------------------------ #
+    LOITER_SECONDS: float = 15.0
+    #: A tracked subject may leave the loiter zone for this long without the
+    #: dwell timer resetting. The old rule discarded its state the instant a
+    #: foot point fell outside, so a single jittery frame at the boundary reset
+    #: the clock to zero and the threshold was effectively never reached.
+    LOITER_EXIT_GRACE_SECONDS: float = 3.0
+    #: Re-alert interval for a subject that keeps loitering past the first
+    #: alert. 0 disables re-alerting (one event per visit).
+    LOITER_REALERT_SECONDS: float = 120.0
+    #: Object classes the loiter rule considers. Loitering is a human
+    #: behaviour; a parked car should not be reported as loitering.
+    LOITER_CLASSES: list[str] = ["person"]
+
     #: Presence/first-sighting events for plain human & vehicle detections.
     PRESENCE_ALERTS_ENABLED: bool = True
     PRESENCE_MIN_CONFIDENCE: float = 0.55
     PRESENCE_DEBOUNCE_SECONDS: float = 60.0
+    #: Suppress a presence event unless the scene has been quiet for this long
+    #: for that class. Track IDs churn when objects occlude each other, and a
+    #: per-track debounce alone therefore cannot stop the flood; this is a
+    #: per-(camera, class) floor that does not depend on ID stability.
+    PRESENCE_CLASS_COOLDOWN_SECONDS: float = 20.0
     #: Drop rule state for tracks unseen for this long (prevents dict growth).
     TRACK_STATE_TTL: float = 120.0
+
+    # -- per-event-type cooldowns -------------------------------------- #
+    #: Overrides DEBOUNCE_SECONDS per alert type. Tuned so a single subject
+    #: cannot produce a wall of events while genuinely distinct incidents are
+    #: still all reported. Anything absent falls back to DEBOUNCE_SECONDS.
+    ALERT_COOLDOWNS: dict[str, float] = {
+        "entry": 4.0,
+        "exit": 4.0,
+        "enter": 8.0,
+        "zone_exit": 8.0,
+        "zone_presence": 30.0,
+        "loiter": 30.0,
+        "wrong_direction": 6.0,
+        "night_movement": 45.0,
+        "human_detected": 20.0,
+        "vehicle_detected": 20.0,
+        "anpr_detection": 30.0,
+        "face_detected": 60.0,
+        "watchlist_match": 45.0,
+        "camera_offline": 120.0,
+    }
 
     # ------------------------------------------------------------------ #
     # Evidence
@@ -183,11 +346,41 @@ class Settings(BaseSettings):
     ANPR_CONFIDENCE_THRESHOLD: float = 0.45
     #: Confidence required before an ANPR event is written to the log.
     ANPR_ALERT_CONFIDENCE: float = 0.55
-    ANPR_MIN_PLATE_AREA: int = 500
+    #: Candidate plate geometry. These are now *relative* to the region being
+    #: searched rather than absolute pixel counts: the old code required a
+    #: candidate at least 50x15 px, which at the 640x384 analytics resolution
+    #: only matches a vehicle filling most of the frame — so on any normal feed
+    #: the candidate list came back empty and ANPR silently did nothing.
+    ANPR_MIN_PLATE_AREA: int = 120
+    ANPR_MIN_PLATE_WIDTH_FRAC: float = 0.06   # of the searched region's width
+    ANPR_MIN_PLATE_WIDTH_PX: int = 18
+    ANPR_MIN_PLATE_HEIGHT_PX: int = 7
+    #: Upper bounds, also relative to the searched region. A plate is a small
+    #: feature of a vehicle; without these the full-frame fallback proposed a
+    #: whole-frame "plate" and OCR read the burnt-in overlay text out of it.
+    ANPR_MAX_PLATE_WIDTH_FRAC: float = 0.75
+    ANPR_MAX_PLATE_HEIGHT_FRAC: float = 0.45
     ANPR_MIN_ASPECT_RATIO: float = 1.8
     ANPR_MAX_ASPECT_RATIO: float = 6.5
+    #: Plate crops are upscaled to this height before OCR. A plate is often
+    #: 40x12 px at analytics resolution; EasyOCR cannot read glyphs that small,
+    #: and the previous build passed the crop through at native size.
+    ANPR_PLATE_TARGET_HEIGHT: int = 64
+    ANPR_PLATE_MAX_UPSCALE: float = 6.0
     ANPR_ALERT_DEBOUNCE_SECONDS: float = 30.0
     ANPR_LANGUAGES: str = "en"
+
+    #: Temporal consensus. A single frame's OCR is a noisy observation, so reads
+    #: of the same tracked vehicle are accumulated and decided by per-character
+    #: majority vote (WB12AB1234 / WB12AB1284 / WB12AB1234 -> WB12AB1234).
+    ANPR_CONSENSUS_ENABLED: bool = True
+    #: Reads of one vehicle required before a plate is published.
+    ANPR_MIN_VOTES: int = 2
+    #: Reads kept per tracked vehicle when voting.
+    ANPR_VOTE_HISTORY: int = 12
+    #: Votes older than this (seconds) are discarded — a new vehicle may reuse
+    #: a recycled track id.
+    ANPR_VOTE_WINDOW_SECONDS: float = 20.0
 
     # ------------------------------------------------------------------ #
     # Video upload / offline analysis
@@ -242,13 +435,15 @@ class Settings(BaseSettings):
             self.CLIPS_DIR.resolve(),
             self.VIDEOS_DIR.resolve(),
             self.PROCESSED_DIR.resolve(),
+            self.SOURCES_DIR.resolve(),
         )
 
     def ensure_dirs(self) -> None:
         """Create runtime directories that don't yet exist."""
         for d in (
             self.ALERTS_DIR, self.CLIPS_DIR, self.SNAPSHOTS_DIR,
-            self.VIDEOS_DIR, self.PROCESSED_DIR, self.STATIC_DIR, self.LOG_DIR,
+            self.VIDEOS_DIR, self.PROCESSED_DIR, self.SOURCES_DIR,
+            self.STATIC_DIR, self.LOG_DIR,
         ):
             d.mkdir(parents=True, exist_ok=True)
 

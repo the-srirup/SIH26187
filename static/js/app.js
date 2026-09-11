@@ -30,6 +30,8 @@ const IBVAP = (() => {
     alertTypes: new Set(),
     upload: { file: null, sessionId: null, poll: null },
     fence: { cameraId: null, cameraName: '', mode: 'line', points: [], rules: [], image: null },
+    camera: { kind: 'live', file: null },
+    frame: { width: 640, height: 384 },
     deviceLabel: '—',
   };
 
@@ -143,8 +145,12 @@ const IBVAP = (() => {
     root.className = 'camera-tile';
     root.innerHTML = `
       <div class="camera-video">
-        <img alt="${esc(cam.name)} live feed" loading="lazy">
+        <img alt="${esc(cam.name)} feed" loading="lazy">
         <div class="camera-badge"><span class="dot"></span><span class="b-status">CONNECTING</span></div>
+        <div class="camera-source-badge ${cam.is_file_source ? 'file' : ''}"
+             title="${esc(cam.is_file_source
+                          ? 'Recorded video file: ' + (cam.source_name || '')
+                          : cam.url)}">${esc(cam.source_label || 'LIVE FEED')}</div>
         <div class="camera-night" hidden>NIGHT MODE</div>
       </div>
       <div class="camera-bar">
@@ -196,6 +202,18 @@ const IBVAP = (() => {
       tile.status.textContent = s.online ? 'LIVE' : 'OFFLINE';
       tile.root.classList.toggle('offline', !s.online);
       tile.night.hidden = !s.night_mode;
+      if (s.night_mode && s.scene) {
+        // Night mode is a measurement of this camera's view, so show what was
+        // measured. The old build inferred it from the clock and had nothing to
+        // show — and was wrong whenever the scene disagreed with the hour.
+        tile.night.textContent =
+          s.scene.source === 'infrared' ? 'NIGHT MODE · IR' : 'NIGHT MODE';
+        tile.night.title =
+          `Darkness score ${s.scene.darkness} (night at ${s.scene.enter_threshold})`
+          + `\nMean brightness ${s.scene.mean_luma} / 255`
+          + `\nDark pixels ${Math.round((s.scene.dark_fraction || 0) * 100)}%`
+          + `\nReason: ${s.scene.source}`;
+      }
       tile.fps.textContent = s.fps.toFixed(1);
       tile.obj.textContent = s.detections;
       tile.lat.textContent = Math.round(s.latency_ms);
@@ -222,35 +240,122 @@ const IBVAP = (() => {
   }
 
   async function removeCamera(id, name) {
-    if (!confirm(`Remove camera "${name}"?\nIts rules and alert history are deleted too.`)) return;
+    // Say what removal actually does. The stream, threads and zones go; sealed
+    // events stay, because the alert log is a hash chain and deleting rows from
+    // the middle of it would invalidate every later row.
+    if (!confirm(
+      `Remove camera "${name}"?\n\n` +
+      'Its stream stops, its processing threads are released and its ' +
+      'zones/tripwires are deleted.\nRecorded events and evidence are kept in ' +
+      'the audit log.'
+    )) return;
     try {
-      await api(`/api/cameras/${id}`, { method: 'DELETE' });
+      const result = await api(`/api/cameras/${id}`, { method: 'DELETE' });
       state.tiles.get(id)?.root.remove();
       state.tiles.delete(id);
-      toast(`Removed ${name}`, 'ok');
-      loadCameras();
-    } catch (err) { toast(err.message, 'err'); }
+      toast(result.detail || `Removed ${name}`, 'ok', 6500);
+      await loadCameras();
+    } catch (err) {
+      toast(`Could not remove ${name}: ${err.message}`, 'err', 7000);
+    }
   }
 
-  function openCameraModal() { openModal('modal-camera'); }
+  /* ------------------------------------------------ add camera (live / MP4) */
+
+  function openCameraModal() {
+    setCameraKind('live');
+    openModal('modal-camera');
+  }
+
+  /**
+   * Switch the Add Camera form between a network stream and an MP4 file.
+   * Both produce a first-class camera; only the transport differs.
+   */
+  function setCameraKind(kind) {
+    state.camera.kind = kind;
+    document.querySelectorAll('#cam-kind .seg').forEach((seg) =>
+      seg.classList.toggle('active', seg.dataset.kind === kind));
+    $('cam-live-fields').hidden = kind !== 'live';
+    $('cam-file-fields').hidden = kind !== 'file';
+    $('cam-url').required = kind === 'live';
+    $('cam-submit').textContent =
+      kind === 'file' ? 'Upload & Add Video Source' : 'Add Camera';
+  }
+
+  function cameraFileChosen(event) { setCameraFile(event.target.files[0]); }
+
+  function setCameraFile(file) {
+    if (!file) return;
+    if (!/\.mp4$/i.test(file.name)) {
+      toast('Only .mp4 files are supported as a camera source.', 'warn');
+      return;
+    }
+    state.camera.file = file;
+    const label = $('cam-file-label');
+    label.textContent = `${file.name} · ${(file.size / 1048576).toFixed(1)} MB`;
+    label.classList.add('chosen');
+    // Offer the filename as the camera name so the operator rarely has to type.
+    if (!$('cam-name').value.trim()) {
+      $('cam-name').value = file.name.replace(/\.mp4$/i, '').slice(0, 40).toUpperCase();
+    }
+  }
 
   async function submitCamera(event) {
     event.preventDefault();
+    const name = $('cam-name').value.trim();
+    const location = $('cam-location').value.trim();
+    const button = $('cam-submit');
+    const restore = button.textContent;
+
     try {
-      await api('/api/cameras', {
-        method: 'POST',
-        body: form({
-          name: $('cam-name').value.trim(),
-          url: $('cam-url').value.trim(),
-          location: $('cam-location').value.trim(),
-          is_active: 'true',
-        }),
-      });
+      button.disabled = true;
+      let created;
+
+      if (state.camera.kind === 'file') {
+        if (!state.camera.file) {
+          toast('Choose an MP4 file first.', 'warn');
+          return;
+        }
+        button.textContent = 'Uploading…';
+        // Multipart, not the JSON helper: the file is streamed to disk
+        // server-side rather than buffered in memory.
+        const body = new FormData();
+        body.append('file', state.camera.file);
+        body.append('name', name);
+        body.append('location', location);
+        body.append('is_active', 'true');
+        created = await api('/api/cameras/upload', { method: 'POST', body });
+        toast(`Video source added: ${created.name}`, 'ok', 6000);
+      } else {
+        const url = $('cam-url').value.trim();
+        if (!url) { toast('Enter a stream URL or webcam index.', 'warn'); return; }
+        created = await api('/api/cameras', {
+          method: 'POST',
+          body: form({ name, url, location, is_active: 'true' }),
+        });
+        toast(`Camera added: ${created.name}`, 'ok');
+      }
+
       closeModal('modal-camera');
       event.target.reset();
-      toast('Camera added', 'ok');
-      loadCameras();
-    } catch (err) { toast(err.message, 'err'); }
+      resetCameraForm();
+      await loadCameras();
+    } catch (err) {
+      toast(err.message, 'err', 7000);
+    } finally {
+      button.disabled = false;
+      button.textContent = restore;
+    }
+  }
+
+  function resetCameraForm() {
+    state.camera.file = null;
+    const label = $('cam-file-label');
+    if (label) {
+      label.textContent = 'Drop an MP4 here or click to choose';
+      label.classList.remove('chosen');
+    }
+    setCameraKind('live');
   }
 
   function populateCameraSelects() {
@@ -1094,16 +1199,22 @@ const IBVAP = (() => {
     canvas.addEventListener('click', onFenceClick);
     canvas.addEventListener('dblclick', onFenceDouble);
 
-    const zone = $('drop-zone');
-    ['dragenter', 'dragover'].forEach((type) =>
-      zone.addEventListener(type, (e) => {
-        e.preventDefault(); zone.classList.add('dragging');
-      }));
-    ['dragleave', 'drop'].forEach((type) =>
-      zone.addEventListener(type, (e) => {
-        e.preventDefault(); zone.classList.remove('dragging');
-      }));
-    zone.addEventListener('drop', (e) => setUploadFile(e.dataTransfer.files[0]));
+    // Drag-and-drop for both the offline-analysis zone and the Add Camera
+    // video-source zone. Same behaviour, so it is wired once.
+    const wireDropzone = (element, onFile) => {
+      if (!element) return;
+      ['dragenter', 'dragover'].forEach((type) =>
+        element.addEventListener(type, (e) => {
+          e.preventDefault(); element.classList.add('dragging');
+        }));
+      ['dragleave', 'drop'].forEach((type) =>
+        element.addEventListener(type, (e) => {
+          e.preventDefault(); element.classList.remove('dragging');
+        }));
+      element.addEventListener('drop', (e) => onFile(e.dataTransfer.files[0]));
+    };
+    wireDropzone($('drop-zone'), setUploadFile);
+    wireDropzone($('cam-dropzone'), setCameraFile);
 
     document.addEventListener('keydown', (e) => {
       if (e.key === 'Escape') {
@@ -1112,10 +1223,28 @@ const IBVAP = (() => {
     });
 
     api('/api/system/info').then((info) => {
-      $('upload-limit').textContent = 512;
+      const limits = info.limits || {};
+      $('upload-limit').textContent = limits.upload_max_mb ?? 512;
+
       const d = info.detector || {};
       $('stat-device').textContent = d.device === 'cpu' ? 'CPU'
         : (d.gpu_name ? d.gpu_name.replace(/NVIDIA GeForce /, '') : '—');
+
+      // The fence canvas MUST match the analytics frame size exactly: the
+      // coordinates saved for a rule are consumed verbatim by the rule engine.
+      // Reading the size from the server removes the standing risk that
+      // changing FRAME_WIDTH/FRAME_HEIGHT silently misplaces every zone and
+      // tripwire drawn afterwards.
+      const frame = info.frame || {};
+      if (frame.width && frame.height) {
+        state.frame = { width: frame.width, height: frame.height };
+        const canvas = $('fence-canvas');
+        if (canvas.width !== frame.width || canvas.height !== frame.height) {
+          canvas.width = frame.width;
+          canvas.height = frame.height;
+          drawFence();
+        }
+      }
     }).catch(() => {});
 
     showView('operations');
@@ -1125,6 +1254,7 @@ const IBVAP = (() => {
 
   return {
     showView, loadCameras, openCameraModal, submitCamera, restartCamera, removeCamera,
+    setCameraKind, cameraFileChosen,
     renderAlertFeed, clearFeed, openAlert, loadEventLog, pageEvents,
     openFence, setFenceMode, saveFence, resetFenceDraft, deleteRule, toggleRule,
     fileChosen, startAnalysis, cancelAnalysis, showAnalysisEvents, loadAnalysisHistory,

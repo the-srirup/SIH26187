@@ -92,6 +92,8 @@ _MIGRATIONS: tuple[str, ...] = (
     "ALTER TABLE alerts ADD COLUMN session_id VARCHAR(64) DEFAULT ''",
     "ALTER TABLE alerts ADD COLUMN details_json TEXT DEFAULT '{}'",
     "ALTER TABLE alerts ADD COLUMN description TEXT DEFAULT ''",
+    "ALTER TABLE cameras ADD COLUMN is_deleted BOOLEAN DEFAULT 0",
+    "ALTER TABLE cameras ADD COLUMN deleted_at VARCHAR(40) DEFAULT ''",
 )
 
 
@@ -100,14 +102,24 @@ def _ensure_schema_compatibility(bound_engine: Engine) -> None:
     if bound_engine.url.get_backend_name() != "sqlite":
         return
 
-    with bound_engine.begin() as conn:
-        for statement in _MIGRATIONS:
-            try:
+    # Each statement gets its OWN transaction. Sharing one transaction meant a
+    # single failure (which is the *normal* case — SQLite has no
+    # ``ADD COLUMN IF NOT EXISTS``, so every already-applied migration raises)
+    # left the connection needing a rollback, and every later statement was
+    # refused. On an older database the first duplicate column therefore
+    # silently skipped all remaining migrations, leaving the schema short of
+    # columns the code expects.
+    applied = 0
+    for statement in _MIGRATIONS:
+        try:
+            with bound_engine.begin() as conn:
                 conn.execute(text(statement))
-            except Exception:
-                # SQLite has no `ADD COLUMN IF NOT EXISTS`; a duplicate-column
-                # error simply means this migration already ran.
-                pass
+            applied += 1
+        except Exception:
+            # A duplicate-column error simply means this migration already ran.
+            continue
+    if applied:
+        log.info("Applied %d additive schema migration(s)", applied)
 
     # Newly introduced tables (checkpoints, analysis_sessions) are handled by
     # create_all above; this call makes the intent explicit for older images.

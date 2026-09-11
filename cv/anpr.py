@@ -1,22 +1,62 @@
 """
-Automatic Number Plate Recognition (ANPR) for IBVAP.
+Automatic Number Plate Recognition (ANPR).
 
-The critical gap in the previous implementation was that ANPR ran OCR over
-the whole frame and merely returned text fragments; it did not actively
-extract license-plate candidates. This module now performs a proper two-stop
-edge pipeline:
+Pipeline
+--------
+::
 
-1. Vehicle-aware plate localization:
-   * Use YOLO vehicle detections (car/truck/bus/motorcycle) to crop likely
-     plate areas.
-   * Find high-contrast rectangular candidates using edge density, contour
-     geometry, aspect-ratio and area constraints.
-   * If YOLO misses a vehicle, the same candidate search runs on the full
-     frame as a fallback.
-2. OCR only the localized candidates with EasyOCR.
+    frame -> vehicle detections (YOLO)
+          -> vehicle ROI (lower portion, where plates live)
+          -> plate candidate localisation (edge density + contour geometry)
+          -> plate crop
+          -> UPSCALE + preprocess variants
+          -> OCR each variant, score each token
+          -> per-vehicle temporal consensus (per-character majority vote)
+          -> validated plate -> event -> evidence -> database -> frontend
 
-This makes ANPR materially extract alphanumerics from license plates instead
-of transcribing arbitrary text from the frame.
+Why the previous implementation read nothing
+--------------------------------------------
+Four defects compounded, and each alone was enough to make ANPR produce no
+usable output on a normal feed:
+
+1. **The candidate filter was geometrically impossible.**  A candidate had to
+   be at least ``50 x 15`` px.  Analytics run at 640x384, where a plate on a
+   car at realistic range is more like ``40 x 12`` — so the contour search
+   returned nothing, every frame, and ANPR silently did nothing at all.  Size
+   limits are now *relative* to the region being searched.
+
+2. **The crop was never upscaled.**  Whatever survived was handed to EasyOCR at
+   native size.  No OCR engine reads 8-pixel-tall glyphs.  Crops are now scaled
+   up to ``ANPR_PLATE_TARGET_HEIGHT`` with a cubic filter before recognition.
+
+3. **OCR ran on a globally CLAHE'd grayscale frame.**  ``preprocess_for_indian_plates``
+   flattened the whole frame to one channel and stretched its contrast, then
+   *that* image was cropped for OCR — so the recogniser never saw the original
+   pixels, only a noise-amplified copy of them.  Localisation still uses the
+   contrast-enhanced image (it helps edge detection); OCR now reads the
+   original crop, plus preprocessed variants, and keeps the best result.
+
+4. **Every OCR token was concatenated into one string.**  A plate photographed
+   with "IND" on the strip, a state name, or a dealer sticker produced
+   ``"INDMH12AB1234"``, which matches no plate pattern, so the salvage regex
+   returned a wrong substring.  Tokens are now scored individually.
+
+Accuracy comes from **temporal consensus**, not from one lucky frame
+-------------------------------------------------------------------
+A single frame's OCR is a noisy observation.  Reads of the same *tracked*
+vehicle are accumulated and resolved by per-character majority vote::
+
+    frame 1 -> WB12AB1234
+    frame 2 -> WB12AB1284
+    frame 3 -> WB12AB1234
+    frame 4 -> WB12AB1234
+    ------------------------
+    consensus  WB12AB1234
+
+That is what makes the output stable across vehicles and streams.  Nothing is
+hard-coded: there is no plate string anywhere in this module, and a read below
+``ANPR_ALERT_CONFIDENCE`` is reported as ``PLATE UNCERTAIN`` rather than
+written into the evidentiary log as a guessed registration.
 """
 from __future__ import annotations
 
@@ -24,8 +64,9 @@ import logging
 import re
 import threading
 import time
-from dataclasses import dataclass
-from typing import Iterable, Optional
+from collections import Counter, deque
+from dataclasses import dataclass, field
+from typing import Optional
 
 import cv2
 import numpy as np
@@ -37,7 +78,6 @@ log = logging.getLogger("ibvap.cv.anpr")
 try:
     import easyocr
     EASYOCR_AVAILABLE = True
-    log.info("EasyOCR available - ANPR functionality enabled")
 except ImportError:
     EASYOCR_AVAILABLE = False
     log.warning("EasyOCR not installed - ANPR functionality disabled")
@@ -45,41 +85,142 @@ except ImportError:
 
 @dataclass
 class PlateDetection:
-    """Result of detecting a license plate in a frame."""
-    bbox: tuple[int, int, int, int]  # x1, y1, x2, y2
-    confidence: float
-    plate_text: str
-    text_confidence: float
+    """Result of detecting and reading a licence plate in a frame."""
+
+    bbox: tuple[int, int, int, int]        # x1, y1, x2, y2 in frame coordinates
+    confidence: float                     # localisation confidence
+    plate_text: str                        # display form (may be grouped)
+    text_confidence: float                 # OCR confidence, 0-1
     frame_number: int
     timestamp: float
     vehicle_class: Optional[str] = None
     vehicle_track_id: Optional[int] = None
+    #: True once several frames of the same vehicle agree on this reading.
+    consensus: bool = False
+    #: How many independent reads backed the consensus.
+    votes: int = 1
+    #: Whether the final string matches the Indian plate grammar.
+    format_verified: bool = False
+
+
+@dataclass
+class _PlateVotes:
+    """Accumulated reads for one tracked vehicle."""
+
+    reads: deque = field(default_factory=lambda: deque(maxlen=32))
+    last_seen: float = 0.0
+    published: Optional[str] = None
+
+
+class PlateVoter:
+    """
+    Temporal consensus over repeated reads of the same tracked vehicle.
+
+    Two levels of voting, because OCR errors are usually *per character* rather
+    than per string:
+
+    * whole-string majority, which wins immediately when several frames agree
+      exactly;
+    * otherwise per-character majority across reads of the modal length, which
+      recovers the correct plate even when no single frame got every character
+      right.
+
+    Confidence is carried through as the mean confidence of the reads
+    supporting the winner, so a consensus built from four weak reads is not
+    passed off as a strong one.
+    """
+
+    def __init__(self) -> None:
+        self._votes: dict[int, _PlateVotes] = {}
+
+    def add(self, track_id: int, text: str, confidence: float, now: float) -> None:
+        entry = self._votes.setdefault(track_id, _PlateVotes())
+        entry.reads.append((text, float(confidence), now))
+        entry.last_seen = now
+
+    def _fresh(self, track_id: int, now: float) -> list[tuple[str, float]]:
+        entry = self._votes.get(track_id)
+        if entry is None:
+            return []
+        window = settings.ANPR_VOTE_WINDOW_SECONDS
+        return [(text, conf) for text, conf, seen in entry.reads
+                if now - seen <= window]
+
+    def consensus(self, track_id: int, now: float) -> Optional[tuple[str, float, int]]:
+        """
+        Best-supported reading for this vehicle, or ``None``.
+
+        Returns ``(text, mean_confidence, vote_count)`` once at least
+        ``ANPR_MIN_VOTES`` reads are available.
+        """
+        reads = self._fresh(track_id, now)
+        if len(reads) < max(1, int(settings.ANPR_MIN_VOTES)):
+            return None
+
+        # Level 1: exact agreement between frames.
+        counts = Counter(text for text, _ in reads)
+        best_text, best_count = counts.most_common(1)[0]
+        if best_count >= max(2, int(settings.ANPR_MIN_VOTES)):
+            supporting = [c for t, c in reads if t == best_text]
+            return best_text, sum(supporting) / len(supporting), best_count
+
+        # Level 2: per-character majority across reads of the modal length.
+        # OCR errors are typically a single confused glyph, so the correct plate
+        # can be recovered even when no individual frame is entirely right.
+        lengths = Counter(len(text) for text, _ in reads)
+        modal_length, length_votes = lengths.most_common(1)[0]
+        same_length = [(t, c) for t, c in reads if len(t) == modal_length]
+        if length_votes < max(2, int(settings.ANPR_MIN_VOTES)) or not same_length:
+            return None
+
+        voted = []
+        for position in range(modal_length):
+            column: Counter = Counter()
+            for text, conf in same_length:
+                column[text[position]] += conf      # weight by OCR confidence
+            voted.append(column.most_common(1)[0][0])
+
+        text = "".join(voted)
+        mean_conf = sum(c for _, c in same_length) / len(same_length)
+        return text, mean_conf, len(same_length)
+
+    def gc(self, now: float) -> None:
+        """Forget vehicles that have left, so a long run cannot grow."""
+        window = settings.ANPR_VOTE_WINDOW_SECONDS * 3
+        for track_id in [t for t, e in self._votes.items() if now - e.last_seen > window]:
+            self._votes.pop(track_id, None)
+
+    def mark_published(self, track_id: int, text: str) -> None:
+        entry = self._votes.get(track_id)
+        if entry is not None:
+            entry.published = text
+
+    def already_published(self, track_id: int, text: str) -> bool:
+        entry = self._votes.get(track_id)
+        return entry is not None and entry.published == text
+
+    def reset(self) -> None:
+        self._votes.clear()
 
 
 class ANPRProcessor:
     """
-    License plate detection and OCR processor.
+    Plate localisation and OCR.
 
-    Uses EasyOCR for recognition and OpenCV morphological/contour search for
-    plate candidate localization. It is intentionally lazy: ``get_anpr_processor()``
-    instantiates the processor, but EasyOCR models load only when enabled.
+    Intentionally lazy: ``get_anpr_processor()`` constructs the object cheaply,
+    and EasyOCR's several-hundred-megabyte models load only on the first frame
+    that actually contains a vehicle.
     """
 
     VEHICLE_CLASSES = {"car", "truck", "bus", "motorcycle", "motorbike", "van"}
     PLATE_CHARS_RE = re.compile(r"[^A-Z0-9]+")
-    INDIAN_PLATE_RE = re.compile(
-        r"^[A-Z]{2}[0-9]{1,2}[A-Z]{0,3}[0-9]{1,4}[A-Z]?$"
-    )
+    #: ``MH12AB1234``, ``DL8CAF5031``, ``KA01F1234`` … the standard grammar.
+    INDIAN_PLATE_RE = re.compile(r"^[A-Z]{2}[0-9]{1,2}[A-Z]{0,3}[0-9]{1,4}[A-Z]?$")
     LOOSE_PLATE_RE = re.compile(r"^[A-Z0-9]{6,12}$")
+    #: Tokens that legitimately appear on an Indian plate but are not the number.
+    NON_PLATE_TOKENS = {"IND", "INDIA", "BH"}
 
     def __init__(self, lang_list: Optional[list[str]] = None):
-        """
-        Initialize ANPR processor.
-
-        Args:
-            lang_list: List of languages for easyOCR (default: ['en'] for Latin chars,
-                      would need ['hi', 'en'] for Indian plates with Devanagari).
-        """
         self.lang_list = lang_list or [
             lang.strip() for lang in settings.ANPR_LANGUAGES.split(",") if lang.strip()
         ] or ["en"]
@@ -96,16 +237,14 @@ class ANPRProcessor:
         self._gpu = False
         self._plates_read = 0
         self._plates_uncertain = 0
+        self._candidates_found = 0
+        self._frames_searched = 0
+        self.voter = PlateVoter()
 
+    # ------------------------------------------------------------------ #
+    # Availability / model loading
+    # ------------------------------------------------------------------ #
     def _init_reader(self) -> None:
-        """
-        Load the EasyOCR reader (~5-10 s, several hundred MB).
-
-        Deliberately lazy: the previous build loaded this during application
-        startup even on deployments that never see a vehicle, delaying the
-        dashboard coming up.  It now loads on the first frame that actually
-        contains a vehicle.
-        """
         try:
             gpu = False
             try:
@@ -117,12 +256,10 @@ class ANPRProcessor:
             self.reader = easyocr.Reader(self.lang_list, gpu=gpu, verbose=False)
             self._gpu = gpu
             self._initialized = True
-            log.info(
-                "ANPR reader ready — languages=%s device=%s",
-                self.lang_list, "cuda" if gpu else "cpu",
-            )
-        except Exception as e:
-            log.error("Failed to initialize EasyOCR: %s", e)
+            log.info("ANPR reader ready — languages=%s device=%s",
+                     self.lang_list, "cuda" if gpu else "cpu")
+        except Exception as exc:
+            log.error("Failed to initialise EasyOCR: %s", exc)
             self._initialized = False
             self._init_failed = True
             self.reader = None
@@ -131,8 +268,9 @@ class ANPRProcessor:
         """
         True when OCR can run. Triggers the one-time model load if needed.
 
-        Returns False (rather than raising) when EasyOCR is missing or failed
-        to load, so the rest of the surveillance pipeline is unaffected.
+        Returns False rather than raising when EasyOCR is missing or fails to
+        load, so a broken ANPR install degrades one feature instead of taking
+        the surveillance pipeline down with it.
         """
         if not (EASYOCR_AVAILABLE and settings.ANPR_ENABLED):
             return False
@@ -150,7 +288,6 @@ class ANPRProcessor:
         if not EASYOCR_AVAILABLE:
             log.warning("Cannot set languages - EasyOCR not available")
             return False
-
         try:
             self.lang_list = lang_list or ["en"]
             self._init_failed = False
@@ -158,290 +295,268 @@ class ANPRProcessor:
             self._initialized = True
             log.info("ANPR languages updated to: %s", self.lang_list)
             return True
-        except Exception as e:
-            log.error("Failed to update ANPR languages: %s", e)
+        except Exception as exc:
+            log.error("Failed to update ANPR languages: %s", exc)
             return False
 
     # ------------------------------------------------------------------ #
     # Public API
     # ------------------------------------------------------------------ #
-
     def recognize_plates(
         self,
         frame: np.ndarray,
         vehicle_detections: Optional[list] = None,
         frame_number: int = 0,
         timestamp: Optional[float] = None,
+        source_frame: Optional[np.ndarray] = None,
     ) -> list[PlateDetection]:
         """
-        Actively localize and recognize license plates in the frame.
+        Localise and read licence plates in one frame.
 
-        Parameters
-        ----------
-        frame:
-            BGR frame.
-        vehicle_detections:
-            YOLO detection objects. Each object should expose
-            ``bbox``, ``class_name`` and ``track_id``.
-        frame_number:
-            Processing frame number (zero-based).
-        timestamp:
-            Epoch timestamp. Defaults to ``time.time()``.
+        Localisation runs on a contrast-enhanced copy of the analytics frame
+        (better edges); OCR reads the **original** pixels, upscaled.
 
-        Returns
-        -------
-        list[PlateDetection]
-            Detected plates, sorted by confidence.
+        ``source_frame`` is the camera's frame *before* it was resized to the
+        analytics resolution, when the pipeline still has it.  Reading the plate
+        from there instead of from the 640x384 working frame is the single
+        largest accuracy lever available: on a 1080p feed the same plate carries
+        three times the linear detail, and OCR accuracy on small text is
+        governed almost entirely by glyph height.  Upscaling a 12-pixel crop
+        cannot invent detail that was discarded by the resize; cropping the
+        original never threw it away.
+
+        Reads feed the temporal voter, and returned detections carry the
+        consensus text once one exists.
         """
         if not self.is_available():
             return []
-
-        ts = timestamp if timestamp is not None else time.time()
-        processed = self.preprocess_for_indian_plates(frame)
-
-        vehicle_boxes = self._vehicle_boxes(vehicle_detections)
-        candidates: list[tuple[int, int, int, int, float, Optional[int], Optional[str]]] = []
-
-        # Vehicle-aware localization. Crop each vehicle and find plate candidates.
-        if vehicle_boxes:
-            h, w = processed.shape[:2]
-            for x1, y1, x2, y2, track_id, vehicle_class in vehicle_boxes:
-                if x2 <= x1 or y2 <= y1:
-                    continue
-
-                # Expand crop slightly. ANPR should look for the lower part of
-                # vehicle ROI, where most plates appear.
-                crop_x1 = max(0, x1 - 6)
-                crop_y1 = max(0, y1 + int((y2 - y1) * 0.45))
-                crop_x2 = min(w, x2 + 6)
-                crop_y2 = min(h, y2 + 6)
-                crop = processed[crop_y1:crop_y2, crop_x1:crop_x2]
-
-                local_candidates = self._find_plate_candidates(crop)
-                for lx1, ly1, lx2, ly2, score in local_candidates:
-                    candidates.append(
-                        (
-                            lx1 + crop_x1,
-                            ly1 + crop_y1,
-                            lx2 + crop_x1,
-                            ly2 + crop_y1,
-                            score,
-                            track_id,
-                            vehicle_class,
-                        )
-                    )
-
-        # Full-frame fallback for missed vehicles or test images with plates.
-        if not candidates:
-            for fx1, fy1, fx2, fy2, score in self._find_plate_candidates(processed):
-                candidates.append((fx1, fy1, fx2, fy2, score, None, None))
-
-        if not candidates:
-            self._detection_cache = []
+        if frame is None or frame.size == 0:
             return []
 
-        deduped = self._deduplicate_candidates(candidates)
-        # OCR is by far the most expensive stage; only the strongest candidates
-        # are read, bounding worst-case latency per analytics frame.
-        deduped = sorted(deduped, key=lambda c: c[4], reverse=True)
-        deduped = deduped[: max(1, int(settings.ANPR_MAX_PLATES_PER_TICK))]
+        ts = timestamp if timestamp is not None else time.time()
+        self._frames_searched += 1
+        enhanced = self.preprocess_for_indian_plates(frame)
+
+        # Plate pixels come from the highest-resolution image available.
+        ocr_source, ocr_scale = frame, 1.0
+        if source_frame is not None and source_frame.size:
+            src_h, src_w = source_frame.shape[:2]
+            frm_h, frm_w = frame.shape[:2]
+            if src_w > frm_w and frm_w > 0:
+                ocr_source = source_frame
+                ocr_scale = src_w / float(frm_w)
+
+        candidates = self._collect_candidates(frame, enhanced, vehicle_detections)
+        if not candidates:
+            self._detection_cache = []
+            self.voter.gc(ts)
+            return []
+
+        self._candidates_found += len(candidates)
+        candidates = self._deduplicate_candidates(candidates)
+        # OCR dominates the cost of this stage, so only the strongest candidates
+        # are read; that bounds worst-case latency per analytics frame.
+        candidates.sort(key=lambda c: c[4], reverse=True)
+        candidates = candidates[: max(1, int(settings.ANPR_MAX_PLATES_PER_TICK))]
 
         detections: list[PlateDetection] = []
-        for x1, y1, x2, y2, score, track_id, vehicle_class in deduped:
-            plate_text, text_conf = self._ocr_region(processed, (x1, y1, x2, y2))
-            clean_text = self.normalize_plate_text(plate_text)
-            if not clean_text:
+        for x1, y1, x2, y2, score, track_id, vehicle_class in candidates:
+            text, confidence = self._read_plate(
+                frame, enhanced, (x1, y1, x2, y2),
+                ocr_source=ocr_source, ocr_scale=ocr_scale,
+            )
+            if not text:
                 continue
 
-            best = self._extract_most_plate_like(clean_text)
-            if not best:
-                continue
+            final_text, final_conf, votes, consensus = text, confidence, 1, False
+            if settings.ANPR_CONSENSUS_ENABLED and track_id is not None:
+                self.voter.add(int(track_id), text, confidence, ts)
+                agreed = self.voter.consensus(int(track_id), ts)
+                if agreed is not None:
+                    final_text, final_conf, votes = agreed
+                    consensus = True
 
-            # Reward a read that matches the Indian plate grammar; penalise a
-            # string that is merely alphanumeric noise of the right length.
-            structured = bool(self.INDIAN_PLATE_RE.match(best))
-            adjusted = float(text_conf) * (1.0 if structured else 0.75)
+            verified = bool(self.INDIAN_PLATE_RE.match(final_text))
+            # Reward a read matching the plate grammar; discount one that is
+            # merely alphanumeric noise of a plausible length.
+            adjusted = float(final_conf) * (1.0 if verified else 0.75)
             if adjusted >= settings.ANPR_CONFIDENCE_THRESHOLD:
                 self._plates_read += 1
             else:
                 self._plates_uncertain += 1
 
-            detection = PlateDetection(
+            detections.append(PlateDetection(
                 bbox=(x1, y1, x2, y2),
                 confidence=float(score),
-                plate_text=self.format_indian_plate(best) if structured else best,
+                plate_text=self.format_indian_plate(final_text) if verified else final_text,
                 text_confidence=adjusted,
                 frame_number=frame_number,
                 timestamp=ts,
                 vehicle_class=vehicle_class,
                 vehicle_track_id=track_id,
-            )
-            detections.append(detection)
+                consensus=consensus,
+                votes=votes,
+                format_verified=verified,
+            ))
 
         detections.sort(
-            key=lambda d: (d.text_confidence * 0.6 + d.confidence * 0.4),
-            reverse=True,
+            key=lambda d: (d.text_confidence * 0.6 + d.confidence * 0.4), reverse=True
         )
         self._detection_cache = detections
         self._last_inference_frame = frame_number
+        self.voter.gc(ts)
         return detections
 
     def detect_and_recognize(self, frame: np.ndarray) -> list[PlateDetection]:
-        """
-        Backward-compatible wrapper used by the ANPR test endpoint.
-
-        It runs the full-frame fallback path only, which is appropriate when
-        no YOLO detections are available.
-        """
+        """Full-frame search — used by the ANPR probe endpoint."""
         return self.recognize_plates(frame, vehicle_detections=None)
 
     # ------------------------------------------------------------------ #
     # Preprocessing
     # ------------------------------------------------------------------ #
-
     def preprocess_for_indian_plates(self, frame: np.ndarray) -> np.ndarray:
         """
-        Preprocess frame for better license-plate localization.
+        Contrast-enhanced copy used for **localisation only**.
 
-        The returned image is kept as BGR because EasyOCR expects either RGB
-        or BGR and internally converts.
+        Kept 3-channel for interface compatibility.  Note what changed: this
+        image is no longer the one OCR reads.  Cropping OCR input from a
+        globally contrast-stretched grayscale frame meant the recogniser never
+        saw the actual plate pixels.
         """
         if frame is None:
             return np.zeros((settings.FRAME_HEIGHT, settings.FRAME_WIDTH, 3), dtype=np.uint8)
-
         grey = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        enhanced = clahe.apply(grey)
-        return cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
+        return cv2.cvtColor(clahe.apply(grey), cv2.COLOR_GRAY2BGR)
 
     # ------------------------------------------------------------------ #
-    # Plate localization
+    # Localisation
     # ------------------------------------------------------------------ #
-
-    def _vehicle_boxes(
-        self,
-        vehicle_detections: Optional[list],
-    ) -> list[tuple[int, int, int, int, Optional[int], Optional[str]]]:
-        boxes: list[tuple[int, int, int, int, Optional[int], Optional[str]]] = []
+    def _vehicle_boxes(self, vehicle_detections: Optional[list]):
+        boxes = []
         if not vehicle_detections:
             return boxes
-
         for det in vehicle_detections:
             class_name = (getattr(det, "class_name", "") or "").lower()
             if class_name not in self.VEHICLE_CLASSES:
                 continue
-            bbox = tuple(map(int, det.bbox))
+            bbox = tuple(int(v) for v in det.bbox)
             if len(bbox) != 4:
                 continue
-            boxes.append(
-                (
-                    bbox[0],
-                    bbox[1],
-                    bbox[2],
-                    bbox[3],
-                    getattr(det, "track_id", None),
-                    class_name,
-                )
-            )
+            boxes.append((bbox[0], bbox[1], bbox[2], bbox[3],
+                          getattr(det, "track_id", None), class_name))
         return boxes
 
-    def _find_plate_candidates(
-        self,
-        image_bgr: np.ndarray,
-    ) -> list[tuple[int, int, int, int, float]]:
-        """
-        Find high-contrast rectangular regions that look like license plates.
+    def _collect_candidates(self, frame, enhanced, vehicle_detections):
+        """Plate candidates from each vehicle ROI, with a full-frame fallback."""
+        height, width = enhanced.shape[:2]
+        candidates: list[tuple] = []
 
-        Returns ``(x1, y1, x2, y2, score)`` sorted best-first.
+        for x1, y1, x2, y2, track_id, vehicle_class in self._vehicle_boxes(vehicle_detections):
+            if x2 <= x1 or y2 <= y1:
+                continue
+            box_height = y2 - y1
+            # Search the lower 60% of the vehicle plus a small margin: plates sit
+            # low on cars and at the very bottom on two-wheelers.
+            crop_x1 = max(0, x1 - 8)
+            crop_y1 = max(0, y1 + int(box_height * 0.40))
+            crop_x2 = min(width, x2 + 8)
+            crop_y2 = min(height, y2 + 8)
+            if crop_x2 - crop_x1 < 12 or crop_y2 - crop_y1 < 6:
+                continue
+
+            region = enhanced[crop_y1:crop_y2, crop_x1:crop_x2]
+            for lx1, ly1, lx2, ly2, score in self._find_plate_candidates(region):
+                candidates.append((lx1 + crop_x1, ly1 + crop_y1,
+                                   lx2 + crop_x1, ly2 + crop_y1,
+                                   score, track_id, vehicle_class))
+
+        if not candidates:
+            for fx1, fy1, fx2, fy2, score in self._find_plate_candidates(enhanced):
+                candidates.append((fx1, fy1, fx2, fy2, score, None, None))
+        return candidates
+
+    def _find_plate_candidates(self, image_bgr: np.ndarray):
         """
-        if image_bgr.size == 0:
+        High-contrast, roughly rectangular regions that look like plates.
+
+        Size limits are **relative to the searched region**.  The previous
+        absolute ``50 x 15`` px floor could not be met inside a vehicle crop at
+        the 640x384 analytics resolution, so this function returned an empty
+        list on essentially every real frame.
+        """
+        if image_bgr is None or image_bgr.size == 0:
             return []
+
+        region_h, region_w = image_bgr.shape[:2]
+        min_w = max(int(settings.ANPR_MIN_PLATE_WIDTH_PX),
+                    int(region_w * settings.ANPR_MIN_PLATE_WIDTH_FRAC))
+        min_h = max(int(settings.ANPR_MIN_PLATE_HEIGHT_PX), int(region_h * 0.04))
+        # A plate is a small feature of whatever is being searched. Without an
+        # upper bound the full-frame fallback happily proposed a box covering
+        # the entire frame — whose aspect ratio squeaks past the 1.8 minimum —
+        # and OCR then read whatever text was largest in it.
+        max_w = max(min_w + 1, int(region_w * settings.ANPR_MAX_PLATE_WIDTH_FRAC))
+        max_h = max(min_h + 1, int(region_h * settings.ANPR_MAX_PLATE_HEIGHT_FRAC))
 
         grey = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
         blurred = cv2.GaussianBlur(grey, (5, 5), 0)
-        edges = cv2.Canny(blurred, 80, 200)
+        edges = cv2.Canny(blurred, 60, 180)
 
-        # Morphologically close short edge gaps (plate border and characters).
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (17, 3))
+        # Close the gaps between adjacent characters so a plate's glyph row
+        # becomes one blob. The kernel scales with the region so it works on a
+        # small vehicle crop and on a full frame alike.
+        kernel_w = max(7, min(25, int(min_w * 0.7) | 1))
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_w, 3))
         closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=1)
         closed = cv2.dilate(closed, kernel, iterations=1)
 
         contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        candidates: list[tuple[int, int, int, int, float]] = []
-
+        candidates = []
         for contour in contours:
             x, y, w, h = cv2.boundingRect(contour)
-            if w < 50 or h < 15 or w * h < settings.ANPR_MIN_PLATE_AREA:
+            if w < min_w or h < min_h or w * h < settings.ANPR_MIN_PLATE_AREA:
                 continue
-
-            aspect_ratio = w / float(h)
-            if not (settings.ANPR_MIN_ASPECT_RATIO <= aspect_ratio <= settings.ANPR_MAX_ASPECT_RATIO):
+            if w > max_w or h > max_h:
+                continue
+            aspect = w / float(h)
+            if not (settings.ANPR_MIN_ASPECT_RATIO <= aspect
+                    <= settings.ANPR_MAX_ASPECT_RATIO):
                 continue
 
             area = cv2.contourArea(contour)
-            bbox_area = float(w * h)
             if area <= 0:
                 continue
-
-            # License plates are usually rectangular. Reject very sparse or
-            # very filled blobs.
-            extent = area / bbox_area
-            if not (0.25 <= extent <= 0.95):
+            extent = area / float(w * h)
+            if not (0.20 <= extent <= 0.98):
                 continue
 
-            roi_edges = edges[y : y + h, x : x + w]
+            roi_edges = edges[y:y + h, x:x + w]
+            if roi_edges.size == 0:
+                continue
             edge_density = float(np.count_nonzero(roi_edges)) / float(roi_edges.size)
             if edge_density < 0.03:
                 continue
 
-            # Score rewards plate-like edges and penalizes extreme sizes.
             score = edge_density * extent
-            if 3.0 <= aspect_ratio <= 5.5:
+            if 2.5 <= aspect <= 5.5:            # typical single-row plate
                 score *= 1.25
             candidates.append((x, y, x + w, y + h, score))
 
-        # Non-max suppression and score sorting.
         candidates.sort(key=lambda c: c[4], reverse=True)
-        picked: list[tuple[int, int, int, int, float]] = []
-
-        def _iou(a, b):
-            ax1, ay1, ax2, ay2, _ = a
-            bx1, by1, bx2, by2, _ = b
-            ix1, iy1 = max(ax1, bx1), max(ay1, by1)
-            ix2, iy2 = min(ax2, bx2), min(ay2, by2)
-            inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
-            a_area = max(1, (ax2 - ax1) * (ay2 - ay1))
-            b_area = max(1, (bx2 - bx1) * (by2 - by1))
-            return inter / float(a_area + b_area - inter)
-
+        picked: list[tuple] = []
         for cand in candidates:
             if not any(_iou(cand, kept) > 0.55 for kept in picked):
-                picked.append(cand[:5])
+                picked.append(cand)
             if len(picked) >= 4:
                 break
-
         return picked
 
-    def _deduplicate_candidates(
-        self,
-        candidates: list[tuple[int, int, int, int, float, Optional[int], Optional[str]]],
-    ) -> list[tuple[int, int, int, int, float, Optional[int], Optional[str]]]:
-        """Deduplicate candidate boxes across full-frame and vehicle crops."""
-        deduped: list[tuple[int, int, int, int, float, Optional[int], Optional[str]]] = []
-
-        def _iou(a, b):
-            ax1, ay1, ax2, ay2 = a[:4]
-            bx1, by1, bx2, by2 = b[:4]
-            ix1, iy1 = max(ax1, bx1), max(ay1, by1)
-            ix2, iy2 = min(ax2, bx2), min(ay2, by2)
-            inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
-            a_area = max(1, (ax2 - ax1) * (ay2 - ay1))
-            b_area = max(1, (bx2 - bx1) * (by2 - by1))
-            return inter / float(a_area + b_area - inter)
-
-        candidates = sorted(candidates, key=lambda c: c[4], reverse=True)
-        for cand in candidates:
-            if deduped and any(_iou(cand, kept) > 0.5 for kept in deduped):
+    def _deduplicate_candidates(self, candidates: list[tuple]) -> list[tuple]:
+        """Merge overlapping candidates from vehicle crops and the full frame."""
+        deduped: list[tuple] = []
+        for cand in sorted(candidates, key=lambda c: c[4], reverse=True):
+            if any(_iou(cand, kept) > 0.5 for kept in deduped):
                 continue
             deduped.append(cand)
         return deduped
@@ -449,110 +564,328 @@ class ANPRProcessor:
     # ------------------------------------------------------------------ #
     # OCR
     # ------------------------------------------------------------------ #
+    @staticmethod
+    def _upscale(crop: np.ndarray) -> np.ndarray:
+        """
+        Scale a plate crop up to a height OCR can actually resolve.
 
-    def _ocr_region(self, frame: np.ndarray, bbox: tuple[int, int, int, int]) -> tuple[str, float]:
-        """Run EasyOCR on a localized plate candidate."""
-        x1, y1, x2, y2 = bbox
-        roi = frame[y1:y2, x1:x2]
-        if roi.size == 0:
+        A plate is routinely 12 px tall at analytics resolution. EasyOCR cannot
+        read glyphs that small, and the previous build passed the crop through
+        untouched — the single largest reason ANPR returned nothing useful.
+        """
+        h, w = crop.shape[:2]
+        if h <= 0 or w <= 0:
+            return crop
+        target = int(settings.ANPR_PLATE_TARGET_HEIGHT)
+        if h >= target:
+            return crop
+        scale = min(float(settings.ANPR_PLATE_MAX_UPSCALE), target / float(h))
+        return cv2.resize(crop, (max(1, int(w * scale)), max(1, int(h * scale))),
+                          interpolation=cv2.INTER_CUBIC)
+
+    def _variants(self, crop: np.ndarray) -> list[np.ndarray]:
+        """
+        Several renderings of one plate crop, best-effort rather than clever.
+
+        Plates vary enormously — white-on-black, black-on-white, reflective,
+        dusty, motion-blurred. Rather than guessing which single preprocessing
+        chain suits a given plate, OCR a few cheap variants and keep the best
+        scoring read. The upscale is shared by all of them.
+        """
+        upscaled = self._upscale(crop)
+        variants = [upscaled]
+
+        grey = cv2.cvtColor(upscaled, cv2.COLOR_BGR2GRAY)
+        # Denoise lightly, then stretch local contrast: helps a dusty or
+        # underexposed plate without destroying a clean one.
+        denoised = cv2.bilateralFilter(grey, 7, 55, 55)
+        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(4, 4))
+        variants.append(cv2.cvtColor(clahe.apply(denoised), cv2.COLOR_GRAY2BGR))
+
+        # Otsu binarisation, and its inverse for light-on-dark plates.
+        _, binary = cv2.threshold(denoised, 0, 255,
+                                  cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        variants.append(cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR))
+        if float(binary.mean()) < 110:
+            variants.append(cv2.cvtColor(cv2.bitwise_not(binary), cv2.COLOR_GRAY2BGR))
+        return variants
+
+    @staticmethod
+    def _crop(image: np.ndarray, bbox: tuple[int, int, int, int],
+              scale: float = 1.0) -> np.ndarray:
+        """Crop ``bbox`` (in analytics coordinates) from ``image``, with margin."""
+        x1, y1, x2, y2 = (v * scale for v in bbox)
+        # A small margin recovers characters clipped by a tight contour.
+        pad_x = max(2.0, (x2 - x1) * 0.06)
+        pad_y = max(2.0, (y2 - y1) * 0.18)
+        h, w = image.shape[:2]
+        cx1, cy1 = int(max(0, x1 - pad_x)), int(max(0, y1 - pad_y))
+        cx2, cy2 = int(min(w, x2 + pad_x)), int(min(h, y2 + pad_y))
+        if cx2 <= cx1 or cy2 <= cy1:
+            return np.zeros((0, 0, 3), np.uint8)
+        return image[cy1:cy2, cx1:cx2]
+
+    def _read_plate(self, frame: np.ndarray, enhanced: np.ndarray,
+                    bbox: tuple[int, int, int, int],
+                    ocr_source: Optional[np.ndarray] = None,
+                    ocr_scale: float = 1.0) -> tuple[str, float]:
+        """
+        Read one plate candidate, returning ``(text, confidence)``.
+
+        Tries, in order of expected quality: the full-resolution source crop
+        (when the pipeline still has the pre-resize frame), the analytics-frame
+        crop, and the contrast-enhanced crop as a last resort.  Each is run
+        through several preprocessing variants and the best-scoring plate-like
+        token wins.
+        """
+        sources: list[np.ndarray] = []
+        if ocr_source is not None and ocr_scale > 1.0:
+            hi = self._crop(ocr_source, bbox, ocr_scale)
+            if hi.size:
+                sources.append(hi)
+
+        native = self._crop(frame, bbox)
+        if native.size:
+            sources.append(native)
+        if enhanced is not None and enhanced.shape[:2] == frame.shape[:2]:
+            boosted = self._crop(enhanced, bbox)
+            if boosted.size:
+                sources.append(boosted)
+        if not sources:
             return "", 0.0
 
-        # Convert BGR->RGB because easyOCR documentation/pretrained models use
-        # RGB image input. Some installations are tolerant, but do this
-        # explicitly for consistency.
-        roi_rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
+        best_text, best_score, best_conf = "", 0.0, 0.0
+        for source in sources:
+            if source.size == 0:
+                continue
+            for variant in self._variants(source):
+                for text, confidence in self._ocr_tokens(variant):
+                    candidate = self._best_token(text)
+                    if not candidate:
+                        continue
+                    score = self._score_reading(candidate, confidence)
+                    if score > best_score:
+                        best_text, best_score, best_conf = candidate, score, confidence
+            # A confident, format-valid read from the original pixels is enough;
+            # don't pay for the enhanced copy as well.
+            if best_text and self.INDIAN_PLATE_RE.match(best_text) and best_conf >= 0.5:
+                break
+
+        return best_text, best_conf
+
+    def _score_reading(self, text: str, confidence: float) -> float:
+        """
+        Rank one candidate reading.
+
+        Grammar conformance matters more than raw OCR confidence: a
+        high-confidence read of a dealer sticker is worthless, while a moderate
+        read shaped exactly like a registration is probably the plate.
+        """
+        score = float(confidence)
+        if self.INDIAN_PLATE_RE.match(text):
+            score *= 2.0
+        elif self.LOOSE_PLATE_RE.match(text):
+            score *= 1.2
+        # Plates carry both letters and digits; an all-alpha token is a word.
+        has_alpha = any(c.isalpha() for c in text)
+        has_digit = any(c.isdigit() for c in text)
+        if not (has_alpha and has_digit):
+            score *= 0.3
+        if 8 <= len(text) <= 10:               # the common Indian plate length
+            score *= 1.15
+        return score
+
+    def _ocr_tokens(self, image: np.ndarray) -> list[tuple[str, float]]:
+        """
+        Run EasyOCR and return each recognised token separately.
+
+        Returning tokens individually is the fix for the concatenation defect:
+        the old code joined every token into one string, so ``IND`` + the
+        registration became ``INDMH12AB1234`` — matching no plate pattern.
+        """
         self._ocr_call_count += 1
         started = time.perf_counter()
         with self._reader_lock:
             try:
                 results = self.reader.readtext(
-                    roi_rgb,
-                    detail=1,
-                    paragraph=False,
-                    width_ths=0.65,
+                    cv2.cvtColor(image, cv2.COLOR_BGR2RGB),
+                    detail=1, paragraph=False, width_ths=0.7,
                     allowlist="ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
                 )
-            except Exception as e:
-                log.error("EasyOCR readtext failed: %s", e)
-                return "", 0.0
+            except Exception as exc:
+                log.error("EasyOCR readtext failed: %s", exc)
+                return []
             finally:
                 self._ocr_ms_total += (time.perf_counter() - started) * 1000.0
 
-        if not results:
-            return "", 0.0
-
-        # Keep every read and report the confidence honestly. Discarding
-        # low-confidence reads here (as the previous build did) made it
-        # impossible to distinguish "no plate" from "plate I could not read",
-        # so a marginal plate silently vanished instead of surfacing as
-        # PLATE UNCERTAIN.
-        text_parts: list[str] = []
-        confidences: list[float] = []
-        for (_bbox, text, conf) in results:
-            cleaned = text.strip().upper()
+        tokens: list[tuple[str, float]] = []
+        cleaned_parts: list[str] = []
+        for entry in results or ():
+            try:
+                _box, raw_text, confidence = entry
+            except (ValueError, TypeError):
+                continue
+            cleaned = self.normalize_plate_text(raw_text)
             if not cleaned:
                 continue
-            text_parts.append(cleaned)
-            confidences.append(float(conf))
+            cleaned_parts.append(cleaned)
+            tokens.append((cleaned, float(confidence)))
 
-        if not text_parts:
-            return "", 0.0
+        # Also offer the joined string: a plate split across two OCR boxes
+        # ("MH12" + "AB1234") is only a valid plate once reassembled. It is one
+        # more candidate to be scored, not an override.
+        if len(cleaned_parts) > 1:
+            joined = "".join(cleaned_parts)
+            mean_conf = sum(c for _, c in tokens) / len(tokens)
+            tokens.append((joined, mean_conf))
+        return tokens
 
-        # Weight by character count: a 9-character read at 0.6 is a better
-        # plate candidate than a 1-character read at 0.95.
-        total_chars = sum(len(t) for t in text_parts) or 1
-        weighted = sum(c * len(t) for c, t in zip(confidences, text_parts)) / total_chars
-        return "".join(text_parts), float(weighted)
+    #: Glyph pairs OCR habitually confuses. Used only where the plate grammar
+    #: makes the correct class unambiguous (a position that must hold a digit
+    #: cannot hold the letter "O"), never as a blanket substitution.
+    _TO_DIGIT = {"O": "0", "D": "0", "Q": "0", "I": "1", "L": "1", "J": "1",
+                 "Z": "2", "A": "4", "S": "5", "G": "6", "T": "7", "B": "8"}
+    _TO_LETTER = {"0": "O", "1": "I", "2": "Z", "4": "A", "5": "S",
+                  "6": "G", "7": "T", "8": "B"}
+
+    def apply_plate_grammar(self, text: str) -> tuple[str, bool]:
+        """
+        Resolve OCR glyph confusions using the Indian plate grammar.
+
+        An Indian registration is ``LL DD L{0,3} DDDD``.  That structure makes
+        many OCR errors *decidable* rather than ambiguous: at a position which
+        must be a digit, the letter ``O`` can only have been ``0`` and ``I`` can
+        only have been ``1``; at a position which must be a letter, ``8`` can
+        only have been ``B``.
+
+        This is constraint satisfaction against a known format, not guesswork,
+        and it is applied only when the result matches the grammar exactly.  The
+        uncorrected OCR string is preserved in the event details, so the
+        evidence record still shows what the recogniser actually saw.
+
+        Returns ``(text, corrected)``.
+        """
+        if not text or self.INDIAN_PLATE_RE.match(text):
+            return text, False
+
+        # Enumerate every layout consistent with the grammar (2 letters, 1-2
+        # digits, 0-3 letters, 1-4 digits) and keep the reading that requires the
+        # **fewest** substitutions. Minimum edit distance from what the OCR
+        # actually saw is the right tie-break: several layouts can fit a given
+        # length, and preferring the first one found picked arbitrarily badly
+        # ("KAOIF1234" fit LLDDLLDDD as "KA01FI234", three changes, instead of
+        # LLDDLDDDD as "KA01F1234", two).
+        best: Optional[tuple[float, str]] = None
+        for digits_1 in (2, 1):
+            for letters_2 in (0, 1, 2, 3):
+                for digits_2 in (1, 2, 3, 4):
+                    # Layout prior. Substitution count alone is ambiguous
+                    # because the grammar is loose: "KAOIF1234" fits both
+                    # LL-D-LL-DDDD with one change and LL-DD-L-DDDD with two,
+                    # and only the second is a real registration shape. Indian
+                    # plates almost always carry a two-digit district code and a
+                    # four-digit serial, so those layouts are cheaper.
+                    layout_cost = (
+                        (0.0 if digits_1 == 2 else 1.5)
+                        + {4: 0.0, 3: 0.5, 2: 1.0, 1: 1.5}[digits_2]
+                        + {2: 0.0, 1: 0.25, 3: 0.5, 0: 1.5}[letters_2]
+                    )
+                    if 2 + digits_1 + letters_2 + digits_2 != len(text):
+                        continue
+                    pattern = (["L"] * 2 + ["D"] * digits_1
+                               + ["L"] * letters_2 + ["D"] * digits_2)
+                    out, changes, ok = [], 0, True
+                    for glyph, kind in zip(text, pattern):
+                        if kind == "D":
+                            if glyph.isdigit():
+                                out.append(glyph)
+                            elif glyph in self._TO_DIGIT:
+                                out.append(self._TO_DIGIT[glyph])
+                                changes += 1
+                            else:
+                                ok = False
+                                break
+                        else:
+                            if glyph.isalpha():
+                                out.append(glyph)
+                            elif glyph in self._TO_LETTER:
+                                out.append(self._TO_LETTER[glyph])
+                                changes += 1
+                            else:
+                                ok = False
+                                break
+                    if not ok:
+                        continue
+                    candidate = "".join(out)
+                    if not self.INDIAN_PLATE_RE.match(candidate):
+                        continue
+                    cost = changes + layout_cost
+                    if best is None or cost < best[0]:
+                        best = (cost, candidate)
+
+        if best is None:
+            return text, False
+        return best[1], best[1] != text
 
     def normalize_plate_text(self, raw_text: str) -> str:
         """
-        Normalize OCR output to uppercase alphanumeric plate characters.
+        Normalise OCR output to uppercase alphanumerics.
 
-        This intentionally does not aggressively map O->0 or I->1 because a
-        little OCR ambiguity is safer to keep visible in the final string
-        (and for later re-verification) than to silently change evidence.
+        Deliberately does *not* map O->0 or I->1: keeping a little OCR ambiguity
+        visible is safer for evidence than silently rewriting a registration.
         """
         if not raw_text:
             return ""
-        return self.PLATE_CHARS_RE.sub("", raw_text).upper()
+        return self.PLATE_CHARS_RE.sub("", str(raw_text)).upper()
 
-    def _extract_most_plate_like(self, clean_text: str) -> Optional[str]:
-        """
-        If OCR output includes extra text around the plate, pick the token
-        that best matches a plausibly Indian alphanumeric plate pattern.
-        """
-        if not clean_text:
+    def _best_token(self, clean_text: str) -> Optional[str]:
+        """Pick the most plate-like substring of one OCR token."""
+        if not clean_text or len(clean_text) < 4:
+            return None
+        if clean_text in self.NON_PLATE_TOKENS:
             return None
 
         if self.INDIAN_PLATE_RE.match(clean_text):
             return clean_text
 
-        # OCR may concatenate all tokens as one string in small ROIs.
-        # If the entire string is a plausible alphanumeric code, keep it.
+        # Glyph-confusion repair against the plate grammar, e.g. "DLBCAF5O31"
+        # -> "DL8CAF5031": at those positions only a digit is possible.
+        repaired, corrected = self.apply_plate_grammar(clean_text)
+        if corrected:
+            return repaired
+
+        # Strip a leading country/strip marker such as "IND".
+        for marker in self.NON_PLATE_TOKENS:
+            if clean_text.startswith(marker) and len(clean_text) > len(marker) + 3:
+                remainder = clean_text[len(marker):]
+                if self.INDIAN_PLATE_RE.match(remainder):
+                    return remainder
+
+        # A window matching the plate grammar anywhere inside the token.
+        for length in range(min(10, len(clean_text)), 5, -1):
+            for start in range(0, len(clean_text) - length + 1):
+                window = clean_text[start:start + length]
+                if self.INDIAN_PLATE_RE.match(window):
+                    return window
+                repaired, corrected = self.apply_plate_grammar(window)
+                if corrected:
+                    return repaired
+
         if self.LOOSE_PLATE_RE.match(clean_text):
             return clean_text
-
-        # Try splitting into plausible tokens and prefer the longest one.
-        tokens = re.findall(r"[A-Z0-9]{5,12}", clean_text)
-        if not tokens:
-            return None
-        return max(tokens, key=len)
+        tokens = re.findall(r"[A-Z0-9]{6,12}", clean_text)
+        return max(tokens, key=len) if tokens else None
 
     # ------------------------------------------------------------------ #
     # Pipeline integration
     # ------------------------------------------------------------------ #
-
     def cached_detections(self) -> list[PlateDetection]:
         """Last OCR result set, reused between cadence ticks."""
         return list(self._detection_cache)
 
     @staticmethod
     def format_indian_plate(text: str) -> str:
-        """
-        Group a validated plate the way it is printed: ``MH12AB1234`` ->
-        ``MH 12 AB 1234``.  Purely presentational; the raw string is kept in
-        the event details so the evidence is not reshaped.
-        """
+        """``MH12AB1234`` -> ``MH 12 AB 1234``. Presentational only."""
         match = re.match(r"^([A-Z]{2})([0-9]{1,2})([A-Z]{0,3})([0-9]{1,4})([A-Z]?)$", text)
         if not match:
             return text
@@ -562,10 +895,10 @@ class ANPRProcessor:
         """
         Build a debounced ANPR event, or ``None``.
 
-        A read below ``ANPR_ALERT_CONFIDENCE`` is *not* logged as a plate
-        number — writing a guessed registration into an evidentiary log is
-        worse than logging nothing.  The overlay still shows it live as
-        PLATE UNCERTAIN so the operator knows a plate was seen.
+        A read below ``ANPR_ALERT_CONFIDENCE`` is **not** logged as a plate
+        number — writing a guessed registration into an evidentiary log is worse
+        than logging nothing.  The overlay still shows it live as
+        ``PLATE UNCERTAIN`` so the operator knows a plate was seen.
         """
         from cv.rules import Alert as RuleAlert
 
@@ -573,9 +906,18 @@ class ANPRProcessor:
             return None
         if plate.text_confidence < settings.ANPR_ALERT_CONFIDENCE:
             return None
+        # With consensus enabled, wait for corroboration before writing to the
+        # log; a single frame is an observation, not a reading.
+        if (settings.ANPR_CONSENSUS_ENABLED
+                and plate.vehicle_track_id is not None
+                and not plate.consensus):
+            return None
 
         track_id = int(plate.vehicle_track_id or 0)
-        key = (plate.plate_text, track_id)
+        raw = plate.plate_text.replace(" ", "")
+        # Debounce per (plate, vehicle) so the same car is logged once per pass
+        # while a different vehicle with a similar plate is still reported.
+        key = (raw, track_id)
         now = time.time()
         last = self._event_debounce.get(key, 0.0)
         if now - last < settings.ANPR_ALERT_DEBOUNCE_SECONDS:
@@ -585,26 +927,35 @@ class ANPRProcessor:
             self._event_debounce = {
                 k: v for k, v in self._event_debounce.items() if now - v < 600
             }
+        self.voter.mark_published(track_id, raw)
 
-        verified = bool(self.INDIAN_PLATE_RE.match(plate.plate_text.replace(" ", "")))
         return RuleAlert(
             rule_name="anpr", rule_type="anpr", track_id=track_id,
             alert_type="anpr_detection",
             description=(
                 f"Number plate read: {plate.plate_text} "
                 f"({plate.text_confidence * 100:.0f}% OCR confidence"
-                f"{', matches Indian plate format' if verified else ''})"
+                f"{f', {plate.votes} corroborating frames' if plate.consensus else ''}"
+                f"{', matches Indian plate format' if plate.format_verified else ''})"
             ),
             details={
                 "plate_text": plate.plate_text,
-                "plate_raw": plate.plate_text.replace(" ", ""),
+                "plate_raw": raw,
                 "ocr_confidence": round(float(plate.text_confidence), 4),
                 "localization_confidence": round(float(plate.confidence), 4),
-                "format_verified": verified,
+                "format_verified": plate.format_verified,
+                "consensus": plate.consensus,
+                "corroborating_reads": plate.votes,
                 "vehicle_class": plate.vehicle_class or "unknown",
+                "vehicle_track_id": track_id,
                 "bbox": list(plate.bbox),
             },
         )
+
+    def reset(self) -> None:
+        """Clear per-stream state (source reconnect, file loop)."""
+        self.voter.reset()
+        self._detection_cache = []
 
     def get_metrics(self) -> dict:
         calls = max(1, self._ocr_call_count)
@@ -618,26 +969,44 @@ class ANPRProcessor:
             "ocr_ms_avg": round(self._ocr_ms_total / calls, 1),
             "plates_confident": self._plates_read,
             "plates_uncertain": self._plates_uncertain,
+            "frames_searched": self._frames_searched,
+            "candidates_found": self._candidates_found,
             "cadence_frames": settings.ANPR_EVERY_N_FRAMES,
             "confidence_threshold": settings.ANPR_CONFIDENCE_THRESHOLD,
             "alert_confidence": settings.ANPR_ALERT_CONFIDENCE,
+            "consensus_enabled": settings.ANPR_CONSENSUS_ENABLED,
+            "min_votes": settings.ANPR_MIN_VOTES,
+            "plate_target_height": settings.ANPR_PLATE_TARGET_HEIGHT,
             "last_inference_frame": self._last_inference_frame,
         }
 
 
-# Global ANPR processor instance (lazy initialized)
+def _iou(a, b) -> float:
+    """Intersection-over-union of two ``(x1, y1, x2, y2, …)`` boxes."""
+    ax1, ay1, ax2, ay2 = a[:4]
+    bx1, by1, bx2, by2 = b[:4]
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+    a_area = max(1, (ax2 - ax1) * (ay2 - ay1))
+    b_area = max(1, (bx2 - bx1) * (by2 - by1))
+    return inter / float(a_area + b_area - inter)
+
+
 _anpr_processor: Optional[ANPRProcessor] = None
-_anpr_lock = None
+_anpr_lock = threading.Lock()
 
 
 def get_anpr_processor() -> ANPRProcessor:
-    """Get or create the global ANPR processor instance."""
-    global _anpr_processor, _anpr_lock  # noqa: PLW0602
-    if _anpr_lock is None:
-        import threading
-        _anpr_lock = threading.Lock()
-
+    """Process-wide ANPR processor (the OCR model is loaded at most once)."""
+    global _anpr_processor
     with _anpr_lock:
         if _anpr_processor is None:
             _anpr_processor = ANPRProcessor()
         return _anpr_processor
+
+
+__all__ = [
+    "ANPRProcessor", "PlateDetection", "PlateVoter",
+    "get_anpr_processor", "EASYOCR_AVAILABLE",
+]

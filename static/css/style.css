@@ -475,3 +475,30 @@ label { display: block; font-size: 11.5px; color: var(--text-dim);
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: .001ms !important; transition-duration: .001ms !important; }
 }
+
+/* --- Add-Camera modal: compact MP4 dropzone -------------------------------
+   Reuses .upload-area's visual language at modal scale rather than
+   introducing a second dropzone style. */
+.upload-area-sm { margin: 8px 0; padding: 18px 14px; }
+.upload-area-sm p { font-size: 12.5px; color: var(--text-dim); }
+.upload-area-sm.dragging { border-color: var(--accent); background: #101c26; }
+#cam-kind { margin-bottom: 12px; }
+#cam-file-label.chosen { color: var(--accent); font-family: var(--mono); font-size: 11.5px; }
+
+/* --- Camera tile: source-kind badge --------------------------------------
+   An MP4 source runs the same analytics as a live feed, so the grid must say
+   which is which -- an operator must never mistake looping recorded footage
+   for a live view of the border. */
+.camera-source-badge {
+  position: absolute; top: 8px; right: 8px; z-index: 2;
+  padding: 2px 7px; border-radius: 3px;
+  font-family: var(--mono); font-size: 9.5px; font-weight: 700;
+  letter-spacing: .07em; text-transform: uppercase;
+  background: rgba(8, 12, 18, .82); border: 1px solid var(--line);
+  color: var(--text-dim); backdrop-filter: blur(3px);
+}
+.camera-source-badge.file { color: #ffc14d; border-color: #6b5220; }
+
+/* Night-mode chip carries its measured reason, so the UI explains the state
+   rather than merely asserting it. */
+.camera-night { cursor: help; }
