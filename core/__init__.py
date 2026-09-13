@@ -1,12 +1,4 @@
-"""
-Core package for IBVAP — configuration, database, models, hash chain,
-and the video-analytics pipeline.
 
-Submodules are exposed lazily (PEP 562).  ``core.camera`` pulls in the CV
-stack, which itself imports ``core.config``; importing it eagerly here made
-``import cv.detector`` fail with a circular-import error whenever ``cv`` was
-imported before ``core``.  Lazy attribute access removes that ordering trap.
-"""
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
@@ -24,6 +16,9 @@ from core.timeutil import (
 )
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
+    from core.alarm import AlarmManager, get_alarm_manager
+    from core.notify import NotificationChannel
+    from core.sms import SMSNotifier, get_sms_notifier
     from core.camera import (
         CameraManager,
         CameraProcessor,
@@ -40,6 +35,11 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     )
 
 _LAZY: dict[str, str] = {
+    "AlarmManager": "core.alarm",
+    "SMSNotifier": "core.sms",
+    "NotificationChannel": "core.notify",
+    "get_alarm_manager": "core.alarm",
+    "get_sms_notifier": "core.sms",
     "FrameBuffer": "core.camera",
     "CameraProcessor": "core.camera",
     "CameraManager": "core.camera",
@@ -75,4 +75,6 @@ __all__ = [
     "latest_chain_hash", "VerificationResult",
     "FrameBuffer", "CameraProcessor", "CameraManager",
     "ClipWriter", "LowLightEnhancer",
+    "AlarmManager", "SMSNotifier", "NotificationChannel",
+    "get_alarm_manager", "get_sms_notifier",
 ]

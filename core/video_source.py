@@ -21,8 +21,10 @@ and an uploaded video share one :class:`~core.analytics.FrameAnalyzer`.
 from __future__ import annotations
 
 import logging
+import sys
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -73,22 +75,96 @@ def _parse_source(url: str):
 _FFMPEG_OPEN_TIMEOUT_US = 8_000_000    # 8 s to establish
 _FFMPEG_READ_TIMEOUT_US = 8_000_000    # 8 s without data before giving up
 
+#: The same bounds in milliseconds, for OpenCV's *own* watchdog, which is a
+#: separate mechanism from the FFmpeg options above and wins when it fires
+#: first (see :func:`_capture_params`).
+#:
+#: The FFmpeg options above are necessary and are not sufficient, which is easy
+#: to miss because they look like they cover it. OpenCV wraps every FFmpeg call
+#: in an interrupt callback of its own, and that callback has separate
+#: environment variables and its own 30-second default. Measured against an
+#: unroutable host, a ``VideoCapture`` open returned after::
+#:
+#:     [WARN] _opencv_ffmpeg_interrupt_callback Stream timeout triggered
+#:            after 30072.851000 ms
+#:
+#: — 30 s, not the 8 s configured right above it, because the interrupt fired
+#: first. With ``RECONNECT_INTERVAL`` at 4 s that is a capture thread parked in
+#: a 30-second syscall, waking briefly, and parking again, for as long as the
+#: camera stays unreachable. A handful of mistyped or offline sources is then
+#: a handful of threads each spending ~90% of its life inside an uninterruptible
+#: native call — which is also why a removed camera's thread appeared to
+#: outlive its removal by half a minute.
+#:
+#: Setting these through the environment does not work; they have to be passed
+#: as open parameters. Both are kept because the FFmpeg-level options still
+#: matter for transports the interrupt callback does not cover.
+_FFMPEG_OPEN_TIMEOUT_MS = str(_FFMPEG_OPEN_TIMEOUT_US // 1000)
+_FFMPEG_READ_TIMEOUT_MS = str(_FFMPEG_READ_TIMEOUT_US // 1000)
+
 
 def _apply_ffmpeg_timeouts() -> None:
-    """Set FFmpeg transport timeouts before a capture is opened."""
+    """
+    Bound how long a capture may block, before one is opened.
+
+    Every variable is set only if the operator has not set it, so explicit
+    tuning in the environment always wins.
+    """
     import os
 
-    existing = os.environ.get("OPENCV_FFMPEG_CAPTURE_OPTIONS")
-    if existing:
-        return  # respect an operator's explicit tuning
-    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "|".join((
-        "rtsp_transport;tcp",                      # UDP silently blackholes
-        f"timeout;{_FFMPEG_READ_TIMEOUT_US}",      # newer FFmpeg
-        f"stimeout;{_FFMPEG_OPEN_TIMEOUT_US}",     # older FFmpeg
-        "reconnect;1",
-        "reconnect_streamed;1",
-        "reconnect_delay_max;4",
-    ))
+    if not os.environ.get("OPENCV_FFMPEG_CAPTURE_OPTIONS"):
+        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "|".join((
+            "rtsp_transport;tcp",                      # UDP silently blackholes
+            f"timeout;{_FFMPEG_READ_TIMEOUT_US}",      # newer FFmpeg
+            f"stimeout;{_FFMPEG_OPEN_TIMEOUT_US}",     # older FFmpeg
+            "reconnect;1",
+            "reconnect_streamed;1",
+            "reconnect_delay_max;4",
+        ))
+
+
+# Applied at import as well as before each open: OpenCV caches some of these
+# configuration parameters the first time it reads them, which for a process
+# that opens its first capture late is well after the value stopped mattering.
+_apply_ffmpeg_timeouts()
+
+
+def _webcam_backends() -> list[int]:
+    """
+    Backends to try for a local webcam index, best first.
+
+    On Windows OpenCV defaults to Media Foundation, and MSMF is slow to open a
+    camera: measured on this machine, ``VideoCapture(0)`` took 1803 ms with the
+    default backend and 765 ms with DirectShow, and the first ``read()`` after
+    it 781 ms against 532 ms. With a second handle already on the device —
+    exactly what a remove-then-re-add does, because the old capture thread may
+    still be unwinding — the gap is far wider: 1473 ms against 30 ms.
+
+    That delay is the whole of "I added the webcam and the tile just sits
+    there", so DirectShow is tried first and the default backend is kept as the
+    fallback for any device DirectShow will not open. Elsewhere the default is
+    already the right one and the list is left alone.
+    """
+    if sys.platform != "win32":
+        return [0]
+    dshow = getattr(cv2, "CAP_DSHOW", None)
+    return [int(dshow), 0] if dshow is not None else [0]
+
+
+def _capture_params() -> list:
+    """
+    Per-open timeouts for OpenCV's interrupt callback, or ``[]`` if unsupported.
+
+    These are what actually bound the open; the FFmpeg options alone do not.
+    ``CAP_PROP_*_TIMEOUT_MSEC`` exist from OpenCV 4.5, so the lookup is by
+    ``getattr`` and an older build simply keeps its own default.
+    """
+    open_prop = getattr(cv2, "CAP_PROP_OPEN_TIMEOUT_MSEC", None)
+    read_prop = getattr(cv2, "CAP_PROP_READ_TIMEOUT_MSEC", None)
+    if open_prop is None or read_prop is None:
+        return []
+    return [int(open_prop), int(_FFMPEG_OPEN_TIMEOUT_MS),
+            int(read_prop), int(_FFMPEG_READ_TIMEOUT_MS)]
 
 
 def resolve_source_url(url: str) -> str:
@@ -117,14 +193,26 @@ def open_capture(url: str) -> Optional[cv2.VideoCapture]:
     Open a video source, returning ``None`` rather than raising.
 
     RTSP gets a short buffer so a reconnect does not replay several seconds of
-    stale video before catching up, and a bounded FFmpeg timeout so an
-    unreachable host fails in seconds rather than parking the thread.
+    stale video before catching up, and a bounded timeout so an unreachable
+    host fails in seconds rather than parking the thread.
+
+    The timeout is passed as *open parameters*, not only through the
+    environment. Measured against an unroutable host, the environment
+    variables alone left the open taking 30.1 s — OpenCV's interrupt-callback
+    default — while the same open with these parameters returned in 8.1 s. The
+    difference is not academic: an unreachable camera retries forever, so it is
+    the difference between a thread that is blocked most of the time and one
+    that is blocked almost all of the time.
     """
     _apply_ffmpeg_timeouts()
     src = _parse_source(url)
     try:
         if isinstance(src, str) and src.lower().startswith(("rtsp", "http")):
-            cap = cv2.VideoCapture(src, cv2.CAP_FFMPEG)
+            params = _capture_params()
+            cap = (cv2.VideoCapture(src, cv2.CAP_FFMPEG, params) if params
+                   else cv2.VideoCapture(src, cv2.CAP_FFMPEG))
+        elif isinstance(src, int):
+            cap = _open_webcam(src)
         else:
             cap = cv2.VideoCapture(src)
     except Exception as exc:
@@ -141,6 +229,21 @@ def open_capture(url: str) -> Optional[cv2.VideoCapture]:
     except Exception:
         pass  # not supported by every backend — harmless
     return cap
+
+
+def _open_webcam(index: int) -> Optional[cv2.VideoCapture]:
+    """Open a local camera index, preferring the backend that opens fastest."""
+    for backend in _webcam_backends():
+        try:
+            cap = cv2.VideoCapture(index, backend) if backend else cv2.VideoCapture(index)
+        except Exception as exc:
+            log.debug("Webcam %d: backend %s raised %s", index, backend, exc)
+            continue
+        if cap is not None and cap.isOpened():
+            return cap
+        if cap is not None:
+            cap.release()
+    return None
 
 
 def probe_video(path: str | Path) -> dict:
@@ -171,6 +274,13 @@ def probe_video(path: str | Path) -> dict:
     return info
 
 
+#: Bounds for the operator's playback speed control. Below 0.5x a review drags
+#: and the pipeline idles; above 2x a file source decodes faster than the
+#: analytics can consume, so frames would be shed rather than watched.
+PLAYBACK_MIN_SPEED = 0.5
+PLAYBACK_MAX_SPEED = 2.0
+
+
 class LiveSource:
     """
     Threaded latest-frame capture for a continuous feed.
@@ -188,12 +298,25 @@ class LiveSource:
 
         self.stats = SourceStats()
         self._cap: Optional[cv2.VideoCapture] = None
-        self._frame: Optional[np.ndarray] = None
+        #: The latest decoded frame, and *only* the latest.
+        #:
+        #: A ``deque(maxlen=1)`` rather than a list or a queue, so the bound is
+        #: structural: if the analytics thread stalls — a slow inference, a
+        #: blocked disk, a GC pause — the decoder keeps overwriting this one
+        #: slot instead of stacking frames behind it. At 640x384x3 a frame is
+        #: 737 KB, so an unbounded hand-off on a stalled 15 fps camera would
+        #: grow RAM by ~11 MB per second and raise end-to-end latency by the
+        #: whole backlog. Dropping is the right answer for surveillance: the
+        #: operator wants the newest frame, never a queue of old ones.
+        self._frames: deque = deque(maxlen=1)
         self._frame_id = 0
         self._frame_ts = 0.0
         self._lock = threading.Lock()
         self._new_frame = threading.Condition(self._lock)
-        self._running = False
+        #: Set to stop the capture thread. Every wait in the loop is a wait on
+        #: this, so a stopping source never sits out a sleep it no longer needs.
+        self._stop_event = threading.Event()
+        self._stop_event.set()              # not running until start() clears it
         self._thread: Optional[threading.Thread] = None
         self._last_open_attempt = 0.0
         self._fps_window: list[float] = []
@@ -202,8 +325,22 @@ class LiveSource:
         #: clip was being decoded at ~1300 fps with 99% of frames thrown away —
         #: burning CPU and racing the footage past the analytics.
         self._is_file = False
+        #: A webcam / capture card, opened by index. Such a device emits in real
+        #: time by definition and cannot outrun it, which is what makes pacing
+        #: it not merely pointless but harmful — see ``_try_open``.
+        self._is_local_device = False
         self._frame_interval = 0.0
+        #: The rate the capture loop is actually pacing to, which is not always
+        #: what the source reports (see ``_try_open``).
+        self._paced_rate = 0.0
         self._next_frame_due = 0.0
+        #: Operator playback control. ``_speed`` multiplies the paced rate, so
+        #: 2.0 decodes a recording twice as fast and 0.5 at half speed; it has
+        #: no meaning for a live camera, which cannot outrun real time, so the
+        #: capture loop only honours it where pacing is exact (see
+        #: ``playback_applies``). ``_paused`` stops the decode entirely.
+        self._speed = 1.0
+        self._paused = False
         #: Set once a frame has ever arrived, so the pipeline can tell
         #: "still starting up" apart from "was up, now down".
         self._ever_connected = False
@@ -219,23 +356,61 @@ class LiveSource:
         self._generation = 0
 
     # -- lifecycle ------------------------------------------------------ #
+    @property
+    def _running(self) -> bool:
+        """True while the capture thread should keep decoding."""
+        return not self._stop_event.is_set()
+
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
             return
-        self._running = True
+        self._stop_event.clear()
         self._thread = threading.Thread(
             target=self._capture_loop, name=f"capture-{self.name}", daemon=True
         )
         self._thread.start()
 
-    def stop(self) -> None:
-        self._running = False
+    def request_stop(self) -> None:
+        """
+        Signal the capture thread to finish, without waiting for it.
+
+        Separated from :meth:`stop` so a caller holding a lock — the camera
+        manager removing a source — can make the source dead instantly and do
+        the joining afterwards, outside that lock.
+        """
+        self._stop_event.set()
         with self._new_frame:
+            self.stats.connected = False
             self._new_frame.notify_all()
-        if self._thread:
-            self._thread.join(timeout=3.0)
-            self._thread = None
-        self._release()
+
+    def stop(self, join_timeout: float = 3.0) -> None:
+        """
+        Stop capture and release the decoder.
+
+        The release is conditional on the capture thread actually having
+        exited. ``cv2.VideoCapture.release()`` called while that thread is
+        parked inside ``read()`` on the same handle is a use-after-free in
+        native code, and a thread blocked on an unreachable RTSP host is
+        exactly when it would happen. An overrunning thread releases its own
+        handle on the way out (see the tail of ``_capture_loop``), so nothing
+        leaks either way.
+        """
+        self.request_stop()
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=join_timeout)
+            if thread.is_alive():
+                log.warning(
+                    "SOURCE_STOP_SLOW [%s]: capture thread still inside a "
+                    "blocking read — it releases its own handle on exit",
+                    self.name,
+                )
+        self.cleanup()
+
+    @property
+    def is_thread_alive(self) -> bool:
+        thread = self._thread
+        return bool(thread is not None and thread.is_alive())
 
     def _invalidate_resolution(self) -> None:
         """Force the next attempt to re-resolve (YouTube signatures expire)."""
@@ -247,20 +422,129 @@ class LiveSource:
             pass
 
     def _release(self) -> None:
+        """Release the decoder handle. Only ever called from the owning thread."""
         cap, self._cap = self._cap, None
         if cap is not None:
             try:
                 cap.release()
-            except Exception:
-                pass
+            except Exception as exc:
+                log.debug("[%s] release raised: %s", self.name, exc)
+
+    def cleanup(self, wait: float = 0.0) -> None:
+        """
+        Guarantee the capture device is released, and drop the frame slot.
+
+        Releasing an OpenCV capture is not optional bookkeeping — a webcam
+        handle left open keeps the device locked against the next camera that
+        wants it, and an RTSP handle keeps a session established on the
+        recorder. But it is also not safe to do from just anywhere:
+        ``VideoCapture.release()`` called while the capture thread is inside
+        ``read()`` on the same handle is a use-after-free in native code, and a
+        thread blocked on an unreachable host is exactly when that would
+        happen.
+
+        So the release is always explicit and always happens, from whichever of
+        the two places can do it safely:
+
+        * if the capture thread has exited, release here and now;
+        * if it has not, it releases its own handle at the end of
+          ``_capture_loop`` — which it reaches as soon as the native call
+          returns, because ``_stop_event`` is already set. A short ``wait``
+          lets a caller give it that chance; a watchdog then reports anything
+          still holding on, rather than leaving it silent.
+
+        Idempotent: calling it twice, or on a source that never started, does
+        nothing the second time.
+        """
+        self._stop_event.set()
+        with self._new_frame:
+            self._new_frame.notify_all()
+
+        thread = self._thread
+        if wait > 0 and thread is not None and thread.is_alive():
+            thread.join(timeout=wait)
+
+        if thread is None or not thread.is_alive():
+            self._release()                       # explicit, immediate
+            self._thread = None
+        elif self._cap is not None:
+            # The owning thread still has it; it releases on its way out.
+            log.info(
+                "[%s] capture handle still owned by its thread — it is released "
+                "when the pending read returns", self.name,
+            )
+
+        with self._new_frame:
+            self._frames.clear()                  # ~737 KB per frame, freed now
+            self.stats.connected = False
+            self._new_frame.notify_all()
+
+    # -- playback control ------------------------------------------------ #
+    @property
+    def is_file(self) -> bool:
+        """Is this source a finite recording rather than a live feed?"""
+        return bool(self._is_file)
+
+    @property
+    def playback_applies(self) -> bool:
+        """
+        Can this source honour a speed change?
+
+        Only a source we pace exactly can: a recording is decoded as fast or as
+        slowly as we ask. A webcam or an RTSP camera emits in real time by
+        definition — asking it for 2x would just drop every other frame, and
+        0.5x would build the backlog the pacing exists to prevent — so speed is
+        reported as unavailable there rather than silently doing nothing.
+        """
+        return bool(self._is_file and not self._is_local_device)
+
+    def _effective_interval(self) -> float:
+        """Frame interval with the operator's speed multiplier applied."""
+        if not self.playback_applies or self._speed <= 0:
+            return self._frame_interval
+        return self._frame_interval / self._speed
+
+    def set_playback(self, paused: Optional[bool] = None,
+                     speed: Optional[float] = None) -> dict:
+        """Apply an operator's pause / speed request. Returns the new state."""
+        with self._lock:
+            if paused is not None:
+                was = self._paused
+                self._paused = bool(paused)
+                # Resuming must not try to repay the whole pause as a burst of
+                # frames, so the schedule restarts from now.
+                if was and not self._paused:
+                    self._next_frame_due = time.time()
+            if speed is not None:
+                self._speed = max(PLAYBACK_MIN_SPEED,
+                                  min(PLAYBACK_MAX_SPEED, float(speed)))
+            return self.playback_state
+
+    @property
+    def playback_state(self) -> dict:
+        return {
+            "paused": bool(self._paused),
+            "speed": round(float(self._speed), 2),
+            "speed_supported": self.playback_applies,
+            "effective_fps": (round(self._paced_rate * self._speed, 1)
+                              if self.playback_applies else round(self._paced_rate, 1)),
+        }
 
     # -- capture thread ------------------------------------------------- #
     def _capture_loop(self) -> None:
         while self._running:
             if self._cap is None:
                 if not self._try_open():
-                    time.sleep(0.35)
+                    self._stop_event.wait(0.35)     # wakes instantly on stop
                     continue
+
+            if self._paused:
+                # Hold the decoder still. The wait is on the stop event, so a
+                # paused source still tears down instantly rather than sitting
+                # out a sleep. Nothing is read, so a recording resumes exactly
+                # where the operator stopped it instead of having raced on.
+                self._stop_event.wait(0.1)
+                continue
 
             if self._frame_interval:
                 # Emit at (or near) the source's own rate.
@@ -282,9 +566,9 @@ class LiveSource:
                 # recording faster than it was shot is never what is wanted.
                 wait = self._next_frame_due - time.time()
                 if wait > 0:
-                    time.sleep(min(wait, 0.25))
+                    self._stop_event.wait(min(wait, 0.25))
                     continue
-                self._next_frame_due += self._frame_interval
+                self._next_frame_due += self._effective_interval()
                 # Never accumulate a debt we cannot repay (e.g. after a stall).
                 if time.time() - self._next_frame_due > 1.0:
                     self._next_frame_due = time.time()
@@ -298,18 +582,19 @@ class LiveSource:
             if not ok or frame is None:
                 if self._handle_read_failure():
                     continue
-                time.sleep(0.05)
+                self._stop_event.wait(0.05)
                 continue
 
             now = time.time()
             self._track_fps(now)
 
             with self._new_frame:
-                if self._frame is not None:
+                if self._frames:
                     # A frame the analytics loop never consumed is being
-                    # discarded — that is the latency guarantee working.
+                    # discarded — that is the latency guarantee working, and
+                    # the deque's maxlen is what enforces it.
                     self.stats.frames_dropped += 1
-                self._frame = frame
+                self._frames.append(frame)
                 self._frame_id += 1
                 self._frame_ts = now
                 self.stats.frames_read += 1
@@ -319,12 +604,24 @@ class LiveSource:
                 self._ever_connected = True
                 self._new_frame.notify_all()
 
+        # The owning thread's own release, on the way out. This is the path
+        # that frees a handle cleanup() could not touch because this thread was
+        # still inside a blocking read when stop was requested.
         self._release()
         with self._new_frame:
+            self._frames.clear()
             self.stats.connected = False
             self._new_frame.notify_all()
+        log.debug("[%s] capture thread exited and released its handle", self.name)
 
     def _try_open(self) -> bool:
+        # Opening a capture is an uninterruptible native call of up to
+        # _FFMPEG_OPEN_TIMEOUT_MS. Re-checking here — after the reconnect wait,
+        # immediately before committing to it — is what keeps a source that was
+        # stopped during that wait from entering one last blocking open that
+        # nothing wants the answer to.
+        if not self._running:
+            return False
         now = time.time()
         if now - self._last_open_attempt < settings.RECONNECT_INTERVAL:
             return False
@@ -343,6 +640,7 @@ class LiveSource:
             return False
         self._resolved_url = target
 
+        self._is_local_device = isinstance(_parse_source(target), int)
         cap = open_capture(target)
         if cap is None:
             if self.stats.connected or not self.stats.last_error:
@@ -367,25 +665,63 @@ class LiveSource:
         # A positive frame count means a finite file rather than a live feed.
         total = float(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
         self._is_file = total > 0
-        if 0 < self.stats.source_fps < 240:
-            # A file plays at exactly its own rate. A live source is allowed
-            # some headroom so it can catch back up to the live edge after a
-            # stall, but is still bounded — an unbounded decoder on a buffered
-            # network stream is a CPU sink, not a faster camera.
-            rate = self.stats.source_fps
-            if not self._is_file:
-                rate *= max(1.0, float(settings.LIVE_CAPTURE_HEADROOM))
-            self._frame_interval = 1.0 / rate
+        # How fast to pull frames — which depends entirely on what kind of
+        # source this is, and getting it wrong in either direction hurts.
+        #
+        # Too fast, and a buffered network stream becomes a CPU sink: a YouTube
+        # Live HLS feed hands FFmpeg whole segments, and an unpaced loop decoded
+        # it at 370-750 fps — measured — while the analytics it fed fell to 1.5.
+        #
+        # Too slow, and a real-time source backs up *inside the driver*. A
+        # webcam delivers 30 fps whether we read them or not; pulling at 22.5
+        # leaves the difference queued, and since that queue is FIFO every frame
+        # we then read is the oldest one in it. Measured on this machine,
+        # consuming a 30 fps webcam at 15 fps: 45 of 45 reads returned a
+        # distinct frame and each returned in 0.2 ms instead of blocking ~33 ms
+        # for the sensor — the signature of draining a backlog rather than
+        # sitting at the live edge. ``CAP_PROP_BUFFERSIZE=1`` does not help;
+        # DirectShow ignores it.
+        #
+        # So:
+        reported = self.stats.source_fps
+        if self._is_local_device:
+            # A camera device cannot outrun real time, so there is nothing to
+            # protect against — and ``read()`` blocking on the sensor is itself
+            # perfect pacing. Anything we add here only inserts latency.
+            rate = 0.0
+        elif self._is_file:
+            # A recording plays at exactly the rate it was shot at.
+            rate = reported if 0 < reported < 240 else float(settings.TARGET_FPS)
+        elif 0 < reported < 240:
+            # A network camera, pacing with headroom so it can regain the live
+            # edge after a stall — always above its own rate, never below.
+            rate = reported * max(1.0, float(settings.LIVE_CAPTURE_HEADROOM))
         else:
-            self._frame_interval = 0.0
+            # A live source that will not say how fast it is. Cap the runaway
+            # case, but stay above any ordinary camera rate so we can never
+            # create the backlog described above.
+            rate = max(
+                float(settings.TARGET_FPS) * max(1.0, float(settings.LIVE_CAPTURE_HEADROOM)),
+                30.0,
+            )
+            log.debug("[%s] source reports fps=%.1f — pacing at %.1f fps instead",
+                      self.name, reported, rate)
+
+        self._frame_interval = (1.0 / rate) if rate > 0 else 0.0
+        self._paced_rate = rate
         self._next_frame_due = time.time()
 
+        if self._is_local_device:
+            pacing = " (local device — read at the sensor's own rate)"
+        elif self._is_file and 0 < reported < 240:
+            pacing = " (file, paced to source rate)"
+        else:
+            pacing = f" (paced to {self._paced_rate:.0f} fps)"
         log.info(
-            "[%s] connected — %dx%d @ %.1f fps%s",
-            self.name, self.stats.width, self.stats.height, self.stats.source_fps,
-            (" (file, paced to source rate)" if self._is_file
-             else f" (paced to {1.0 / self._frame_interval:.0f} fps)")
-            if self._frame_interval else " (unpaced — source reports no frame rate)",
+            "[%s] connected — %dx%d @ %s%s",
+            self.name, self.stats.width, self.stats.height,
+            f"{reported:.1f} fps" if reported > 0 else "unreported fps",
+            pacing,
         )
         return True
 
@@ -404,7 +740,7 @@ class LiveSource:
                         log.debug("[%s] video file looped (generation %d)",
                                   self.name, self._generation)
                         with self._new_frame:
-                            self._frame = frame
+                            self._frames.append(frame)
                             self._frame_id += 1
                             self._frame_ts = time.time()
                             self.stats.frames_read += 1
@@ -445,11 +781,11 @@ class LiveSource:
                 if remaining <= 0:
                     return None, last_id, 0.0
                 self._new_frame.wait(remaining)
-            if self._frame is None:
+            if not self._frames:
                 return None, last_id, 0.0
-            frame, fid, ts = self._frame, self._frame_id, self._frame_ts
-            # Hand the frame off; a fresh one will replace it.
-            self._frame = None
+            # popleft on a maxlen=1 deque: take the one frame there is and
+            # leave the slot empty for the next decode.
+            frame, fid, ts = self._frames.popleft(), self._frame_id, self._frame_ts
             return frame, fid, ts
 
     @property
@@ -511,6 +847,9 @@ class LiveSource:
             "resolution": f"{s.width}x{s.height}" if s.width else "—",
             "source_fps": round(s.source_fps, 2),
             "paced": bool(self._frame_interval),
+            "paced_fps": round(self._paced_rate, 1),
+            "playback": self.playback_state,
+            "local_device": bool(self._is_local_device),
             "is_file": bool(self._is_file),
             "loops": bool(self._is_file and self.loop_files),
             "generation": self._generation,

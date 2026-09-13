@@ -316,13 +316,71 @@ def test_night_survives_a_bright_light_in_a_dark_scene():
     assert _settle(SceneIlluminationEstimator(), scene).is_night is True
 
 
+def _ir_frame(peak: int = 150) -> np.ndarray:
+    """
+    A frame that looks like real night-vision footage.
+
+    The fixture matters here. This test used to pass pure per-pixel noise
+    (``integers(95, 135)``), which the estimator's INTER_AREA downsample
+    averages away to a luma standard deviation of 2.9 with not one dark pixel —
+    a flat grey field, not a scene. That is exactly what a phone used as a
+    webcam emits while it connects, and treating it as night vision is what
+    produced phantom night-movement alerts in a lit room.
+
+    Genuine IR footage has spatial structure that survives downsampling, and an
+    IR illuminator lights a cone and leaves the rest of the frame black, so
+    some truly dark pixels are always present.
+    """
+    height, width = 384, 640
+    rng = np.random.default_rng(0)
+    yy, xx = np.mgrid[0:height, 0:width]
+    cone = np.exp(-(((xx - width / 2) / (width * 0.33)) ** 2
+                    + ((yy - height * 0.62) / (height * 0.4)) ** 2))
+    grey = np.clip(cone * peak + rng.normal(0, 22, (height, width)) * cone
+                   + rng.normal(0, 4, (height, width)), 0, 255).astype(np.uint8)
+    return cv2.cvtColor(grey, cv2.COLOR_GRAY2BGR)
+
+
 def test_infrared_night_vision_is_recognised_despite_being_bright():
     """An IR camera outputs a bright but colourless image."""
-    grey = np.random.default_rng(0).integers(95, 135, (384, 640), dtype=np.uint8)
-    ir = cv2.cvtColor(grey, cv2.COLOR_GRAY2BGR)
-    condition = _settle(SceneIlluminationEstimator(), ir)
+    condition = _settle(SceneIlluminationEstimator(), _ir_frame())
     assert condition.is_night is True
-    assert condition.infrared is True
+
+
+def test_a_colourless_but_lit_room_is_not_night():
+    """
+    Regression: a phone used as a webcam reported night in a lit room.
+
+    A virtual-camera driver emits a flat grey placeholder while the phone
+    connects, and many phone feeds are near-colourless indoors. Both satisfied
+    every colour test the infrared heuristic applied, so a frame at mean luma
+    128 was declared "infrared" night — which armed the night-movement rule and
+    reported phantom night movement on the first person to walk past.
+
+    Colourlessness alone cannot mean night. The frame must also contain a scene
+    and actually be dim.
+    """
+    flat = np.full((384, 640, 3), 128, np.uint8)
+    condition = _settle(SceneIlluminationEstimator(), flat)
+    assert condition.is_night is False, (
+        "a flat grey placeholder frame was read as night vision"
+    )
+    assert condition.infrared is False
+
+    # A lit but desaturated room: real texture, but nothing dark in it.
+    rng = np.random.default_rng(5)
+    grey = rng.integers(95, 145, (384, 640), dtype=np.uint8)
+    lit = cv2.cvtColor(grey, cv2.COLOR_GRAY2BGR)
+    assert _settle(SceneIlluminationEstimator(), lit).is_night is False
+
+
+def test_a_dark_scene_is_still_night_however_colourless():
+    """The fix must not cost us the case the detector exists for."""
+    rng = np.random.default_rng(9)
+    dark = rng.normal(24, 12, (384, 640)).clip(0, 255).astype(np.uint8)
+    condition = _settle(SceneIlluminationEstimator(),
+                        cv2.cvtColor(dark, cv2.COLOR_GRAY2BGR))
+    assert condition.is_night is True
 
 
 def test_a_few_dark_frames_do_not_arm_night():

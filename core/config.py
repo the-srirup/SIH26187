@@ -25,6 +25,11 @@ class Settings(BaseSettings):
     PROJECT_NAME: str = "IBVAP"
     VERSION: str = "2.0.0"
     LOG_LEVEL: str = "INFO"
+    #: Operational log retention. The file rotates at this size and keeps this
+    #: many previous files, so the worst case on disk is bounded and knowable:
+    #: LOG_MAX_MB * (LOG_BACKUP_COUNT + 1).
+    LOG_MAX_MB: int = 10
+    LOG_BACKUP_COUNT: int = 5
 
     # ------------------------------------------------------------------ #
     # Database
@@ -52,9 +57,52 @@ class Settings(BaseSettings):
     DEFAULT_CAMERA_URL: str = ""
 
     # ------------------------------------------------------------------ #
+    # Startup behaviour
+    # ------------------------------------------------------------------ #
+    #: Bring previously registered cameras back up when the server starts.
+    #:
+    #: True is right for a deployed Border Out Post: the box reboots and the
+    #: post is watched again without anyone logging in. False is right for
+    #: development and for a demo, where the last run's cameras reappearing
+    #: looks like the software failed to let go of them.
+    AUTOSTART_CAMERAS: bool = True
+
+    #: Start as though the software had just been installed: every camera is
+    #: retired at boot and the dashboard comes up empty.
+    #:
+    #: Applied at *startup*, never at shutdown — a termination that skips the
+    #: shutdown path (a kill, a crash, a closed terminal, a power cut) is
+    #: exactly the one after which a clean slate matters most, and a shutdown
+    #: hook does not run for any of them.
+    #:
+    #: Off by default because it destroys an operator's camera configuration.
+    #: Turn it on in .env for a development machine or a demo rig.
+    FRESH_START: bool = False
+
+    # ------------------------------------------------------------------ #
     # Detection model
     # ------------------------------------------------------------------ #
-    MODEL_PATH: str = "yolo11n.pt"
+    #: Detector weights.
+    #:
+    #: Benchmarked on this project's own footage (RTX 4060, 640x384 analytics
+    #: frame, 200 frames across a border clip and 1080p traffic):
+    #:
+    #:     model      conf   det/frame   small objs   mean conf   p50 ms
+    #:     yolo11n    0.30        1.46            5       0.651     18.8
+    #:     yolo11s    0.25        1.68            8       0.714     18.4
+    #:     yolo11m    0.25        1.82           14       0.733     22.7
+    #:
+    #: ``s`` is the default because it is strictly better than ``n`` here — 15%
+    #: more detections and a higher mean confidence — and, on a GPU, measurably
+    #: *faster*: both models are small enough that fixed per-call overhead
+    #: dominates, so the larger one costs nothing. "small objs" counts boxes
+    #: under 32x32 px, which is what a distant figure on a border road looks
+    #: like and precisely where the nano model gives up.
+    #:
+    #: Set MODEL_PATH=yolo11m.pt on a GPU host where distant detection matters
+    #: most: it finds 2.8x the small objects for 4 ms more, still a third of
+    #: the frame budget. Set yolo11n.pt on a CPU-only edge box.
+    MODEL_PATH: str = "yolo11s.pt"
     #: "auto" picks CUDA when available and falls back to CPU cleanly.
     DEVICE: str = "auto"
     #: FP16 on CUDA only; ignored on CPU (torch CPU has no fast fp16 path).
@@ -66,9 +114,14 @@ class Settings(BaseSettings):
     #: awkward letterbox padding. On a CPU-only host 640 costs ~1.8x the pixels;
     #: set INFERENCE_IMGSZ=480 in .env there.
     INFERENCE_IMGSZ: int = 640
-    #: Below 0.30 the extra detections were marginal and added flicker; above it
-    #: distant vehicles were dropped.
-    DEFAULT_CONFIDENCE: float = 0.30
+    #: Re-measured after the model change. At 0.25 the detector finds 15% more
+    #: objects and 60% more small ones than at 0.30, while mean confidence
+    #: barely moves (0.727 -> 0.714) — the extra detections are real, not
+    #: noise. The flicker this threshold used to guard against is now handled
+    #: where it belongs: every rule requires ANCHOR_CONFIRMATION_FRAMES of
+    #: agreement before it will raise anything, so a transient box cannot
+    #: produce an event.
+    DEFAULT_CONFIDENCE: float = 0.25
     NMS_IOU: float = 0.45
     MAX_DETECTIONS: int = 50
     #: Batch frames from concurrent cameras into one forward pass. Measured on
@@ -129,6 +182,18 @@ class Settings(BaseSettings):
     RECONNECT_INTERVAL: float = 4.0
     #: Loop finite video files (demo behaviour for the sample clip).
     LOOP_FILE_SOURCES: bool = True
+    #: Seal a repeated event once, not once per lap.
+    #:
+    #: A looping video file replays identical footage, so every pass produces
+    #: the same crossings, the same zone entries and the same detections. Left
+    #: alone, a clip looping for an hour writes the same handful of events into
+    #: the hash chain dozens of times, and the first real occurrence is lost
+    #: among copies of itself. With this on, the first pass is recorded in full
+    #: and later passes seal only what is genuinely new; each loop still
+    #: announces itself with a ``source_restarted`` event so the seam is
+    #: visible. Turn it off if a looping file is standing in for a live feed
+    #: and every pass must be treated as fresh footage.
+    FILE_LOOP_SUPPRESS_REPEATS: bool = True
     #: JPEG quality for the MJPEG stream (encoded once per frame, shared).
     JPEG_QUALITY: int = 72
     #: How far above its nominal frame rate a LIVE source may be decoded.
@@ -193,6 +258,18 @@ class Settings(BaseSettings):
     NIGHT_IR_LUMA_MAX: float = 160.0
     #: Darkness score attributed to a confirmed IR frame.
     NIGHT_IR_SCORE: float = 0.75
+    #: Minimum luma standard deviation before a colourless frame may be read as
+    #: infrared. A frame flatter than this contains no scene — a virtual-camera
+    #: placeholder, a covered lens, a driver not yet delivering — and a phone
+    #: used as a webcam emits exactly such frames while it connects. Without
+    #: this, a uniform grey fill at mean luma 128 was declared infrared night,
+    #: which armed the night-movement rule in a lit room and reported phantom
+    #: night movement on the first person to walk past.
+    NIGHT_IR_MIN_LUMA_STD: float = 8.0
+    #: An IR illuminator lights a cone and leaves the rest of the frame black,
+    #: so genuine night-vision footage always carries some truly dark pixels.
+    #: A washed-out or desaturated daylight view carries none.
+    NIGHT_IR_MIN_DARK_FRACTION: float = 0.04
 
     #: Optional *hint* only — never a trigger. When true, the clock window can
     #: nudge a borderline scene, but a bright scene is never called night.
@@ -276,6 +353,20 @@ class Settings(BaseSettings):
     ZONE_EXIT_GRACE_SECONDS: float = 1.5
     #: Restricted-zone presence threshold (seconds) before a dwell alert.
     ZONE_PRESENCE_SECONDS: float = 5.0
+    #: While a subject stays inside a zone, re-announce it this often.
+    #:
+    #: A zone that is occupied is a *continuing* condition, not a moment: an
+    #: operator who looks up thirty seconds after the entry event needs to see
+    #: that someone is still in there. The live signal for that is state — it
+    #: rides the 1 Hz stats socket and is drawn on the frame — because writing
+    #: an event per frame would bury the audit log under thousands of rows
+    #: saying the same thing and destroy its usefulness as evidence.
+    #:
+    #: This is the compromise for the log itself: one ``zone_presence`` event
+    #: per interval for as long as the subject remains, so the record shows a
+    #: continuing intrusion rather than a single entry followed by silence.
+    #: Set to 0 to keep the old behaviour of announcing sustained presence once.
+    ZONE_PRESENCE_REPEAT_SECONDS: float = 30.0
     #: Emit the low-severity "left the zone" event. Kept ON: with the exit
     #: grace period in place this is now one informative event per genuine
     #: departure (carrying the dwell time), not the flapping noise it used to
@@ -312,6 +403,16 @@ class Settings(BaseSettings):
     #: Overrides DEBOUNCE_SECONDS per alert type. Tuned so a single subject
     #: cannot produce a wall of events while genuinely distinct incidents are
     #: still all reported. Anything absent falls back to DEBOUNCE_SECONDS.
+    #: Severity at or above which an event interrupts a human — the desktop
+    #: notification and the alarm tone in the dashboard.
+    #:
+    #: HIGH by default, which is the line between "a security event" and
+    #: "something was detected". Below it an event is still sealed, still
+    #: listed and still visible on the tile; it simply does not make a noise.
+    #: Without that line an operator watching a road gets a notification per
+    #: passing car and learns to dismiss all of them.
+    NOTIFY_MIN_SEVERITY: str = "HIGH"
+
     ALERT_COOLDOWNS: dict[str, float] = {
         "entry": 4.0,
         "exit": 4.0,
@@ -321,12 +422,21 @@ class Settings(BaseSettings):
         "loiter": 30.0,
         "wrong_direction": 6.0,
         "night_movement": 45.0,
-        "human_detected": 20.0,
-        "vehicle_detected": 20.0,
+        #: Routine traffic. These are INFO-grade and exist so the log can show
+        #: what the camera saw; a short cooldown turns that into thousands of
+        #: near-identical rows an operator has to scroll past.
+        "human_detected": 45.0,
+        "vehicle_detected": 45.0,
         "anpr_detection": 30.0,
         "face_detected": 60.0,
         "watchlist_match": 45.0,
         "camera_offline": 120.0,
+        # A loop seam is announced every lap; the lap itself is the rate limit.
+        "source_restarted": 0.0,
+        #: A failing subsystem re-reports as long as it keeps failing; at the
+        #: 12 s global default that is a wall of identical rows hiding the
+        #: events around it.
+        "system_error": 120.0,
     }
 
     # ------------------------------------------------------------------ #
@@ -346,6 +456,18 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------ #
     FACE_ENABLED: bool = True
     FACE_RECOGNITION_EVERY_N_FRAMES: int = 12
+    #: Ceiling on the share of wall-clock time the face and ANPR stages may
+    #: consume, as a fraction. The frame cadence alone cannot bound them: it is
+    #: counted in frames, so on a CPU-only face stack — where a tick costs
+    #: about as long as the cadence it is gated by — the stage ends up running
+    #: essentially all the time. Measured with that happening: YOLO inference
+    #: rose from ~17 ms to ~97 ms and the pipeline fell from 15 fps to 8.3,
+    #: because the stage was taking a core and the GIL with it. After a tick
+    #: lasting T, the next is held off for T*(1/duty - 1), so a stage that is
+    #: slow on this machine simply runs less often instead of taking the
+    #: machine over. Raise it on a host with CUDA onnxruntime, where a tick is
+    #: cheap and more frequent recognition is affordable.
+    STAGE_MAX_DUTY: float = 0.25
     FACE_DET_SIZE: int = 320          # SCRFD input; 640 is 4x the pixels
     FACE_MIN_HEIGHT: int = 32
     FACE_MATCH_CACHE_SECONDS: float = 30.0
@@ -398,6 +520,31 @@ class Settings(BaseSettings):
     #: of the same tracked vehicle are accumulated and decided by per-character
     #: majority vote (WB12AB1234 / WB12AB1284 / WB12AB1234 -> WB12AB1234).
     ANPR_CONSENSUS_ENABLED: bool = True
+    #: Multiplier applied to a read that does not match the Indian plate
+    #: grammar. The default discounts it, which is right at an Indian border
+    #: post. Raise it toward 1.0 when the footage is from elsewhere, otherwise
+    #: every plate reads as PLATE UNCERTAIN however clearly it was seen.
+    ANPR_UNVERIFIED_PENALTY: float = 0.75
+    #: Bonus for a plate whose reading is agreed by several frames. Repeated
+    #: independent observations of the same characters genuinely raise
+    #: confidence; capped so agreement can sharpen a good read but never
+    #: manufacture a confident one from a poor one.
+    ANPR_CONSENSUS_BONUS: float = 0.20
+    #: A plate candidate whose centre lies within this fraction of any frame
+    #: edge is treated as leaving the scene and given priority for the OCR
+    #: budget. A vehicle at the edge has one or two ticks left before it is
+    #: gone; one in the middle of the picture will still be there next tick.
+    ANPR_EDGE_URGENCY_FRACTION: float = 0.18
+    #: Attempt motion deconvolution on plates the ordinary preprocessing could
+    #: not read. Costs extra OCR calls, but only for crops that already failed.
+    ANPR_DEBLUR_ENABLED: bool = True
+    #: Smear lengths (source pixels) tried when deconvolving a blurred plate.
+    #: The true length is unknown, so a short ladder is tried and the scorer
+    #: keeps whichever reading wins; a wrong length yields noise, which does not
+    #: parse as a registration.
+    ANPR_DEBLUR_LENGTHS: tuple = (5, 9, 13)
+    #: Wiener noise-to-signal term. Lower restores more detail and more ringing.
+    ANPR_DEBLUR_SNR: float = 0.012
     #: Reads of one vehicle required before a plate is published.
     ANPR_MIN_VOTES: int = 2
     #: Reads kept per tracked vehicle when voting.
@@ -405,6 +552,74 @@ class Settings(BaseSettings):
     #: Votes older than this (seconds) are discarded — a new vehicle may reuse
     #: a recycled track id.
     ANPR_VOTE_WINDOW_SECONDS: float = 20.0
+
+    # ------------------------------------------------------------------ #
+    # Notifications — alarm siren & SMS escalation
+    # ------------------------------------------------------------------ #
+    # Both channels are OFF by default. They reach a physical siren and a
+    # metered gateway that only exist in a real deployment, and a demo or
+    # development machine must not start dialling out because somebody walked
+    # past a camera. Enabling a channel without configuring a sink is a no-op
+    # that reports itself as "enabled but not configured" on
+    # /api/system/notifications rather than failing silently.
+    #
+    # Dispatch is asynchronous (see core/notify.py): the event pipeline hands
+    # the alert to a worker thread and returns, so an unreachable siren
+    # controller can never stall the camera thread that sealed the event.
+
+    #: Severity floor for escalation. HIGH means HIGH and CRITICAL escalate;
+    #: MEDIUM and below stay in the event log and on the dashboard. A siren
+    #: that fires for every vehicle seen is a siren an operator learns to
+    #: ignore, which is worse than no siren at all.
+    NOTIFY_MIN_SEVERITY: str = "HIGH"
+    #: Events queued per channel before new ones are dropped and counted. This
+    #: bound is what stops a hung endpoint becoming an unbounded memory leak.
+    NOTIFY_QUEUE_SIZE: int = 64
+
+    # -- alarm / siren --------------------------------------------------- #
+    ALARM_ENABLED: bool = False
+    #: HTTP endpoint of an external alarm controller — IP siren, relay board,
+    #: PA controller or a dispatch API. Empty disables the webhook sink.
+    ALARM_WEBHOOK_URL: str = ""
+    #: Shared secret for the X-IBVAP-Signature HMAC-SHA256 header. Empty sends
+    #: the trigger unsigned, which is only safe on an isolated segment.
+    ALARM_WEBHOOK_SECRET: str = ""
+    ALARM_WEBHOOK_TIMEOUT: float = 5.0
+    #: Minimum quiet period per (camera, alert type). Deliberately far longer
+    #: than the event-log cooldowns: the log is scrolled, the siren is heard.
+    ALARM_COOLDOWN_SECONDS: float = 60.0
+    #: BCM pin driving a relay on a single-board host. -1 disables the GPIO
+    #: sink; on an x86 server it stays -1 and the webhook does the work.
+    ALARM_GPIO_PIN: int = -1
+    ALARM_GPIO_DURATION_SECONDS: int = 5
+    #: Many relay boards are active-LOW. Set false for those, or the siren is
+    #: wired permanently on and only discovered at 2 a.m.
+    ALARM_GPIO_ACTIVE_HIGH: bool = True
+
+    # -- SMS ------------------------------------------------------------- #
+    SMS_ENABLED: bool = False
+    #: Primary gateway: "twilio" or "msg91". Whichever is not primary is used
+    #: as a fallback when it is also configured.
+    SMS_PROVIDER: str = "twilio"
+    SMS_COOLDOWN_SECONDS: float = 120.0
+    SMS_TIMEOUT: float = 10.0
+    #: Destination number(s). A comma-separated list is accepted so a post can
+    #: escalate to the duty officer and the section commander at once.
+    SMS_TO_NUMBER: str = ""
+    #: Applied to a number that arrives without one (a bare 10-digit mobile).
+    SMS_DEFAULT_COUNTRY_CODE: str = "91"
+
+    TWILIO_ACCOUNT_SID: str = ""
+    TWILIO_AUTH_TOKEN: str = ""
+    TWILIO_FROM_NUMBER: str = ""
+
+    MSG91_AUTH_KEY: str = ""
+    #: Indian DLT rules require transactional SMS to go out against a
+    #: registered template, so MSG91 uses its v5 flow API rather than free text.
+    MSG91_TEMPLATE_ID: str = ""
+    MSG91_SENDER_ID: str = ""
+    #: Template variable the alert text is passed in as.
+    MSG91_MESSAGE_VAR: str = "MESSAGE"
 
     # ------------------------------------------------------------------ #
     # Video upload / offline analysis
@@ -435,6 +650,23 @@ class Settings(BaseSettings):
     CORS_ORIGINS: list[str] = ["*"]
     #: Cap on concurrent MJPEG viewers per camera.
     MAX_STREAM_CLIENTS: int = 12
+
+    # ------------------------------------------------------------------ #
+    # Hard reset
+    # ------------------------------------------------------------------ #
+    #: Whether ``POST /api/system/hard-reset`` is reachable at all. The CLI
+    #: (``python manage.py hard-reset``) is unaffected — it already requires
+    #: shell access to the host, which is a stronger control than any token.
+    HARD_RESET_ENABLED: bool = True
+    #: Optional shared secret for the endpoint, sent as ``X-Reset-Token`` or
+    #: ``?token=``. Empty means ``?confirm=true`` alone is sufficient, which is
+    #: reasonable on a closed BOP LAN and is not once the API is reachable from
+    #: anywhere else — set this for any deployment beyond a demo machine.
+    HARD_RESET_TOKEN: str = ""
+    #: Whether a hard reset also deletes snapshots, clips, ANPR/face crops,
+    #: registered source videos and processed renders. Off by default: wiping
+    #: the database is recoverable from a backup, deleting evidence is not.
+    HARD_RESET_WIPE_EVIDENCE: bool = False
 
     # ------------------------------------------------------------------ #
     # Derived helpers

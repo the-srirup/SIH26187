@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>IBVAP — Border Surveillance Command</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🛡️</text></svg>">
-<link rel="stylesheet" href="/static/css/style.css?v=2.0.2">
+<link rel="stylesheet" href="/static/css/style.css?v=2.2.0">
 </head>
 <body>
 
@@ -29,6 +29,14 @@
   </div>
 
   <nav class="topbar-actions">
+    <!-- Alerting controls. Both default OFF and are remembered per browser:
+         a siren that starts on its own in a control room is a liability, and
+         Chrome refuses to play audio before a user gesture anyway, so the
+         operator arming it explicitly is both correct and required. -->
+    <button class="btn btn-ghost alert-toggle" id="btn-sound" title="Audible alert on every event, and a continuous tone while a zone is occupied"
+            onclick="IBVAP.toggleSound()"><span class="btn-icon">🔇</span> Sound</button>
+    <button class="btn btn-ghost alert-toggle" id="btn-notify" title="Desktop notification on every alert, even when this tab is in the background"
+            onclick="IBVAP.toggleNotifications()"><span class="btn-icon">🔕</span> Notify</button>
     <button class="btn btn-ghost" data-view="operations" onclick="IBVAP.showView('operations')">Operations</button>
     <button class="btn btn-ghost" data-view="events" onclick="IBVAP.showView('events')">Event Log</button>
     <button class="btn btn-ghost" data-view="analyze" onclick="IBVAP.showView('analyze')">Analyze Video</button>
@@ -40,6 +48,14 @@
   </nav>
 </header>
 
+<!-- Continuous intrusion banner. Shown for as long as something is inside a
+     zone, not for the instant it crossed the boundary. -->
+<div class="zone-banner" id="zone-banner" hidden>
+  <span class="zone-banner-pulse"></span>
+  <span class="zone-banner-text" id="zone-banner-text">ZONE OCCUPIED</span>
+  <span class="zone-banner-detail" id="zone-banner-detail"></span>
+</div>
+
 <div class="statbar" id="statbar">
   <div class="stat"><span class="stat-label">Active Cameras</span><span class="stat-value" id="stat-cameras">0<small>/0</small></span></div>
   <div class="stat"><span class="stat-label">Persons</span><span class="stat-value" id="stat-persons">0</span></div>
@@ -49,6 +65,7 @@
   <div class="stat"><span class="stat-label">Inference</span><span class="stat-value" id="stat-inference">— <small>ms</small></span></div>
   <div class="stat"><span class="stat-label">Latency</span><span class="stat-value" id="stat-latency">— <small>ms</small></span></div>
   <div class="stat"><span class="stat-label">Compute</span><span class="stat-value" id="stat-device">—</span></div>
+  <div class="stat" id="stat-zones-wrap"><span class="stat-label">Zones Occupied</span><span class="stat-value" id="stat-zones">0</span></div>
 </div>
 
 <main class="layout">
@@ -104,15 +121,18 @@
             <option value="">Live + Uploads</option><option value="live">Live only</option><option value="upload">Uploads only</option>
           </select>
           <button class="btn btn-sm" onclick="IBVAP.loadEventLog()">Apply</button>
+          <button class="btn btn-sm btn-ghost" id="btn-export-pdf"
+                  title="Print the filtered event log, with its hash-chain status"
+                  onclick="IBVAP.exportEventLogPdf()">&#128196; PDF</button>
         </div>
       </div>
       <div class="table-scroll">
         <table class="log-table">
           <thead><tr>
             <th>#</th><th>Time (IST)</th><th>Severity</th><th>Event</th><th>Source</th>
-            <th>Object</th><th>Track</th><th>Origin</th><th>Evidence</th><th>Chain</th>
+            <th>Object</th><th>Plate</th><th>Track</th><th>Origin</th><th>Evidence</th><th>Chain</th>
           </tr></thead>
-          <tbody id="log-body"><tr><td colspan="10" class="empty">Loading…</td></tr></tbody>
+          <tbody id="log-body"><tr><td colspan="11" class="empty">Loading…</td></tr></tbody>
         </table>
       </div>
       <div class="pager">
@@ -278,6 +298,6 @@
 </div>
 
 <div class="toast-stack" id="toast-stack"></div>
-<script src="/static/js/app.js?v=2.0.2"></script>
+<script src="/static/js/app.js?v=2.2.0"></script>
 </body>
 </html>

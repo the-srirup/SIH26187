@@ -28,11 +28,42 @@ log = logging.getLogger("ibvap.db")
 
 _is_sqlite = settings.DATABASE_URL.startswith("sqlite")
 
+#: Connection pool, sized for how many threads actually touch this database.
+#:
+#: SQLAlchemy's default for a SQLite file is ``QueuePool(pool_size=5,
+#: max_overflow=10)`` — fifteen connections, and a 30-second wait before the
+#: sixteenth caller raises ``TimeoutError``. That default assumes a request/
+#: response server. This process is not one: every camera runs an analytics
+#: thread that opens a session to seal an event, plus a capture thread; the API
+#: adds up to forty Starlette threadpool workers; and there are background
+#: tasks for checkpoints, evidence and analysis on top. Eight cameras and a
+#: couple of dashboards can exceed fifteen concurrent sessions, and the symptom
+#: when they do is the worst kind: not an error, but every caller stalling for
+#: up to thirty seconds first.
+#:
+#: Pooling is kept rather than switched to ``NullPool``, because it is measured
+#: at 0.355 ms per acquire/query/close against 1.595 ms without — SQLite
+#: reconnects are cheap but not free, and this path runs on every sealed event.
+#: The pool is simply made big enough, and made to fail fast instead of hanging
+#: when something really is wrong.
+_POOL_KWARGS = {
+    "pool_size": 25,
+    "max_overflow": 25,
+    # Fail in five seconds with a clear error rather than freezing a camera
+    # thread for thirty. Exhausting fifty connections is a bug to surface, not
+    # a queue to wait in.
+    "pool_timeout": 5.0,
+    # Recycle idle connections so a long-running deployment never accumulates
+    # handles the OS has quietly dropped.
+    "pool_recycle": 3600,
+} if _is_sqlite else {}
+
 engine = create_engine(
     settings.DATABASE_URL,
     connect_args={"check_same_thread": False, "timeout": 15.0} if _is_sqlite else {},
     pool_pre_ping=True,
     echo=False,
+    **_POOL_KWARGS,
 )
 
 

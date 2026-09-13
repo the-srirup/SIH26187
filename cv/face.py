@@ -39,6 +39,17 @@ except ImportError:
     log.warning("InsightFace not installed — face recognition disabled")
 
 
+#: How often the per-track identity cache is swept for departed tracks. The
+#: sweep is a dict comprehension over a few hundred entries, so it is cheap,
+#: but there is no reason to pay for it on every recognition tick.
+_TRACK_CACHE_SWEEP_SECONDS: float = 30.0
+#: Sweep entries older than FACE_MATCH_CACHE_SECONDS x this. The read path
+#: expires at 1x; sweeping at the same multiple would evict a track that is
+#: merely occluded and force a fresh (expensive) ArcFace embedding when it
+#: reappears, so the sweep deliberately lags behind the read-side TTL.
+_TRACK_CACHE_TTL_FACTOR: float = 4.0
+
+
 @dataclass
 class FaceMatch:
     """Result of matching a detected face against the watchlist."""
@@ -113,6 +124,9 @@ class FaceRecognizer:
         self._track_match_cache: dict[
             tuple, tuple[Optional[int], Optional[str], float, bool, float]
         ] = {}
+        #: Clock for the periodic sweep of the above. Without it the cache only
+        #: ever shed tracks that were still on screen — see _sweep_track_cache.
+        self._last_cache_sweep: float = 0.0
 
         if self._enabled:
             self._init_model()
@@ -147,8 +161,20 @@ class FaceRecognizer:
                 else ["CPUExecutionProvider"]
             )
 
+            # Only the two models this project actually reads.
+            #
+            # ``buffalo_l`` is a *bundle* of five: detection, recognition,
+            # genderage, landmark_2d_106 and landmark_3d_68. Left unrestricted,
+            # ``FaceAnalysis.get()`` runs all five on every detected face — and
+            # this code has only ever used ``bbox``, ``det_score`` and
+            # ``normed_embedding``, so three of the five were pure cost.
+            # Measured on this machine, one ``get()`` over a frame with a single
+            # face: 5818 ms with all modules, 1475 ms with these two. A 3.9x
+            # saving on the most expensive stage in the pipeline, for output
+            # nothing consumed.
             self._app = insightface.app.FaceAnalysis(
-                name="buffalo_l", providers=providers
+                name="buffalo_l", providers=providers,
+                allowed_modules=["detection", "recognition"],
             )
             det = max(128, int(settings.FACE_DET_SIZE))
             self._app.prepare(ctx_id=0, det_size=(det, det))
@@ -466,13 +492,7 @@ class FaceRecognizer:
             matches.append(match)
 
             if track_id is not None:
-                self._track_match_cache[(stream, track_id)] = (
-                    match.watchlist_id,
-                    match.watchlist_name,
-                    match.similarity,
-                    match.matched,
-                    now,
-                )
+                self._remember_match(stream, track_id, match, now)
 
         return matches
 
@@ -744,6 +764,53 @@ class FaceRecognizer:
     def clear_track_cache(self) -> None:
         self._track_match_cache.clear()
 
+    def _remember_match(self, stream: str, track_id: int, match: "FaceMatch",
+                        now: float) -> None:
+        """
+        Cache one track's identity, and sweep departed tracks while here.
+
+        The write and the eviction live in the same method on purpose: this
+        cache leaked because the only pruning was on the *read* path, which by
+        construction only ever visits tracks still on screen. Keeping the two
+        together means a future caller cannot add entries without also paying
+        for the sweep.
+        """
+        self._track_match_cache[(stream, track_id)] = (
+            match.watchlist_id,
+            match.watchlist_name,
+            match.similarity,
+            match.matched,
+            now,
+        )
+        self._sweep_track_cache(now)
+
+    def _sweep_track_cache(self, now: float) -> None:
+        """
+        Drop cached identities for tracks that are never coming back.
+
+        ``_cached_matches_for_frame`` only expires an entry it happens to look
+        at, which means it only ever expires tracks that are *still in view*.
+        A subject who walks out of frame is never looked at again, so their
+        entry stayed forever: on a post running for weeks this is the one
+        structure here that grew without a ceiling, unlike ``_event_debounce``
+        next to it. Entries are worthless once older than the match TTL, so a
+        periodic sweep is enough — and it is cheap because it only runs every
+        ``_TRACK_CACHE_SWEEP_SECONDS``.
+        """
+        if now - self._last_cache_sweep < _TRACK_CACHE_SWEEP_SECONDS:
+            return
+        self._last_cache_sweep = now
+        ttl = max(1.0, float(settings.FACE_MATCH_CACHE_SECONDS))
+        # Keep the TTL generous here: a track briefly occluded should not lose
+        # its identity, so sweep at several times the read-side TTL.
+        cutoff = now - ttl * _TRACK_CACHE_TTL_FACTOR
+        stale = [k for k, v in self._track_match_cache.items() if v[4] < cutoff]
+        for k in stale:
+            self._track_match_cache.pop(k, None)
+        if stale:
+            log.debug("Face cache: released %d departed track(s), %d retained",
+                      len(stale), len(self._track_match_cache))
+
     # ------------------------------------------------------------------ #
     # Pipeline integration
     # ------------------------------------------------------------------ #
@@ -836,4 +903,27 @@ class FaceRecognizer:
 
 # Convenience singleton getter
 def get_face_recognizer() -> FaceRecognizer:
+    """
+    The process-wide recogniser, constructing it on first call.
+
+    Constructing it loads SCRFD and ArcFace, measured at ~6 s on this machine —
+    so never call this from a thread something is waiting on. Test with
+    :func:`face_ready` first, and pay the cost once at startup with
+    :func:`preload_face`, where it belongs.
+    """
     return FaceRecognizer()
+
+
+def face_ready() -> bool:
+    """True when the models are already loaded — a test that never loads them."""
+    instance = FaceRecognizer._instance
+    return instance is not None and bool(getattr(instance, "_initialized", False))
+
+
+def preload_face() -> bool:
+    """Build the recogniser now. Returns False if it could not be loaded."""
+    try:
+        return get_face_recognizer() is not None
+    except Exception:  # pragma: no cover - an absent model must not break boot
+        log.exception("Face recogniser could not be preloaded")
+        return False

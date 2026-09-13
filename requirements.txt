@@ -32,6 +32,7 @@ lap>=0.5.12                    # ByteTrack's linear assignment solver
 fastapi>=0.115.0
 uvicorn[standard]>=0.30.0      # [standard] provides the websockets implementation
 python-multipart>=0.0.9        # multipart form parsing for uploads
+reportlab>=4.0.0             # printable PDF export of the event log
 pydantic-settings>=2.5.0
 
 # --- Persistence -------------------------------------------------------------
@@ -39,6 +40,25 @@ sqlalchemy>=2.0.0              # SQLite at the edge, PostgreSQL at HQ
 
 # --- Monitoring --------------------------------------------------------------
 psutil>=5.9                    # CPU/RAM sampling for benchmark.py and system info
+
+# --- Notifications (alarm siren / SMS escalation) ----------------------------
+requests>=2.31.0               # alarm webhook + MSG91 SMS gateway
+twilio>=8.0.0                  # default SMS provider
+#
+# Both degrade gracefully, like the CV subsystems above. `twilio` is imported
+# behind a guard: without it /api/system/sms/status reports
+# twilio_installed=false and MSG91 (plain HTTP, no extra dependency) is used
+# instead. `requests` has a urllib fallback, so the alarm webhook works even on
+# a minimal install.
+#
+# RPi.GPIO is deliberately NOT listed: it only installs on a Raspberry Pi and
+# would break `pip install -r requirements.txt` everywhere else. Install it on
+# the single-board host only if you are driving a relay directly:
+#
+#     pip install RPi.GPIO
+#
+# Without it, a configured ALARM_GPIO_PIN logs one warning and the alarm falls
+# back to its webhook sink.
 
 # --- Optional subsystems -----------------------------------------------------
 # Both degrade gracefully: if the import fails the feature reports itself as

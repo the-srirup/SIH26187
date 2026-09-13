@@ -432,10 +432,24 @@ class Detector:
         self._infer_times: list[float] = []
         self._infer_count = 0
 
-        self._queue: "queue.Queue[_InferenceRequest]" = queue.Queue(maxsize=64)
+        #: Frames waiting for a forward pass.
+        #:
+        #: Sized to a couple of batches, not to a backlog. Every entry holds a
+        #: whole frame — 737 KB at 640x384 — so the old cap of 64 was 47 MB of
+        #: queued pixels, and a frame that waits behind 63 others is answered
+        #: with an inference of something that happened four seconds ago. This
+        #: is a latest-frame pipeline: when the GPU falls behind, the right
+        #: answer is to shed frames at the door (``raw_detect`` logs and drops)
+        #: rather than to buffer work that is stale before it is read.
+        self._queue: "queue.Queue[_InferenceRequest]" = queue.Queue(
+            maxsize=max(4, int(settings.INFERENCE_BATCH_MAX) * 2)
+        )
         self._batch_thread: Optional[threading.Thread] = None
         self._batch_running = False
         self._batch_sizes: list[int] = []
+        #: Frames dropped because the queue was full — a real number the
+        #: dashboard can show, instead of silent latency.
+        self._shed = 0
 
         resolved = self._resolve_weights(self.model_path)
         try:
@@ -644,9 +658,16 @@ class Detector:
         if self._batch_running and self._batch_thread and self._batch_thread.is_alive():
             request = _InferenceRequest(frame=frame)
             try:
-                self._queue.put(request, timeout=2.0)
+                # A short wait, not a long one. Blocking here blocks a camera's
+                # analytics thread; if the queue has not drained within one
+                # frame interval the frame is already stale and shedding it is
+                # strictly better than delaying every frame behind it.
+                self._queue.put(request, timeout=0.25)
             except queue.Full:
-                log.warning("Inference queue saturated — shedding frame")
+                self._shed += 1
+                if self._shed % 30 == 1:
+                    log.warning("Inference queue saturated — shedding frames "
+                                "(%d so far)", self._shed)
                 return (*self._empty(), (time.perf_counter() - t0) * 1000.0)
 
             if not request.done.wait(timeout=20.0):

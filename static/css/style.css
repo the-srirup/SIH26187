@@ -206,6 +206,59 @@ label { display: block; font-size: 11.5px; color: var(--text-dim);
 .camera-tile.alerting { border-color: var(--critical); box-shadow: 0 0 0 1px var(--critical); }
 .camera-video { position: relative; aspect-ratio: 640/384; background: #05070a; }
 .camera-video img { width: 100%; height: 100%; object-fit: contain; display: block; }
+/* ----------------------------------------------- playback + frozen frame */
+.camera-frozen {
+  position: absolute; inset: 0; width: 100%; height: 100%;
+  object-fit: contain; display: block; background: #05070a;
+  transform-origin: center center; will-change: transform;
+}
+.camera-tile.tile-paused .camera-video { cursor: zoom-in; }
+.camera-tile.tile-zoomed .camera-frozen { cursor: grab; }
+.camera-tile.tile-zoomed .camera-frozen:active { cursor: grabbing; }
+/* The held frame is a still, and an operator must never mistake one for a
+   live picture — so a paused tile says so, unmissably. */
+.camera-tile.tile-paused .camera-video::before {
+  content: "PAUSED"; position: absolute; z-index: 3;
+  top: 8px; right: 8px;
+  font-size: 9px; font-weight: 700; letter-spacing: .1em;
+  padding: 3px 7px; border-radius: 3px;
+  background: rgba(255,138,0,.92); color: #1a1000;
+  pointer-events: none;
+}
+.zoom-bar {
+  position: absolute; z-index: 4; left: 8px; top: 8px;
+  display: flex; align-items: center; gap: 4px;
+  background: rgba(4,7,11,.82); border: 1px solid var(--line);
+  border-radius: var(--radius); padding: 3px 5px;
+}
+.zoom-btn {
+  background: none; border: none; color: var(--text-dim);
+  font-family: inherit; font-size: 12px; font-weight: 700;
+  line-height: 1; padding: 3px 6px; cursor: pointer; border-radius: 3px;
+}
+.zoom-btn:hover { background: var(--bg-input); color: var(--text); }
+.zoom-level {
+  font-size: 10px; font-variant-numeric: tabular-nums;
+  color: var(--text); min-width: 30px; text-align: center;
+}
+.camera-playback {
+  display: flex; align-items: center; gap: 8px;
+  padding: 6px 11px; border-top: 1px solid var(--line-soft);
+}
+.pb-btn {
+  background: var(--bg-input); border: 1px solid var(--line);
+  color: var(--text); border-radius: var(--radius);
+  font-size: 10px; line-height: 1; padding: 5px 9px; cursor: pointer;
+  min-width: 32px;
+}
+.pb-btn:hover { border-color: var(--accent); }
+.pb-btn.paused { background: var(--accent); color: #04121c; border-color: var(--accent); }
+.pb-speed-wrap { display: flex; align-items: center; gap: 5px; }
+.pb-speed-wrap.unsupported { opacity: .45; }
+.pb-label { font-size: 10px; color: var(--text-dim); margin: 0; }
+.pb-speed { padding: 3px 5px; font-size: 10.5px; }
+.pb-note { font-size: 10px; color: var(--text-faint); margin-left: auto;
+           font-variant-numeric: tabular-nums; }
 .camera-badge {
   position: absolute; top: 34px; left: 8px;
   display: inline-flex; align-items: center; gap: 6px;
@@ -214,6 +267,17 @@ label { display: block; font-size: 11.5px; color: var(--text-dim);
   font-size: 11px; font-weight: 650; letter-spacing: .04em;
 }
 .camera-badge .dot { width: 7px; height: 7px; }
+/* A tile beyond the live-stream budget refreshes from stills instead of
+   holding an MJPEG socket open. Labelled so nobody mistakes the lower frame
+   rate for a struggling camera. */
+.camera-tile.tile-snapshot .camera-video::after {
+  content: "SNAPSHOT";
+  position: absolute; left: 8px; bottom: 8px;
+  font-size: 9px; font-weight: 700; letter-spacing: .08em;
+  padding: 2px 6px; border-radius: 3px;
+  background: rgba(4,7,11,.72); color: var(--text-dim);
+  border: 1px solid var(--line); pointer-events: none;
+}
 .camera-night {
   position: absolute; top: 34px; right: 8px;
   padding: 3px 8px; border-radius: 4px; font-size: 10.5px; font-weight: 650;
@@ -418,6 +482,22 @@ label { display: block; font-size: 11.5px; color: var(--text-dim);
 .fence-actions .input { flex: 1; min-width: 160px; }
 .fence-existing { margin-top: 16px; border-top: 1px solid var(--line-soft); padding-top: 12px; }
 .fence-existing h3 { font-size: 12px; color: var(--text-dim); margin-bottom: 8px; }
+/* ------------------------------------------------------- plate chip */
+/* A registration is read as a unit, so it is set in a monospaced face with
+   the letter spacing a plate actually has. Unverified reads are muted rather
+   than hidden: an observation is still worth reviewing. */
+.plate-evidence img { image-rendering: crisp-edges; max-height: 140px;
+                      width: auto; background: #05070a; }
+.plate-chip {
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: 10.5px; font-weight: 700; letter-spacing: .06em;
+  padding: 2px 6px; border-radius: 3px; white-space: nowrap;
+  background: var(--bg-input); color: var(--text-dim);
+  border: 1px solid var(--line);
+}
+.plate-chip.verified { color: #ffd98a; border-color: #6b5420; background: #2a2213; }
+.col-plate { white-space: nowrap; }
+
 .rule-row { display: flex; align-items: center; gap: 10px;
             background: var(--bg-raised); border: 1px solid var(--line);
             border-radius: var(--radius); padding: 7px 11px; margin-bottom: 6px; }
@@ -508,3 +588,56 @@ label { display: block; font-size: 11.5px; color: var(--text-dim);
 /* Night-mode chip carries its measured reason, so the UI explains the state
    rather than merely asserting it. */
 .camera-night { cursor: help; }
+
+
+/* ------------------------------------------------------------------------- */
+/* Continuous intrusion signal                                               */
+/*                                                                            */
+/* A zone being occupied is a condition, not a moment, so it gets a persistent */
+/* banner rather than a toast that fades. It stays up, and keeps pulsing, for  */
+/* exactly as long as something is inside a polygon.                          */
+/* ------------------------------------------------------------------------- */
+.zone-banner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 18px;
+  background: linear-gradient(90deg, rgba(220, 38, 38, .22), rgba(220, 38, 38, .06));
+  border-top: 1px solid rgba(248, 113, 113, .45);
+  border-bottom: 1px solid rgba(248, 113, 113, .45);
+  color: #fecaca;
+  font-weight: 600;
+  letter-spacing: .06em;
+  font-size: .78rem;
+  text-transform: uppercase;
+}
+.zone-banner.breached {
+  background: linear-gradient(90deg, rgba(220, 38, 38, .42), rgba(220, 38, 38, .14));
+  color: #fff;
+}
+.zone-banner-pulse {
+  width: 10px; height: 10px; border-radius: 50%;
+  background: #ef4444;
+  box-shadow: 0 0 0 0 rgba(239, 68, 68, .8);
+  animation: zone-pulse 1.4s infinite;
+  flex: none;
+}
+.zone-banner-detail { font-weight: 400; opacity: .85; letter-spacing: .02em; }
+@keyframes zone-pulse {
+  0%   { box-shadow: 0 0 0 0 rgba(239, 68, 68, .8); }
+  70%  { box-shadow: 0 0 0 12px rgba(239, 68, 68, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0); }
+}
+
+/* A camera tile whose zone is occupied keeps a ring for as long as it is. */
+.camera-tile.zone-occupied .camera-frame { outline: 2px solid rgba(248, 113, 113, .55); outline-offset: -2px; }
+.camera-tile.zone-breached .camera-frame { outline: 3px solid #ef4444; outline-offset: -3px; }
+
+/* Armed alert toggles read as armed. */
+.alert-toggle.armed { color: #34d399; border-color: rgba(52, 211, 153, .5); }
+.alert-toggle.denied { opacity: .55; text-decoration: line-through; }
+
+/* Respect an operator who has asked the OS for reduced motion. */
+@media (prefers-reduced-motion: reduce) {
+  .zone-banner-pulse { animation: none; }
+}

@@ -83,6 +83,53 @@ def test_delete_camera(client, api_camera):
     assert client.get(f"/api/cameras/{api_camera['id']}").status_code == 404
 
 
+def test_a_removed_camera_disappears_from_every_listing(client, api_camera, db):
+    """
+    "Removed" has to mean the same thing on every endpoint.
+
+    ``/health`` selected every non-upload row, archived ones included, so a
+    deployment that had removed 42 cameras reported all 42 back with
+    ``is_active=false`` and ``fps=0`` — which reads as a system carrying dozens
+    of dead cameras, and makes the removals look like they silently failed.
+    """
+    camera_id = api_camera["id"]
+    # Give it an event so it is archived rather than deleted: the archived path
+    # is the one that used to leak into listings.
+    from core.events import EventManager
+    from cv.rules import Alert as RuleAlert
+
+    EventManager.get().record(
+        camera_id=camera_id,
+        rule_alert=RuleAlert(rule_name="t", rule_type="line", track_id=1,
+                             alert_type="fence_crossing", description="x"),
+        frame=None, camera_name="API-CAM", capture_evidence=False,
+    )
+
+    body = client.delete(f"/api/cameras/{camera_id}").json()
+    assert body["ok"] and body["mode"] == "archived"
+
+    health = client.get("/health").json()
+    assert camera_id not in {c["id"] for c in health["cameras"]}
+    assert health["cameras_registered"] == len(health["cameras"])
+    assert camera_id not in {c["id"] for c in client.get("/api/cameras").json()}
+    assert camera_id not in {
+        c["id"] for c in client.get("/api/cameras?include_uploads=true").json()
+    }
+    assert client.get(f"/stream/{camera_id}").status_code == 404
+    assert client.post(f"/api/cameras/{camera_id}/restart").status_code == 404
+    # The sealed event — and the chain it belongs to — survive untouched.
+    assert client.get("/api/integrity/verify").json()["valid"] is True
+
+
+def test_delete_is_idempotent_over_http(client, api_camera):
+    """A double-clicked Remove button must not produce a 500."""
+    camera_id = api_camera["id"]
+    first = client.delete(f"/api/cameras/{camera_id}")
+    second = client.delete(f"/api/cameras/{camera_id}")
+    assert first.status_code == second.status_code == 200
+    assert second.json()["already_removed"] is True
+
+
 def test_unknown_camera_is_404(client):
     assert client.get("/api/cameras/999999").status_code == 404
 
@@ -95,6 +142,83 @@ def test_upload_pseudo_camera_hidden_by_default(client):
     assert all(c["source_kind"] != "upload" for c in default)
     included = client.get("/api/cameras?include_uploads=true").json()
     assert any(c["source_kind"] == "upload" for c in included)
+
+
+# -------------------------------------------------------------- hard reset
+
+
+def test_hard_reset_refuses_without_confirmation(client, api_camera):
+    """An accidental POST must not be able to wipe a deployment."""
+    response = client.post("/api/system/hard-reset")
+    assert response.status_code == 400
+    assert "confirm=true" in response.json()["detail"]
+    # Nothing happened.
+    assert client.get(f"/api/cameras/{api_camera['id']}").status_code == 200
+
+
+def test_hard_reset_clears_the_system(client, api_camera, db):
+    from core.models import Alert, Camera, Rule
+
+    client.post(f"/api/cameras/{api_camera['id']}/rules", data={
+        "rule_type": "line", "name": "T", "geometry": json.dumps([[0, 0], [10, 10]]),
+    })
+    from core.events import EventManager
+    from cv.rules import Alert as RuleAlert
+
+    EventManager.get().record(
+        camera_id=api_camera["id"],
+        rule_alert=RuleAlert(rule_name="t", rule_type="line", track_id=1,
+                             alert_type="fence_crossing", description="x"),
+        frame=None, camera_name="API-CAM", capture_evidence=False,
+    )
+
+    body = client.post("/api/system/hard-reset?confirm=true").json()
+    assert body["ok"] and body["rows_deleted_total"] > 0
+
+    db.expire_all()
+    assert db.query(Camera).count() == 0
+    assert db.query(Rule).count() == 0
+    assert db.query(Alert).count() == 0
+    assert client.get("/api/cameras").json() == []
+    assert client.get("/health").json()["cameras"] == []
+    assert client.get("/api/alerts").json()["alerts"] == []
+    assert client.get("/api/integrity/verify").json()["valid"] is True
+
+
+def test_the_api_is_usable_immediately_after_a_hard_reset(client, api_camera):
+    """After a reset an operator adds a camera — that must simply work."""
+    assert client.post("/api/system/hard-reset?confirm=true").status_code == 200
+
+    created = client.post("/api/cameras", data={
+        "name": "POST-RESET", "url": "samples/sample_border_scenario.mp4",
+        "is_active": "false",
+    })
+    assert created.status_code == 201
+    assert created.json()["id"] == 1
+    assert [c["id"] for c in client.get("/api/cameras").json()] == [1]
+
+
+def test_hard_reset_honours_a_configured_token(client, api_camera, monkeypatch):
+    from core.config import settings
+
+    monkeypatch.setattr(settings, "HARD_RESET_TOKEN", "s3cret")
+    assert client.post("/api/system/hard-reset?confirm=true").status_code == 403
+    assert client.post(
+        "/api/system/hard-reset?confirm=true&token=wrong"
+    ).status_code == 403
+
+    ok = client.post("/api/system/hard-reset?confirm=true",
+                     headers={"X-Reset-Token": "s3cret"})
+    assert ok.status_code == 200
+
+
+def test_hard_reset_can_be_disabled(client, monkeypatch):
+    from core.config import settings
+
+    monkeypatch.setattr(settings, "HARD_RESET_ENABLED", False)
+    response = client.post("/api/system/hard-reset?confirm=true")
+    assert response.status_code == 403
+    assert "disabled" in response.json()["detail"]
 
 
 # ------------------------------------------------------------------- rules

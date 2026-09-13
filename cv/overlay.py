@@ -174,13 +174,21 @@ def draw_rules(img: np.ndarray, rule_shapes: Sequence[dict],
     ``rule_shapes`` is a pre-computed list of
     ``{"type", "name", "geometry", "active"}`` dicts — the pipeline caches
     these in memory so the renderer never touches the database.
+
+    A shape may also carry ``occupied`` and ``breached``. An occupied polygon
+    is tinted and labelled for as long as something is inside it, and a
+    breached one — occupied past its dwell threshold — is drawn in alert
+    colour. That is the difference between a fence that reports a crossing and
+    a zone that shows an intrusion in progress: the operator who looks up
+    thirty seconds late still sees it.
     """
     if not rule_shapes:
         return
     if occupied is None:
         occupied = []
 
-    filled = None
+    filled = None      # armed but empty polygons — a faint hint
+    heavy = None       # occupied polygons — a strong, continuous signal
     for shape in rule_shapes:
         geom = shape.get("geometry") or []
         rtype = shape.get("type")
@@ -209,20 +217,42 @@ def draw_rules(img: np.ndarray, rule_shapes: Sequence[dict],
                        occupied=occupied)
 
         elif rtype in ("zone", "loiter") and len(geom) >= 3:
-            colour = C_LOITER if rtype == "loiter" else C_ZONE
-            pts = np.array(geom, dtype=np.int32).reshape((-1, 1, 2))
+            is_occupied = bool(shape.get("occupied"))
+            is_breached = bool(shape.get("breached"))
+            base = C_LOITER if rtype == "loiter" else C_ZONE
+            # Three states, three appearances, held for as long as the state
+            # holds: armed and empty (thin outline, faint tint), occupied
+            # (thicker outline, stronger tint), breached (alert colour). An
+            # operator can read the current situation off a still frame.
+            colour = C_ALERT if is_breached else base
+            weight = 3 if is_occupied else 2
+            if heavy is None:
+                heavy = img.copy()
             if filled is None:
                 filled = img.copy()
-            cv2.fillPoly(filled, [pts], colour)
-            cv2.polylines(img, [pts], True, colour, 2, cv2.LINE_AA)
+            pts = np.array(geom, dtype=np.int32).reshape((-1, 1, 2))
+            cv2.fillPoly(heavy if is_occupied else filled, [pts], colour)
+            cv2.polylines(img, [pts], True, colour, weight, cv2.LINE_AA)
+
             label = "LOITER ZONE" if rtype == "loiter" else "RESTRICTED ZONE"
-            draw_label(img, f"{label}: {name}",
+            if is_occupied:
+                count = int(shape.get("count") or 0)
+                suffix = f" — OCCUPIED{f' x{count}' if count > 1 else ''}"
+                if is_breached:
+                    suffix = f" — INTRUSION{f' x{count}' if count > 1 else ''}"
+                label = f"{label}: {name}{suffix}"
+            else:
+                label = f"{label}: {name}"
+            draw_label(img, label,
                        (int(geom[0][0]), int(geom[0][1])), colour, scale=0.42,
                        occupied=occupied)
 
+    # Two blend passes, not one per shape: empty polygons stay a faint hint,
+    # occupied ones are unmistakable without hiding the subject inside them.
     if filled is not None:
-        # One blend pass for all polygons — cheaper than per-shape compositing.
         cv2.addWeighted(filled, 0.16, img, 0.84, 0, dst=img)
+    if heavy is not None:
+        cv2.addWeighted(heavy, 0.34, img, 0.66, 0, dst=img)
 
 
 def draw_plates(img: np.ndarray, plates: Iterable,

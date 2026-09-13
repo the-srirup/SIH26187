@@ -18,6 +18,33 @@ const IBVAP = (() => {
   const MAX_FEED = 60;                  // alert cards retained in the live feed
   const PAGE_SIZE = 50;
 
+  /*
+   * Live-stream connection budget.
+   *
+   * A browser opens at most 6 concurrent HTTP/1.1 connections per origin, and
+   * an MJPEG tile holds one of them open forever — the response never ends,
+   * which is the whole point of the format. With six tiles streaming, all six
+   * slots are permanently occupied and every other request the dashboard makes
+   * queues behind them and never runs: the 1 Hz stats poll, the event log, the
+   * snapshot that seeds the fence canvas, even the DELETE behind the Remove
+   * button. Measured: with 5 streams open /health answered in 4 ms; with 6 it
+   * never answered at all, and closing one stream recovered it instantly.
+   *
+   * The symptom is nasty because it does not look like a network problem — the
+   * already-open video keeps moving and WebSocket alerts keep arriving (a
+   * separate pool), so the page looks alive while every control is dead.
+   *
+   * So live streams are capped below the limit and the remaining tiles refresh
+   * from single-frame snapshots, which return their connection between frames.
+   * Slower video on the overflow tiles, and a dashboard that keeps working.
+   */
+  const STREAM_BUDGET = 4;              // leaves 2 of the browser's 6 for the API
+  const SNAPSHOT_INTERVAL_MS = 1000;    // refresh rate for tiles beyond the budget
+  //: Digital-zoom bounds for a paused tile. Past about 8x on a 640x384 frame
+  //: there are no more pixels to show, only bigger ones.
+  const ZOOM_MIN = 1;
+  const ZOOM_MAX = 8;
+
   const state = {
     cameras: [],
     tiles: new Map(),                   // camera_id -> DOM refs
@@ -33,6 +60,17 @@ const IBVAP = (() => {
     camera: { kind: 'live', file: null },
     frame: { width: 640, height: 384 },
     deviceLabel: '—',
+    // Alerting. Both default OFF: a control room where the speakers start on
+    // their own is a liability, and browsers block audio before a user gesture
+    // anyway. The choice is remembered per browser.
+    alerting: { sound: false, notify: false, wantedSound: false,
+                lastNotifiedId: 0, lastZoneSoundAt: 0,
+                // Filled from /api/system/info so retuning NOTIFY_MIN_SEVERITY
+                // on the server is enough; the front end has no second copy.
+                redSeverities: ['HIGH', 'CRITICAL'],
+                severityOrder: { INFO: 0, LOW: 1, MEDIUM: 2, HIGH: 3, CRITICAL: 4 },
+                minSeverity: 'HIGH' },
+    zones: { occupied: 0, breached: 0, cameras: new Map() },
   };
 
   /* ----------------------------------------------------------- utilities */
@@ -40,6 +78,273 @@ const IBVAP = (() => {
   const $ = (id) => document.getElementById(id);
   const esc = (s) => String(s ?? '').replace(/[&<>"']/g,
     (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+  /* --------------------------------------------------------- alert signals */
+
+  /**
+   * Audible alerting, synthesised rather than loaded.
+   *
+   * The tone is generated with the Web Audio API instead of shipping an .mp3
+   * for three reasons that matter at a Border Out Post: there is no file to
+   * fetch, so it works on a LAN with no internet and cannot be delayed by a
+   * slow first load; it costs nothing in the page weight; and the pitch and
+   * length can carry meaning — a short double beep for an ordinary event, a
+   * lower urgent triple for a CRITICAL one, and a slow repeating pulse while a
+   * zone stays occupied.
+   *
+   * The AudioContext is created lazily on the operator's click, because every
+   * browser now refuses to start audio without a user gesture. Creating it at
+   * load would produce a context stuck in "suspended" and silence with no
+   * error — the classic "why is the alarm not working" bug.
+   */
+  const Sound = (() => {
+    let ctx = null;
+
+    function context() {
+      if (!ctx) {
+        const Ctor = window.AudioContext || window.webkitAudioContext;
+        if (!Ctor) return null;
+        ctx = new Ctor();
+      }
+      if (ctx.state === 'suspended') ctx.resume().catch(() => {});
+      return ctx;
+    }
+
+    /** One beep: a sine partial plus a square partial so it cuts through room noise. */
+    function beep(startAt, freq, seconds, gainPeak) {
+      const audio = context();
+      if (!audio) return;
+      const t0 = audio.currentTime + startAt;
+      const gain = audio.createGain();
+      gain.gain.setValueAtTime(0.0001, t0);
+      gain.gain.exponentialRampToValueAtTime(gainPeak, t0 + 0.012);
+      gain.gain.exponentialRampToValueAtTime(0.0001, t0 + seconds);
+      gain.connect(audio.destination);
+
+      [['sine', freq, 1], ['square', freq * 2, 0.25]].forEach(([type, f, mix]) => {
+        const osc = audio.createOscillator();
+        osc.type = type;
+        osc.frequency.setValueAtTime(f, t0);
+        const sub = audio.createGain();
+        sub.gain.value = mix;
+        osc.connect(sub); sub.connect(gain);
+        osc.start(t0);
+        osc.stop(t0 + seconds + 0.02);
+      });
+    }
+
+    /**
+     * A rising-falling siren, for a CRITICAL alert only.
+     *
+     * A sweep rather than discrete beeps because a sweep is what the ear
+     * reads as an alarm — it is the shape every emergency signal uses, and it
+     * stays recognisable through room noise and a cheap speaker in a way a
+     * short tone does not.
+     */
+    function siren(sweeps, gainPeak) {
+      const audio = context();
+      if (!audio) return;
+      const t0 = audio.currentTime;
+      const sweep = 0.55;
+      const gain = audio.createGain();
+      gain.gain.setValueAtTime(0.0001, t0);
+      gain.gain.exponentialRampToValueAtTime(gainPeak, t0 + 0.05);
+      gain.gain.setValueAtTime(gainPeak, t0 + sweeps * sweep - 0.08);
+      gain.gain.exponentialRampToValueAtTime(0.0001, t0 + sweeps * sweep);
+      gain.connect(audio.destination);
+
+      const osc = audio.createOscillator();
+      osc.type = 'sawtooth';                 // harmonically rich: it carries
+      osc.frequency.setValueAtTime(520, t0);
+      for (let n = 0; n < sweeps; n += 1) {
+        osc.frequency.linearRampToValueAtTime(980, t0 + n * sweep + sweep / 2);
+        osc.frequency.linearRampToValueAtTime(520, t0 + (n + 1) * sweep);
+      }
+      osc.connect(gain);
+      osc.start(t0);
+      osc.stop(t0 + sweeps * sweep + 0.05);
+    }
+
+    return {
+      /** Verify the browser will actually make a noise, and say so. */
+      prime() {
+        const audio = context();
+        if (!audio) return false;
+        beep(0, 880, 0.07, 0.18);
+        return true;
+      },
+
+      /**
+       * Sound an event, graded by severity.
+       *
+       * Only a red alert makes a sound at all. Everything below it — a passing
+       * car, a plate read, a face seen — is logged and shown and stays silent,
+       * because a console that chirps at routine traffic is a console whose
+       * operator stops hearing it.
+       */
+      event(severity) {
+        if (!state.alerting.sound) return;
+        const level = String(severity || '').toUpperCase();
+        if (!state.alerting.redSeverities.includes(level)) return;
+
+        if (level === 'CRITICAL') {
+          siren(3, 0.42);                    // loudest, longest, unmistakable
+        } else {
+          beep(0.00, 780, 0.13, 0.30);       // HIGH: a firm two-tone alarm
+          beep(0.18, 620, 0.18, 0.30);
+        }
+      },
+      /** The continuous one: a slow pulse held while a zone stays occupied. */
+      zonePulse(breached) {
+        if (!state.alerting.sound) return;
+        const now = Date.now();
+        const gap = breached ? 1600 : 3200;   // urgent zones repeat faster
+        if (now - state.alerting.lastZoneSoundAt < gap) return;
+        state.alerting.lastZoneSoundAt = now;
+        beep(0.00, breached ? 520 : 660, 0.14, breached ? 0.30 : 0.18);
+        if (breached) beep(0.19, 415, 0.20, 0.30);
+      },
+    };
+  })();
+
+  /**
+   * Desktop notifications, so an operator watching another window still knows.
+   *
+   * Permission is requested only when the operator turns the feature on — a
+   * page that asks on load is the pattern browsers now auto-deny, which would
+   * leave the feature permanently unavailable with no way back except digging
+   * through site settings. Notifications are deduplicated by alert id and
+   * tagged per camera, so a burst replaces itself in the tray instead of
+   * stacking twenty cards.
+   */
+  const Notifier = {
+    supported() { return 'Notification' in window; },
+
+    async enable() {
+      if (!this.supported()) return 'unsupported';
+      if (Notification.permission === 'granted') return 'granted';
+      if (Notification.permission === 'denied') return 'denied';
+      try { return await Notification.requestPermission(); }
+      catch { return 'denied'; }
+    },
+
+    /**
+     * Raise a desktop notification — for a red alert, and nothing else.
+     *
+     * This is the difference between a system an operator trusts and one they
+     * mute. On a road-facing camera the routine types dominate by an order of
+     * magnitude (90 `vehicle_detected` rows in a 45-second run), and a tray
+     * card for each of them buries the intrusion that arrives between them.
+     * Severity is graded server-side and the threshold is served with it, so
+     * this check and the log always agree on what counts.
+     */
+    show(alert) {
+      if (!state.alerting.notify || !this.supported()) return;
+      if (Notification.permission !== 'granted') return;
+      const level = String(alert.severity || '').toUpperCase();
+      if (!state.alerting.redSeverities.includes(level)) return;
+      if (alert.id && alert.id <= state.alerting.lastNotifiedId) return;
+      if (alert.id) state.alerting.lastNotifiedId = alert.id;
+      try {
+        const note = new Notification(`${alert.icon || '⚠️'} ${alert.title || alert.alert_type}`, {
+          body: `${alert.camera_name || 'Camera'} · ${alert.severity || ''}\n${alert.description || ''}`.trim(),
+          tag: `ibvap-cam-${alert.camera_id}`,   // one live card per camera
+          renotify: true,
+          requireInteraction: alert.severity === 'CRITICAL',
+          silent: true,                          // our own tone is the sound
+        });
+        note.onclick = () => {
+          window.focus();
+          showView('events');
+          note.close();
+        };
+        // Ordinary alerts clear themselves; a CRITICAL one is left for the
+        // operator to dismiss, which is what requireInteraction above asks for.
+        if (alert.severity !== 'CRITICAL') setTimeout(() => note.close(), 12000);
+      } catch { /* a notification must never break the dashboard */ }
+    },
+  };
+
+  function toggleSound() {
+    state.alerting.sound = !state.alerting.sound;
+    if (state.alerting.sound && !Sound.prime()) {
+      state.alerting.sound = false;
+      toast('This browser will not play audio.', 'err');
+    } else {
+      toast(state.alerting.sound ? 'Alert sound armed' : 'Alert sound muted', 'ok');
+    }
+    persistAlerting();
+    renderAlertToggles();
+  }
+
+  async function toggleNotifications() {
+    if (state.alerting.notify) {
+      state.alerting.notify = false;
+      toast('Desktop notifications off', 'ok');
+    } else {
+      const result = await Notifier.enable();
+      if (result === 'granted') {
+        state.alerting.notify = true;
+        toast('Desktop notifications armed', 'ok');
+      } else if (result === 'denied') {
+        toast('Notifications are blocked for this site — allow them in the '
+              + 'browser\u2019s site settings, then try again.', 'err', 8000);
+      } else {
+        toast('This browser does not support notifications.', 'err');
+      }
+    }
+    persistAlerting();
+    renderAlertToggles();
+  }
+
+  function persistAlerting() {
+    try {
+      localStorage.setItem('ibvap.alerting', JSON.stringify({
+        sound: state.alerting.sound, notify: state.alerting.notify,
+      }));
+    } catch { /* private window, or storage disabled — the session still works */ }
+  }
+
+  function restoreAlerting() {
+    try {
+      const saved = JSON.parse(localStorage.getItem('ibvap.alerting') || '{}');
+      // Sound stays off until the operator clicks: the browser needs a gesture
+      // before it will play anything, so restoring it "on" would be a lie.
+      state.alerting.sound = false;
+      state.alerting.notify = Boolean(saved.notify)
+        && Notifier.supported() && Notification.permission === 'granted';
+      state.alerting.wantedSound = Boolean(saved.sound);
+    } catch { /* ignore */ }
+    renderAlertToggles();
+  }
+
+  function renderAlertToggles() {
+    const sound = $('btn-sound');
+    const notify = $('btn-notify');
+    // Declared for the whole function: both buttons describe the same
+    // escalation set, and scoping this to the Sound branch made the Notify
+    // branch throw a ReferenceError that killed the rest of init().
+    const red = state.alerting.redSeverities.join(' / ');
+    if (sound) {
+      sound.classList.toggle('armed', state.alerting.sound);
+      sound.innerHTML = `<span class="btn-icon">${state.alerting.sound ? '🔊' : '🔇'}</span> Sound`;
+      sound.title = state.alerting.sound
+        ? `Audible alerts on for ${red} only. Click to mute.`
+        : (state.alerting.wantedSound
+            ? 'Audible alerts were on last time — click once to re-arm (browsers require a click before playing audio).'
+            : `Siren on CRITICAL, alarm on HIGH, silent below. Routine detections never sound.`);
+    }
+    if (notify) {
+      const blocked = Notifier.supported() && Notification.permission === 'denied';
+      notify.classList.toggle('armed', state.alerting.notify);
+      notify.classList.toggle('denied', blocked);
+      notify.innerHTML = `<span class="btn-icon">${state.alerting.notify ? '🔔' : '🔕'}</span> Notify`;
+      notify.title = blocked
+        ? 'Blocked for this site — allow notifications in the browser\u2019s site settings.'
+        : `Desktop notification for ${red} alerts only — intrusions, not routine `
+          + 'detections — even when this tab is in the background.';
+    }
+  }
 
   function toast(message, kind = 'info', ms = 4200) {
     const el = document.createElement('div');
@@ -140,6 +445,51 @@ const IBVAP = (() => {
       }
     });
     grid.querySelector('.placeholder')?.remove();
+    // A new tile starts in 'idle' and is given its mode here, so the number of
+    // open MJPEG connections is decided in exactly one place.
+    rebalanceStreams();
+  }
+
+  /**
+   * Hand the live-stream budget to the tiles that most deserve it.
+   *
+   * Preference goes to tiles actually on screen: an operator scrolled down to
+   * cameras 7-9 wants those live, not the three at the top they cannot see.
+   * Everything else falls back to snapshot refresh. Called whenever the set of
+   * tiles changes or the operator scrolls.
+   */
+  function rebalanceStreams() {
+    const tiles = [...state.tiles.entries()];
+    if (!tiles.length) return;
+
+    const viewportH = window.innerHeight || 1080;
+    const scored = tiles.map(([id, tile]) => {
+      let visible = 0;
+      try {
+        const r = tile.root.getBoundingClientRect();
+        // Fraction of the tile inside the viewport, 0 when fully off screen.
+        const overlap = Math.max(0, Math.min(r.bottom, viewportH) - Math.max(r.top, 0));
+        visible = r.height > 0 ? overlap / r.height : 0;
+      } catch { /* detached mid-rebalance */ }
+      return { id, tile, visible };
+    });
+
+    // Most-visible first; ties keep grid order so the assignment is stable and
+    // tiles do not flip between modes on every scroll tick.
+    scored.sort((a, b) => b.visible - a.visible);
+
+    // A paused tile holds a still and has deliberately released its
+    // connection, so it is not in the running for the budget at all. Without
+    // this, a scroll would re-open its stream behind the frozen picture and
+    // take back the socket the pause had just handed to the rest of the page.
+    let live = 0;
+    scored.forEach((entry) => {
+      try {
+        if (entry.tile.isPaused) return;
+        if (live < STREAM_BUDGET) { entry.tile.goLive(); live += 1; }
+        else entry.tile.goSnapshot();
+      } catch { /* tile destroyed while we were deciding */ }
+    });
   }
 
   function buildTile(cam) {
@@ -147,7 +497,14 @@ const IBVAP = (() => {
     root.className = 'camera-tile';
     root.innerHTML = `
       <div class="camera-video">
-        <img alt="${esc(cam.name)} feed" loading="lazy">
+        <img alt="${esc(cam.name)} feed" decoding="async">
+        <canvas class="camera-frozen" hidden></canvas>
+        <div class="zoom-bar" hidden>
+          <button class="zoom-btn zoom-out" title="Zoom out">&minus;</button>
+          <span class="zoom-level">1.0x</span>
+          <button class="zoom-btn zoom-in" title="Zoom in">+</button>
+          <button class="zoom-btn zoom-reset" title="Fit">Fit</button>
+        </div>
         <div class="camera-badge"><span class="dot"></span><span class="b-status">CONNECTING</span></div>
         <div class="camera-source-badge ${cam.is_file_source ? 'file' : ''}"
              title="${esc(cam.is_file_source
@@ -166,6 +523,20 @@ const IBVAP = (() => {
           <span><b class="m-lat">—</b> ms</span>
         </div>
       </div>
+      <div class="camera-playback">
+        <button class="pb-btn pb-toggle" title="Pause the picture (analysis keeps running)">&#10073;&#10073;</button>
+        <span class="pb-speed-wrap">
+          <label class="pb-label">Speed</label>
+          <select class="pb-speed select select-sm">
+            <option value="0.5">0.5x</option>
+            <option value="0.75">0.75x</option>
+            <option value="1" selected>1x</option>
+            <option value="1.5">1.5x</option>
+            <option value="2">2x</option>
+          </select>
+        </span>
+        <span class="pb-note"></span>
+      </div>
       <div class="camera-tools">
         <button class="btn btn-sm">Draw Fence</button>
         <button class="btn btn-sm btn-ghost">Restart</button>
@@ -174,6 +545,13 @@ const IBVAP = (() => {
       </div>`;
 
     const img = root.querySelector('img');
+    // Decode off the main thread where the browser supports it. An MJPEG
+    // <img> is re-decoded on every frame, and doing that synchronously on the
+    // main thread is a frame-time spike on the same thread that renders the
+    // rest of the dashboard — visible as a stutter the moment a camera is
+    // added. (`loading="lazy"` was also removed from the markup: deferring
+    // the load of a live stream only delays the first frame.)
+    img.decoding = 'async';
     // Reconnect with exponential backoff, and stop entirely once the camera is
     // gone from our state.
     //
@@ -187,20 +565,240 @@ const IBVAP = (() => {
     // from the client side rather than the pipeline.
     let retryDelay = 1000;
     let retryTimer = null;
-    const connect = () => {
+    let snapTimer = null;
+    let mode = 'idle';                          // 'live' | 'snapshot' | 'idle'
+
+    const stopSnapshots = () => {
+      if (snapTimer) { clearInterval(snapTimer); snapTimer = null; }
+    };
+
+    /** Live MJPEG: one connection, held open for as long as the tile shows. */
+    const goLive = () => {
+      if (mode === 'live') return;
+      stopSnapshots();
+      mode = 'live';
+      root.classList.remove('tile-snapshot');
       img.src = `/stream/${cam.id}?t=${Date.now()}`;
     };
+
+    /**
+     * Snapshot mode: one short request per refresh, so the connection is
+     * returned to the pool between frames instead of being held forever.
+     * Lower frame rate, but it costs no permanent socket.
+     */
+    const goSnapshot = () => {
+      if (mode === 'snapshot') return;
+      mode = 'snapshot';
+      root.classList.add('tile-snapshot');
+      img.src = '';                             // end any MJPEG response first
+      const refresh = () => {
+        if (!state.tiles.has(cam.id) || mode !== 'snapshot') return;
+        img.src = `/api/cameras/${cam.id}/snapshot?t=${Date.now()}`;
+      };
+      refresh();
+      stopSnapshots();
+      snapTimer = setInterval(refresh, SNAPSHOT_INTERVAL_MS);
+    };
+
     img.onload = () => { retryDelay = 1000; };
     img.onerror = () => {
+      if (mode === 'snapshot') return;          // a missed still is not an outage
+      if (mode === 'frozen' || paused) return;  // we closed this stream on purpose
       if (retryTimer) return;                   // one retry in flight at a time
       if (!state.tiles.has(cam.id)) return;     // camera removed — do not retry
       retryTimer = setTimeout(() => {
         retryTimer = null;
-        if (state.tiles.has(cam.id)) connect();
+        if (state.tiles.has(cam.id) && mode === 'live') {
+          img.src = `/stream/${cam.id}?t=${Date.now()}`;
+        }
       }, retryDelay);
       retryDelay = Math.min(retryDelay * 2, 30000);
     };
-    connect();
+
+    /* ------------------------------------------------------- frozen frame */
+    // Pausing copies the frame currently on screen into a canvas and shows
+    // that instead of the <img>. Two reasons it is a canvas and not just a
+    // stopped stream: an MJPEG <img> whose src is cleared goes blank rather
+    // than holding its last frame, and a canvas can be zoomed and panned
+    // without refetching anything.
+    const frozen = root.querySelector('.camera-frozen');
+    const fctx = frozen.getContext('2d');
+
+    function freezeTile() {
+      const w = img.naturalWidth || state.frame.width;
+      const h = img.naturalHeight || state.frame.height;
+      try {
+        frozen.width = w;
+        frozen.height = h;
+        fctx.drawImage(img, 0, 0, w, h);
+      } catch {
+        return false;             // nothing decoded yet — leave the stream up
+      }
+      frozen.hidden = false;
+      img.hidden = true;
+      // Releasing the MJPEG connection while paused also hands a socket back
+      // to the browser's per-origin pool, which the rest of the page needs.
+      //
+      // Leaving `mode` on 'live' here was a bug: clearing src aborts the
+      // request, which fires img.onerror, whose reconnect timer then saw a
+      // 'live' tile and re-opened the stream behind the frozen picture —
+      // quietly taking back the very socket the pause had just released.
+      stopSnapshots();
+      mode = 'frozen';
+      img.src = '';
+      resetZoom();
+      return true;
+    }
+
+    function unfreezeTile() {
+      frozen.hidden = true;
+      img.hidden = false;
+      resetZoom();
+      mode = 'idle';              // force the allocator to re-open a stream
+      rebalanceStreams();
+    }
+
+    /* --------------------------------------------------------------- zoom */
+    // Digital zoom on the held frame. Only meaningful while paused: the point
+    // is to inspect a face, a plate or a figure at the treeline in the frame
+    // the operator stopped on. Zoom is applied as a CSS transform on the
+    // canvas, so panning costs no redraw and the pixels stay as sharp as the
+    // source frame allows.
+    let zoom = 1;
+    let panX = 0;
+    let panY = 0;
+
+    function clampPan() {
+      // Never let the picture be dragged off its own frame: at zoom z the
+      // image overhangs by (z-1)/2 of its size in each direction.
+      const limit = Math.max(0, (zoom - 1) / (2 * zoom)) * 100;
+      panX = Math.max(-limit, Math.min(limit, panX));
+      panY = Math.max(-limit, Math.min(limit, panY));
+    }
+
+    function paintZoom() {
+      clampPan();
+      frozen.style.transform =
+        `scale(${zoom}) translate(${panX}%, ${panY}%)`;
+      root.classList.toggle('tile-zoomed', zoom > 1);
+      const badge = root.querySelector('.zoom-level');
+      if (badge) badge.textContent = `${zoom.toFixed(1)}x`;
+    }
+
+    function setZoom(next, originX, originY) {
+      const before = zoom;
+      zoom = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, next));
+      if (zoom === before) return;
+      if (zoom === 1) { panX = 0; panY = 0; }
+      else if (originX != null) {
+        // Keep the point under the cursor roughly still as we scale, which is
+        // what makes wheel-zoom feel like magnifying rather than sliding.
+        const shift = (1 / before - 1 / zoom) * 50;
+        panX -= (originX - 0.5) * 2 * shift;
+        panY -= (originY - 0.5) * 2 * shift;
+      }
+      paintZoom();
+    }
+
+    function resetZoom() { zoom = 1; panX = 0; panY = 0; paintZoom(); }
+
+    frozen.addEventListener('wheel', (e) => {
+      if (!paused) return;
+      e.preventDefault();
+      const r = frozen.getBoundingClientRect();
+      setZoom(zoom * (e.deltaY < 0 ? 1.25 : 0.8),
+              (e.clientX - r.left) / r.width, (e.clientY - r.top) / r.height);
+    }, { passive: false });
+
+    frozen.addEventListener('dblclick', () => {
+      if (paused) setZoom(zoom > 1 ? 1 : 2);
+    });
+
+    // Drag to pan, in the frame's own percentage space so it is independent of
+    // how large the tile happens to be rendered.
+    let dragging = null;
+    frozen.addEventListener('pointerdown', (e) => {
+      if (!paused || zoom <= 1) return;
+      dragging = { x: e.clientX, y: e.clientY, panX, panY };
+      frozen.setPointerCapture(e.pointerId);
+    });
+    frozen.addEventListener('pointermove', (e) => {
+      if (!dragging) return;
+      const r = frozen.getBoundingClientRect();
+      panX = dragging.panX + ((e.clientX - dragging.x) / r.width) * 100;
+      panY = dragging.panY + ((e.clientY - dragging.y) / r.height) * 100;
+      paintZoom();
+    });
+    const endDrag = (e) => {
+      if (!dragging) return;
+      dragging = null;
+      try { frozen.releasePointerCapture(e.pointerId); } catch { /* already gone */ }
+    };
+    frozen.addEventListener('pointerup', endDrag);
+    frozen.addEventListener('pointercancel', endDrag);
+
+    /* ---------------------------------------------------- playback control */
+    // Pause is a *view* control. On a recording the server stops the decoder so
+    // the footage waits; on a live camera it only holds the published picture
+    // while capture, analytics and event sealing carry on — so freezing a tile
+    // to look at something never blinds the post.
+    const pbToggle = root.querySelector('.pb-toggle');
+    const pbSpeed = root.querySelector('.pb-speed');
+    const pbNote = root.querySelector('.pb-note');
+    const pbWrap = root.querySelector('.pb-speed-wrap');
+    let paused = false;
+
+    const paintPlayback = () => {
+      pbToggle.innerHTML = paused ? '&#9654;' : '&#10073;&#10073;';
+      pbToggle.title = paused
+        ? 'Resume the live picture'
+        : 'Pause the picture (analysis keeps running)';
+      pbToggle.classList.toggle('paused', paused);
+      root.classList.toggle('tile-paused', paused);
+      // Zoom only makes sense on a held frame, so its controls follow pause.
+      const bar = root.querySelector('.zoom-bar');
+      if (bar) bar.hidden = !paused;
+    };
+
+    root.querySelector('.zoom-in').onclick = () => setZoom(zoom * 1.5);
+    root.querySelector('.zoom-out').onclick = () => setZoom(zoom / 1.5);
+    root.querySelector('.zoom-reset').onclick = () => resetZoom();
+
+    async function applyPlayback(body, optimistic) {
+      try {
+        const state = await api(`/api/cameras/${cam.id}/playback`, {
+          method: 'POST', body: form(body),
+        });
+        paused = !!state.paused;
+        if (state.speed) pbSpeed.value = String(state.speed);
+        // A live camera cannot be played faster than it happens, so the server
+        // reports whether speed means anything here rather than pretending.
+        pbWrap.classList.toggle('unsupported', !state.speed_supported);
+        pbSpeed.disabled = !state.speed_supported;
+        pbNote.textContent = state.speed_supported
+          ? (state.paused ? 'Paused' : `${state.effective_fps} fps`)
+          : 'Live source — real time';
+        paintPlayback();
+        return state;
+      } catch (err) {
+        paused = optimistic;              // roll back to what the server has
+        paintPlayback();
+        toast(err.message, 'err');
+        return null;
+      }
+    }
+
+    pbToggle.onclick = () => {
+      const want = !paused;
+      paused = want;                      // optimistic, so the button feels instant
+      paintPlayback();
+      // Freeze what is on screen right now, so the held picture is the frame
+      // the operator was looking at rather than whatever arrives next.
+      if (want) freezeTile(); else unfreezeTile();
+      applyPlayback({ paused: String(want) }, !want);
+    };
+    pbSpeed.onchange = () => applyPlayback({ speed: pbSpeed.value }, paused);
+    paintPlayback();
 
     const [fence, restart, events, remove] = root.querySelectorAll('.camera-tools .btn');
     fence.onclick = () => openFence(cam.id, cam.name);
@@ -217,11 +815,17 @@ const IBVAP = (() => {
       // Clearing the handler first, then the src, is what actually closes it.
       destroy() {
         if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
+        stopSnapshots();
+        mode = 'idle';
         img.onerror = null;
         img.onload = null;
         img.src = '';
         root.remove();
       },
+      goLive,
+      goSnapshot,
+      get streamMode() { return mode; },
+      get isPaused() { return paused; },
       dot: root.querySelector('.camera-badge .dot'),
       status: root.querySelector('.b-status'),
       night: root.querySelector('.camera-night'),
@@ -232,7 +836,66 @@ const IBVAP = (() => {
     return root;
   }
 
+  /**
+   * Hold the zone-occupancy signal for as long as a zone is occupied.
+   *
+   * Entering and leaving a polygon are moments, and the event feed already
+   * records them. Being *inside* one is a condition, and a condition has to be
+   * shown continuously or an operator who looks up thirty seconds after the
+   * entry event sees an empty screen and assumes the area is clear. So this is
+   * driven by state on the 1 Hz stats frame rather than by events: the banner
+   * stays up, the tiles keep their ring, and the tone keeps pulsing, until the
+   * backend says the polygon is empty again.
+   */
+  function renderZoneOccupancy(cameraStats) {
+    let occupied = 0;
+    let breached = 0;
+    const names = [];
+
+    cameraStats.forEach((s) => {
+      const zones = s.zones || [];
+      const camOccupied = zones.filter((z) => z.occupied);
+      const camBreached = zones.filter((z) => z.breached);
+      occupied += camOccupied.length;
+      breached += camBreached.length;
+      camOccupied.forEach((z) => {
+        const seconds = Math.round(z.seconds || 0);
+        names.push(`${s.name}·${z.rule}${seconds ? ` (${seconds}s)` : ''}`);
+      });
+
+      const tile = state.tiles.get(s.camera_id);
+      if (tile) {
+        tile.root.classList.toggle('zone-occupied', camOccupied.length > 0);
+        tile.root.classList.toggle('zone-breached', camBreached.length > 0);
+      }
+    });
+
+    state.zones.occupied = occupied;
+    state.zones.breached = breached;
+
+    const zonesStat = $('stat-zones');
+    if (zonesStat) zonesStat.textContent = String(occupied);
+
+    const banner = $('zone-banner');
+    if (banner) {
+      banner.hidden = occupied === 0;
+      banner.classList.toggle('breached', breached > 0);
+      if (occupied) {
+        $('zone-banner-text').textContent = breached
+          ? `INTRUSION IN PROGRESS — ${breached} zone${breached > 1 ? 's' : ''}`
+          : `ZONE OCCUPIED — ${occupied} zone${occupied > 1 ? 's' : ''}`;
+        $('zone-banner-detail').textContent = names.slice(0, 4).join('   ·   ')
+          + (names.length > 4 ? `   · +${names.length - 4} more` : '');
+      }
+    }
+
+    // The continuous audible signal. Sound.zonePulse rate-limits itself, so
+    // calling it once a second produces a slow pulse, not a stutter.
+    if (occupied) Sound.zonePulse(breached > 0);
+  }
+
   function updateTiles(cameraStats) {
+    renderZoneOccupancy(cameraStats);
     cameraStats.forEach((s) => {
       const tile = state.tiles.get(s.camera_id);
       if (!tile) return;
@@ -240,13 +903,20 @@ const IBVAP = (() => {
       // "Error" used to render identically as a red OFFLINE dot, so an operator
       // could not tell a stream that needs a few more seconds from one whose
       // URL is wrong.
+      // Every assignment below can invalidate layout, and this runs once a
+      // second for every camera. Writing only what actually changed keeps a
+      // multi-camera dashboard from doing a full style recalculation every
+      // tick for values that are usually identical to last time.
       const colour = { green: 'dot-ok', amber: 'dot-warn', red: 'dot-down',
                        grey: 'dot-idle' }[s.state_colour] || 'dot-down';
-      tile.dot.className = `dot ${colour}`;
-      tile.status.textContent = s.online
-        ? 'LIVE'
-        : (s.state_label || 'OFFLINE').toUpperCase();
-      tile.status.title = s.state_detail || '';
+      const dotClass = `dot ${colour}`;
+      if (tile.dot.className !== dotClass) tile.dot.className = dotClass;
+
+      const statusText = s.online ? 'LIVE' : (s.state_label || 'OFFLINE').toUpperCase();
+      if (tile.status.textContent !== statusText) tile.status.textContent = statusText;
+      const statusTitle = s.state_detail || '';
+      if (tile.status.title !== statusTitle) tile.status.title = statusTitle;
+
       tile.root.classList.toggle('offline', !s.online);
       tile.night.hidden = !s.night_mode;
       if (s.night_mode && s.scene) {
@@ -261,9 +931,12 @@ const IBVAP = (() => {
           + `\nDark pixels ${Math.round((s.scene.dark_fraction || 0) * 100)}%`
           + `\nReason: ${s.scene.source}`;
       }
-      tile.fps.textContent = s.fps.toFixed(1);
-      tile.obj.textContent = s.detections;
-      tile.lat.textContent = Math.round(s.latency_ms);
+      const fps = s.fps.toFixed(1);
+      if (tile.fps.textContent !== fps) tile.fps.textContent = fps;
+      const objects = String(s.detections);
+      if (tile.obj.textContent !== objects) tile.obj.textContent = objects;
+      const latency = String(Math.round(s.latency_ms));
+      if (tile.lat.textContent !== latency) tile.lat.textContent = latency;
     });
   }
 
@@ -427,28 +1100,110 @@ const IBVAP = (() => {
   function pushAlert(alert) {
     state.alerts.unshift(alert);
     if (state.alerts.length > MAX_FEED) state.alerts.length = MAX_FEED;
-    renderAlertFeed(alert.id);
+    appendAlertToFeed(alert);              // O(1) DOM work, not a full rebuild
     flashTile(alert.camera_id);
+    const knownType = state.alertTypes.has(alert.alert_type);
     state.alertTypes.add(alert.alert_type);
-    refreshTypeFilter();
+    // Rebuilding the filter dropdown re-lays-out the toolbar; only do it when
+    // a genuinely new alert type has appeared, which is rare.
+    if (!knownType) refreshTypeFilter();
     if (alert.severity === 'CRITICAL') {
       toast(`${alert.icon} ${alert.title} — ${alert.camera_name}`, 'err', 7000);
     }
+    // Audible and desktop signals, so an operator who is not looking at this
+    // tab still finds out. Both are no-ops unless armed.
+    Sound.event(alert.severity);
+    Notifier.show(alert);
   }
 
+  /**
+   * Rebuild the whole feed. Used when the filter changes or the feed is reset —
+   * NOT on every incoming alert; see `appendAlertToFeed`.
+   *
+   * A full rebuild throws away up to MAX_FEED cards and builds them again, and
+   * the browser must re-layout and repaint all of them. Doing that per alert is
+   * what made the dashboard stutter the moment a webcam was added: a camera
+   * pointed at a person emits `human_detected` several times a second, so the
+   * page was tearing down and rebuilding sixty DOM nodes at that rate, on the
+   * main thread, competing with the MJPEG decode for the same frame budget.
+   */
   function renderAlertFeed(freshId = null) {
     const filter = $('alert-filter').value;
     const list = filter ? state.alerts.filter((a) => a.severity === filter) : state.alerts;
     const feed = $('alert-feed');
+    bindFeedDelegation(feed);
 
     if (!list.length) {
       feed.innerHTML = '<p class="empty">Monitoring. No alerts yet.</p>';
       return;
     }
     feed.innerHTML = list.map((a) => alertCard(a, a.id === freshId)).join('');
-    feed.querySelectorAll('.alert-card').forEach((card) => {
-      card.onclick = () => openAlert(Number(card.dataset.id));
+  }
+
+  /**
+   * One click listener for the whole feed, attached once.
+   *
+   * The previous code attached a fresh `onclick` to every card on every render:
+   * sixty closures created and sixty discarded per alert. Delegation means one
+   * listener for the life of the page, and cards become plain markup that can
+   * be inserted without any JavaScript bookkeeping.
+   */
+  function bindFeedDelegation(feed) {
+    if (!feed || feed.dataset.delegated === '1') return;
+    feed.dataset.delegated = '1';
+    feed.addEventListener('click', (event) => {
+      const card = event.target.closest('.alert-card');
+      if (card && feed.contains(card)) openAlert(Number(card.dataset.id));
     });
+  }
+
+  /**
+   * Add one alert to the top of the feed without touching the other cards.
+   *
+   * Cost is O(1) in DOM work instead of O(MAX_FEED), which is the difference
+   * between a feed that keeps up with a busy camera and one that makes the
+   * whole page judder. Inserts are coalesced into one animation frame so a
+   * burst of alerts costs a single layout pass rather than one each.
+   */
+  let feedPending = [];
+  let feedFlushQueued = false;
+
+  function appendAlertToFeed(alert) {
+    feedPending.push(alert);
+    if (feedFlushQueued) return;
+    feedFlushQueued = true;
+    requestAnimationFrame(() => {
+      feedFlushQueued = false;
+      const batch = feedPending;
+      feedPending = [];
+      flushFeed(batch);
+    });
+  }
+
+  function flushFeed(batch) {
+    const feed = $('alert-feed');
+    if (!feed) return;
+    bindFeedDelegation(feed);
+
+    const filter = $('alert-filter').value;
+    const visible = batch.filter((a) => !filter || a.severity === filter);
+    if (!visible.length) return;
+
+    feed.querySelector('.empty')?.remove();
+
+    // Newest first, so insert in reverse and prepend each.
+    const fragment = document.createDocumentFragment();
+    visible.forEach((a) => {
+      const holder = document.createElement('div');
+      holder.innerHTML = alertCard(a, true);
+      const card = holder.firstElementChild;
+      if (card) fragment.appendChild(card);
+    });
+    feed.prepend(fragment);
+
+    // Trim the tail to the retention cap — removing nodes is cheap; rebuilding
+    // the ones that stay is not.
+    while (feed.children.length > MAX_FEED) feed.lastElementChild.remove();
   }
 
   function alertCard(a, fresh) {
@@ -472,6 +1227,28 @@ const IBVAP = (() => {
   }
 
   function clearFeed() { state.alerts = []; renderAlertFeed(); }
+
+  /**
+   * The server was hard-reset: empty this tab to match.
+   *
+   * Reloading the camera list is what actually matters. Every tile holds an
+   * <img> on an MJPEG stream, and after a reset those cameras are gone — so
+   * each tile would sit in its reconnect backoff hitting a 404 forever. Letting
+   * renderCameras() destroy them is what closes those connections.
+   */
+  function onSystemReset(info) {
+    state.alerts = [];
+    state.alertTypes.clear();
+    state.logOffset = 0;
+    state.logTotal = 0;
+    renderZoneOccupancy([]);          // no cameras, so no zone can be occupied
+    refreshTypeFilter();
+    renderAlertFeed();
+    loadCameras();
+    if (state.view === 'events') loadEventLog();
+    toast(info?.detail || 'System reset — all cameras and events cleared.',
+          'ok', 7000);
+  }
 
   function refreshTypeFilter() {
     const select = $('log-type');
@@ -506,6 +1283,18 @@ const IBVAP = (() => {
       evidence.push(`<figure><figcaption>Evidence clip (pre + post event)</figcaption>
         <video src="${a.clip_url}" controls preload="metadata"></video></figure>`);
     }
+    // The pixels the registration was actually read from. Without them the
+    // plate is an assertion; with them it is evidence an operator can check.
+    if (a.plate) {
+      evidence.push(`<figure class="plate-evidence">
+        <figcaption>Number plate crop — read as
+          <b>${esc(a.plate)}</b>${a.plate_confidence != null
+            ? ` at ${Math.round(a.plate_confidence * 100)}% OCR confidence` : ''}
+          ${a.plate_verified ? '· matches Indian plate format'
+                             : '· format unverified'}</figcaption>
+        <img src="/api/alerts/${a.id}/plate" alt="Number plate crop"
+             onerror="this.closest('figure').querySelector('figcaption').insertAdjacentHTML('beforeend','<br><span class=&quot;muted&quot;>crop not retained</span>'); this.remove();"></figure>`);
+    }
 
     return `
       <div class="detail-head">
@@ -526,6 +1315,8 @@ const IBVAP = (() => {
         ${cell('Confidence', a.confidence ? `${(a.confidence * 100).toFixed(1)}%` : '—')}
         ${cell('Produced by', a.analysis_kind)}
         ${cell('Rule', a.rule_name || '—')}
+        ${a.plate ? cell('Number plate', a.plate) : ''}
+        ${a.watchlist_name ? cell('Watchlist match', a.watchlist_name) : ''}
         ${cell('Source', a.source_type === 'upload' ? 'Uploaded video' : 'Live camera')}
       </div>
 
@@ -567,14 +1358,32 @@ const IBVAP = (() => {
       $('log-next').disabled = to >= data.total;
     } catch (err) {
       $('log-body').innerHTML =
-        `<tr><td colspan="10" class="empty">Could not load log: ${esc(err.message)}</td></tr>`;
+        `<tr><td colspan="11" class="empty">Could not load log: ${esc(err.message)}</td></tr>`;
     }
+  }
+
+  /**
+   * The registration recorded against an event, if any.
+   *
+   * A plate read is the substance of an ANPR event, so it belongs in the row
+   * rather than inside the details of the row. Unverified reads are marked,
+   * because a registration that does not match the plate grammar is a reading
+   * rather than an identification.
+   */
+  function plateCell(alert) {
+    if (!alert.plate) return '—';
+    const verified = alert.plate_verified;
+    const confidence = alert.plate_confidence != null
+      ? ` ${Math.round(alert.plate_confidence * 100)}%` : '';
+    return `<span class="plate-chip${verified ? ' verified' : ''}"
+      title="${esc(alert.plate)}${confidence}${verified ? ' · matches Indian plate format' : ' · format unverified'}"
+      >${esc(alert.plate)}</span>`;
   }
 
   function renderEventLog(alerts) {
     const body = $('log-body');
     if (!alerts.length) {
-      body.innerHTML = '<tr><td colspan="10" class="empty">No events match these filters.</td></tr>';
+      body.innerHTML = '<tr><td colspan="11" class="empty">No events match these filters.</td></tr>';
       return;
     }
     body.innerHTML = alerts.map((a) => `
@@ -585,14 +1394,64 @@ const IBVAP = (() => {
         <td>${a.icon || ''} ${esc(a.title)}</td>
         <td>${esc(a.camera_name)}</td>
         <td>${a.object_class ? esc(a.object_class.toUpperCase()) : '—'}</td>
+        <td class="col-plate">${plateCell(a)}</td>
         <td class="col-id">${a.track_id ? `#${a.track_id}` : '—'}</td>
         <td><span class="alert-kind ${a.analysis_kind === 'AI DETECTION' ? 'ai' : ''}">${esc(a.analysis_kind)}</span></td>
-        <td>${a.has_snapshot ? '📷' : ''}${a.has_clip ? ' 🎬' : ''}${!a.has_snapshot && !a.has_clip ? '—' : ''}</td>
+        <td>${a.has_snapshot ? '📷' : ''}${a.has_clip ? ' 🎬' : ''}${a.plate ? ' 🔢' : ''}${!a.has_snapshot && !a.has_clip && !a.plate ? '—' : ''}</td>
         <td class="col-hash" title="${esc(a.hash)}">${esc((a.hash || '').slice(0, 10))}…</td>
       </tr>`).join('');
     body.querySelectorAll('tr[data-id]').forEach((row) => {
       row.onclick = () => openAlert(Number(row.dataset.id));
     });
+  }
+
+  /**
+   * Download the filtered event log as a PDF.
+   *
+   * The same filters the operator is looking at, so the printout matches the
+   * screen. Fetched as a blob rather than opened in a tab: the endpoint sends
+   * Content-Disposition: attachment, and a plain navigation would leave the
+   * dashboard — and its live streams — for a download the browser then throws
+   * away the tab for.
+   */
+  async function exportEventLogPdf() {
+    const button = $('btn-export-pdf');
+    const original = button ? button.innerHTML : '';
+    const params = new URLSearchParams({ limit: 1000 });
+    const add = (key, value) => { if (value) params.set(key, value); };
+    add('camera_id', $('log-camera').value);
+    add('alert_type', $('log-type').value);
+    add('severity', $('log-severity').value);
+    add('source_type', $('log-source').value);
+    add('search', $('log-search').value.trim());
+
+    if (button) { button.disabled = true; button.innerHTML = 'Building…'; }
+    try {
+      const response = await fetch(`/api/alerts/export.pdf?${params}`);
+      if (!response.ok) {
+        let detail = `${response.status} ${response.statusText}`;
+        try { detail = (await response.json()).detail || detail; } catch { /* not JSON */ }
+        throw new Error(detail);
+      }
+      const blob = await response.blob();
+      const name = (response.headers.get('Content-Disposition') || '')
+        .match(/filename="?([^"]+)"?/)?.[1] || 'ibvap-event-log.pdf';
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = name;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      // Revoke on the next turn: revoking synchronously can cancel the
+      // download in some browsers before it has read the blob.
+      setTimeout(() => URL.revokeObjectURL(url), 10000);
+      toast(`Event log saved as ${name}`, 'ok');
+    } catch (err) {
+      toast(`PDF export failed: ${err.message}`, 'err');
+    } finally {
+      if (button) { button.disabled = false; button.innerHTML = original; }
+    }
   }
 
   function pageEvents(direction) {
@@ -1188,6 +2047,7 @@ const IBVAP = (() => {
         case 'checkpoint':
           toast(`Merkle checkpoint sealed over ${message.data.alert_count} event(s)`, 'ok');
           break;
+        case 'system_reset': onSystemReset(message.data); break;
       }
     };
 
@@ -1237,6 +2097,7 @@ const IBVAP = (() => {
   function init() {
     tickClock();
     setInterval(tickClock, 1000);
+    restoreAlerting();
 
     connectWebSocket();
     loadCameras();
@@ -1246,6 +2107,18 @@ const IBVAP = (() => {
     const canvas = $('fence-canvas');
     canvas.addEventListener('click', onFenceClick);
     canvas.addEventListener('dblclick', onFenceDouble);
+
+    // Which tiles are on screen decides which ones get a live socket, so the
+    // budget is re-cut when the operator scrolls or resizes. Coalesced into one
+    // animation frame: a scroll fires these far faster than they matter.
+    let rebalanceQueued = false;
+    const queueRebalance = () => {
+      if (rebalanceQueued) return;
+      rebalanceQueued = true;
+      requestAnimationFrame(() => { rebalanceQueued = false; rebalanceStreams(); });
+    };
+    window.addEventListener('scroll', queueRebalance, { passive: true });
+    window.addEventListener('resize', queueRebalance);
 
     // Drag-and-drop for both the offline-analysis zone and the Add Camera
     // video-source zone. Same behaviour, so it is wired once.
@@ -1271,6 +2144,15 @@ const IBVAP = (() => {
     });
 
     api('/api/system/info').then((info) => {
+      // Adopt the server's escalation policy rather than keeping a second copy.
+      const policy = info.alerting || {};
+      if (Array.isArray(policy.red_alert_severities) && policy.red_alert_severities.length) {
+        state.alerting.redSeverities = policy.red_alert_severities;
+      }
+      if (policy.severity_order) state.alerting.severityOrder = policy.severity_order;
+      if (policy.notify_min_severity) state.alerting.minSeverity = policy.notify_min_severity;
+      renderAlertToggles();
+
       const limits = info.limits || {};
       $('upload-limit').textContent = limits.upload_max_mb ?? 512;
 
@@ -1302,8 +2184,9 @@ const IBVAP = (() => {
 
   return {
     showView, loadCameras, openCameraModal, submitCamera, restartCamera, removeCamera,
+    toggleSound, toggleNotifications,
     setCameraKind, cameraFileChosen,
-    renderAlertFeed, clearFeed, openAlert, loadEventLog, pageEvents,
+    renderAlertFeed, clearFeed, openAlert, loadEventLog, pageEvents, exportEventLogPdf,
     openFence, setFenceMode, saveFence, resetFenceDraft, deleteRule, toggleRule,
     fileChosen, startAnalysis, cancelAnalysis, showAnalysisEvents, loadAnalysisHistory,
     loadSystem, verifyIntegrity, makeCheckpoint, downloadCertificate,

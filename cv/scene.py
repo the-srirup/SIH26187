@@ -92,6 +92,9 @@ class SceneCondition:
     saturation: float = 255.0
     #: Mean per-pixel channel spread; ~0 only for a true monochrome sensor.
     channel_spread: float = 255.0
+    #: Luma standard deviation — how much scene structure the frame contains.
+    #: Near zero means a flat fill (placeholder frame, covered lens), not a view.
+    luma_std: float = 0.0
     #: True when the frame looks like an IR / monochrome night-vision image.
     infrared: bool = False
     #: How many consecutive frames currently agree with the pending change.
@@ -108,6 +111,7 @@ class SceneCondition:
             "dark_fraction": round(self.dark_fraction, 3),
             "saturation": round(self.saturation, 1),
             "channel_spread": round(self.channel_spread, 2),
+            "luma_std": round(self.luma_std, 2),
             "infrared": self.infrared,
             "streak": self.streak,
             "samples": self.samples,
@@ -214,10 +218,19 @@ class SceneIlluminationEstimator:
             (as_int.max(axis=2) - as_int.min(axis=2)).mean()
         )
 
-        return mean_luma, dark_fraction, saturation, channel_spread
+        # Luma spread across the frame — "is there a scene here at all".
+        # A real view, lit or dark, has structure. A frame with almost no
+        # variance is a flat fill: a virtual-camera placeholder, a lens cap, a
+        # driver that has not started delivering. That distinction is what the
+        # infrared test below needs, because a flat grey fill otherwise looks
+        # exactly like a monochrome sensor.
+        luma_std = float(grey.std())
+
+        return mean_luma, dark_fraction, saturation, channel_spread, luma_std
 
     def _score(self, mean_luma: float, dark_fraction: float,
-               saturation: float, channel_spread: float) -> tuple[float, bool]:
+               saturation: float, channel_spread: float,
+               luma_std: float) -> tuple[float, bool]:
         """
         Fuse the three signals into a 0-1 darkness score.
 
@@ -247,12 +260,27 @@ class SceneIlluminationEstimator:
         # frame also has zero saturation and zero channel spread, but calling it
         # "infrared" would report the wrong reason for a correct decision — it
         # is simply dark, and the brightness signals already say so.
+        # Colourlessness alone is not enough, and assuming it was is what made
+        # a phone used as a webcam report night in a lit room. Two more things
+        # must hold before a monochrome frame is read as night vision:
+        #
+        #   * the frame must contain a *scene*. A uniform fill has zero colour
+        #     and zero channel spread, so a grey placeholder frame — exactly
+        #     what a virtual-camera driver emits before the phone connects —
+        #     satisfied every colour test and was declared infrared night at
+        #     mean luma 128. Real IR footage is highly textured.
+        #   * the frame must actually be dim, and an IR illuminator lights a
+        #     cone and leaves the rest of the scene black, so a genuine night
+        #     vision frame always carries some truly dark pixels. A washed-out
+        #     daylight view has none.
         infrared = (
             settings.NIGHT_DETECT_INFRARED
             and score < self.enter_threshold
             and saturation < settings.NIGHT_IR_SATURATION_MAX
             and channel_spread < settings.NIGHT_IR_CHANNEL_SPREAD_MAX
             and mean_luma < settings.NIGHT_IR_LUMA_MAX
+            and luma_std >= settings.NIGHT_IR_MIN_LUMA_STD
+            and dark_fraction >= settings.NIGHT_IR_MIN_DARK_FRACTION
         )
         if infrared:
             score = max(score, settings.NIGHT_IR_SCORE)
@@ -269,9 +297,9 @@ class SceneIlluminationEstimator:
         it is why a camera flash or a passing headlight cannot toggle night
         analytics.
         """
-        mean_luma, dark_fraction, saturation, channel_spread = self._probe(frame)
+        mean_luma, dark_fraction, saturation, channel_spread, luma_std =             self._probe(frame)
         raw_score, infrared = self._score(
-            mean_luma, dark_fraction, saturation, channel_spread
+            mean_luma, dark_fraction, saturation, channel_spread, luma_std
         )
 
         # Exponential smoothing over the fused score.
@@ -319,6 +347,7 @@ class SceneIlluminationEstimator:
                 dark_fraction=dark_fraction,
                 saturation=saturation,
                 channel_spread=channel_spread,
+                luma_std=luma_std,
                 infrared=infrared,
                 streak=self._streak,
                 samples=self._samples,

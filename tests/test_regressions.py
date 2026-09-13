@@ -17,6 +17,93 @@ from core.config import settings
 
 
 # --------------------------------------------------------------------------- #
+# The analytics pipeline must actually produce a result
+# --------------------------------------------------------------------------- #
+
+
+class _CountingDetector:
+    """A detector that finds nothing, so ``analyse`` can run without YOLO."""
+
+    names = {0: "person", 2: "car"}
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def raw_detect(self, frame):
+        self.calls += 1
+        return (
+            np.empty((0, 4), dtype=np.float32),
+            np.empty((0,), dtype=np.float32),
+            np.empty((0,), dtype=np.int32),
+            0.0,
+        )
+
+
+def test_analyse_returns_both_an_annotated_and_a_clean_frame():
+    """
+    ``AnalysisResult`` must carry ``raw_frame``, and nothing may be able to
+    drop it quietly.
+
+    It was dropped from the dataclass while ``analyse()`` still passed it, so
+    every single frame raised ``AnalysisResult.__init__() got an unexpected
+    keyword argument 'raw_frame'``. The camera loop catches analysis errors and
+    keeps going — correctly, a database hiccup must not stop surveillance — so
+    there was no crash and no failing test: cameras simply reported PROCESSING
+    forever while publishing nothing, and every live feed, event, snapshot,
+    plate and face silently stopped working. Nothing in the suite exercised
+    ``analyse`` at all, which is why it went unnoticed; this does, with a stub
+    detector so it stays fast and needs no model.
+
+    The two frames must also be *different objects*: evidence crops are cut
+    from ``raw_frame`` precisely because the overlay burns the camera name, HUD
+    and bounding boxes into ``frame``.
+    """
+    from core.analytics import AnalysisResult, FrameAnalyzer
+
+    analyzer = FrameAnalyzer(source_id="regress", display_name="REG",
+                             detector=_CountingDetector(),
+                             enable_face=False, enable_anpr=False)
+    frame = np.full((settings.FRAME_HEIGHT, settings.FRAME_WIDTH, 3), 90, np.uint8)
+
+    result = analyzer.analyse(frame, timestamp=1000.0, fps=15.0)
+
+    assert isinstance(result, AnalysisResult)
+    assert result.frame is not None and result.raw_frame is not None
+    assert result.frame.shape == result.raw_frame.shape
+    assert result.frame is not result.raw_frame, "evidence would carry the HUD"
+    # The HUD is drawn on the annotated frame and only there.
+    assert not np.array_equal(result.frame, result.raw_frame)
+    assert np.array_equal(result.raw_frame, frame)
+    assert analyzer.detector.calls == 1
+
+
+def test_a_camera_publishes_what_it_analyses(db):
+    """
+    The end-to-end shape of the same bug: analysed frames must reach viewers.
+
+    An exception anywhere between ``analyse`` and ``publish`` leaves a camera
+    that looks healthy — state PROCESSING, threads alive, no error surfaced to
+    the operator — and streams nothing at all.
+    """
+    from core.camera import CameraProcessor, FrameBuffer
+
+    proc = CameraProcessor(camera_id=7321, url="0", name="PUBLISH",
+                           detector=_CountingDetector())
+    proc._stop_event.clear()                 # as the analytics loop would have it
+    try:
+        FrameBuffer.get().open(7321)
+        frame = np.full((settings.FRAME_HEIGHT, settings.FRAME_WIDTH, 3), 90, np.uint8)
+        result = proc.analyzer.analyse(frame, timestamp=1000.0)
+        proc._publish(FrameBuffer.get(), result, captured_at=1000.0)
+
+        assert FrameBuffer.get().get_jpeg(7321) is not None
+        assert FrameBuffer.get().get_clean_frame(7321) is not None
+    finally:
+        proc.stop()
+        FrameBuffer.get().drop(7321)
+
+
+# --------------------------------------------------------------------------- #
 # Hash chain — concurrent append must not fork the chain
 # --------------------------------------------------------------------------- #
 

@@ -1,29 +1,9 @@
-"""
-The shared analytics core.
 
-``FrameAnalyzer`` is the one place where a frame becomes intelligence:
 
-    frame -> preprocess -> detect -> track -> face -> ANPR -> rules -> overlay
-
-A live camera thread and an uploaded-MP4 analysis run both drive *this same
-object*, which is what stops the two paths from drifting apart.  The only
-difference between them is who supplies the frames and what "now" means:
-live analytics use wall-clock time, offline analysis uses media time.
-
-Cost control is explicit rather than accidental:
-
-* YOLO runs on every analysed frame (it is the cheapest useful signal).
-* Face recognition runs on a cadence **and** only when a person is present,
-  with a hard cap on crops per tick.
-* ANPR runs on a cadence **and** only when a vehicle is present — the previous
-  build ran EasyOCR on every single frame, including frames with no vehicle
-  in them at all.
-* CLAHE runs only when the frame is actually dark, and the darkness test is
-  done on a downsampled grayscale rather than a full BGR→LAB conversion.
-"""
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -40,22 +20,8 @@ from cv.scene import SceneCondition, SceneIlluminationEstimator
 
 log = logging.getLogger("ibvap.analytics")
 
-
-# --------------------------------------------------------------------------- #
-# Low-light enhancement
-# --------------------------------------------------------------------------- #
-
-
 class LowLightEnhancer:
-    """
-    CLAHE on the L channel, applied only when the frame is genuinely dark.
-
-    The darkness probe runs on a 1/8-scale grayscale image (~0.05 ms) instead
-    of converting the whole frame to LAB just to read its mean (~1.5 ms).  On
-    a bright daytime feed that is the difference between paying 1.5 ms every
-    frame forever and paying almost nothing.
-    """
-
+ 
     def __init__(
         self,
         clip_limit: Optional[float] = None,
@@ -82,7 +48,7 @@ class LowLightEnhancer:
         return luma < self.luminance_threshold
 
     def maybe_enhance(self, frame: np.ndarray) -> tuple[np.ndarray, bool]:
-        """Returns ``(frame, was_enhanced)``."""
+  
         if not self.is_dark(frame):
             return frame, False
         lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
@@ -91,8 +57,171 @@ class LowLightEnhancer:
 
 
 # --------------------------------------------------------------------------- #
-# Result container
+# Optional-stage model loading
 # --------------------------------------------------------------------------- #
+
+#: Loaders already running, so a dozen camera threads asking for the same model
+#: start exactly one load between them.
+_loading: set[str] = set()
+_loading_lock = threading.Lock()
+
+
+def _load_in_background(name: str, build) -> None:
+    """
+    Build an optional model on a thread of its own, once.
+
+    Constructing the face and ANPR stacks costs seconds — measured at ~6.3 s for
+    SCRFD+ArcFace and ~5.6 s for EasyOCR, more when weights move onto CUDA. The
+    first analysed frame used to pay that *on the camera's analytics thread*,
+    inside ``analyse()``, before the cheap "is there even a person in view?"
+    test. The effects were all of a piece and all bad: the camera reported
+    PROCESSING and ONLINE while publishing nothing for ~12-20 s, so the operator
+    saw a dead tile; removing it took five seconds instead of a third of one,
+    because the thread could not reach its own ``while self._running`` check
+    until the load returned; and the model construction holds the GIL in long
+    stretches, which stalls the event loop serving the dashboard, the MJPEG
+    streams and every API call. Every one of those reads as "the UI is lagging
+    and the camera will not go away".
+
+    So the pipeline never waits for a model. It asks whether one is ready,
+    skips its stage if not, and this brings the model up behind it.
+    """
+    with _loading_lock:
+        if name in _loading:
+            return
+        _loading.add(name)
+
+    def _run() -> None:
+        started = time.time()
+        try:
+            build()
+            log.info("%s model ready after %.1fs", name.upper(), time.time() - started)
+        except Exception as exc:
+            log.error("%s model could not be loaded: %s", name.upper(), exc)
+        finally:
+            with _loading_lock:
+                _loading.discard(name)
+
+    threading.Thread(target=_run, name=f"load-{name}", daemon=True).start()
+
+
+class _AsyncStage:
+    """
+    Runs one enrichment tick at a time, off the analytics thread.
+
+    Face recognition and ANPR are *enrichment*: the pipeline already has a
+    cache that answers for them between cadence ticks, and every consumer
+    re-anchors to the current frame's detections. What it did not have was any
+    protection against the tick itself being slow — and on a CPU-only face
+    stack a tick is very slow. Measured here: 5-6 s per tick with three people
+    in view, on a 15 fps pipeline whose whole frame budget is 66 ms.
+
+    Synchronously, that cost was not paid by the face feature. It was paid by
+    the camera (no frames published for seconds at a time), by removal (the
+    thread could not reach its stop check), and by the entire server, because
+    a stage that holds the GIL in long stretches starves the event loop behind
+    the dashboard, the MJPEG streams and every API call. One camera looking at
+    people was enough to make the whole platform feel broken.
+
+    So a tick is submitted and the pipeline moves on. One tick may be in flight
+    at a time, which is the backpressure: a stage that cannot keep up simply
+    runs less often instead of queueing work that is already stale.
+    """
+
+    #: One budget per stage *name*, shared by every camera in the process.
+    #:
+    #: The limiter has to be global, because the resource it protects is. Each
+    #: analyzer holding its own 25% budget means eight cameras can consume 200%
+    #: of a core between them, and that is not a thought experiment: running
+    #: eight streams at once, average inference rose from 33 ms to 229 ms and
+    #: aggregate throughput collapsed from 96 fps to 10.6 while every camera's
+    #: face stage ticked independently. One budget, and one tick in flight at a
+    #: time, keeps the cost of an optional stage flat as cameras are added —
+    #: which is the only way "add another camera" stays a safe thing to do.
+    _budgets: dict = {}
+    _budget_lock = threading.Lock()
+
+    def __init__(self, name: str) -> None:
+        self._name = name
+        self._lock = threading.Lock()
+        self._pending: Any = None
+        #: How long the last tick took, measured for diagnostics.
+        self._last_seconds = 0.0
+        with _AsyncStage._budget_lock:
+            _AsyncStage._budgets.setdefault(
+                name, {"busy": False, "next_allowed": 0.0, "last_seconds": 0.0})
+
+    @property
+    def busy(self) -> bool:
+        """True while *any* camera's tick of this stage is running."""
+        with _AsyncStage._budget_lock:
+            return bool(_AsyncStage._budgets[self._name]["busy"])
+
+    @property
+    def last_seconds(self) -> float:
+        with _AsyncStage._budget_lock:
+            return float(_AsyncStage._budgets[self._name]["last_seconds"])
+
+    def submit(self, work) -> bool:
+        """
+        Start ``work()`` on a worker, unless a tick of this stage is already
+        running anywhere in the process, or the stage has already had its share
+        of the machine. Returns whether one started.
+
+        Both gates are process-wide. A camera that loses the race simply serves
+        its cached result for another cadence and tries again — which is the
+        backpressure: adding cameras spreads a fixed budget more thinly instead
+        of multiplying the load.
+        """
+        now = time.monotonic()
+        with _AsyncStage._budget_lock:
+            budget = _AsyncStage._budgets[self._name]
+            if budget["busy"] or now < budget["next_allowed"]:
+                return False
+            budget["busy"] = True
+
+        started = time.monotonic()
+
+        def _run() -> None:
+            outcome = None
+            try:
+                outcome = work()
+            except Exception as exc:
+                log.warning("%s stage failed: %s", self._name, exc)
+            finally:
+                elapsed = max(0.0, time.monotonic() - started)
+                duty = min(1.0, max(0.01, float(settings.STAGE_MAX_DUTY)))
+                with self._lock:
+                    if outcome is not None:
+                        self._pending = outcome
+                    self._last_seconds = elapsed
+                with _AsyncStage._budget_lock:
+                    slot = _AsyncStage._budgets[self._name]
+                    slot["last_seconds"] = elapsed
+                    # Idle long enough that the stage averages `duty` of wall
+                    # time across the whole process. A cheap tick barely delays
+                    # the next one; an expensive one backs itself off.
+                    slot["next_allowed"] = (
+                        time.monotonic() + elapsed * (1.0 / duty - 1.0))
+                    slot["busy"] = False
+
+        threading.Thread(target=_run, name=f"stage-{self._name}",
+                         daemon=True).start()
+        return True
+
+    @classmethod
+    def reset_budgets(cls) -> None:
+        """Clear every shared gate — used by the hard reset and by tests."""
+        with cls._budget_lock:
+            for slot in cls._budgets.values():
+                slot.update({"busy": False, "next_allowed": 0.0,
+                             "last_seconds": 0.0})
+
+    def take(self):
+        """The most recent completed tick, once. ``None`` if nothing is new."""
+        with self._lock:
+            out, self._pending = self._pending, None
+            return out
 
 
 @dataclass
@@ -100,6 +229,11 @@ class AnalysisResult:
     """Everything one analysed frame produced."""
 
     frame: np.ndarray                       # annotated, ready to stream/encode
+    #: The unannotated frame. Evidence snapshots, ANPR crops and face crops are
+    #: all cut from this one: the overlay burns the camera name, HUD text and
+    #: bounding boxes into ``frame``, and an evidence image with a label drawn
+    #: across the subject is not what the camera saw. (An OCR probe pointed at
+    #: the annotated frame once read the camera's own name back as a plate.)
     raw_frame: np.ndarray                   # unannotated, for evidence snapshots
     detections: list[Detection] = field(default_factory=list)
     alerts: list[RuleAlert] = field(default_factory=list)
@@ -108,28 +242,25 @@ class AnalysisResult:
     timestamp: float = 0.0
     is_night: bool = False
     night_source: str = ""
-    #: Full illumination measurement behind the night decision, so the UI can
-    #: show *why* a camera is in night mode instead of asserting that it is.
+
     scene: Optional[SceneCondition] = None
     enhanced: bool = False
     inference_ms: float = 0.0
     total_ms: float = 0.0
     person_count: int = 0
     vehicle_count: int = 0
+    #: The unannotated frame the ANPR tick read, when its results came from an
+    #: earlier frame than this one. Plate boxes are in that frame's coordinates,
+    #: so the evidence crop has to be cut from it and not from the current one.
+    plates_frame: Optional[np.ndarray] = None
+    #: Live occupancy per zone / loiter area — the continuous counterpart to the
+    #: discrete enter and exit events. One entry per rule that has an inside.
+    zones: list = field(default_factory=list)
 
-
-# --------------------------------------------------------------------------- #
-# Analyzer
-# --------------------------------------------------------------------------- #
 
 
 class FrameAnalyzer:
-    """
-    One analytics context — one camera, or one uploaded-video session.
-
-    Owns the per-stream tracker and rule state.  The YOLO model itself is
-    shared process-wide via :meth:`Detector.get`.
-    """
+ 
 
     def __init__(
         self,
@@ -146,7 +277,7 @@ class FrameAnalyzer:
         self.tracker = ObjectTracker(frame_rate=frame_rate)
         self.rules = RuleEngine(camera_id=self.source_id)
         self.enhancer = LowLightEnhancer()
-        #: Night is decided from this camera's own pixels, never from the clock.
+   
         self.scene = SceneIlluminationEstimator()
 
         self.enable_face = settings.FACE_ENABLED if enable_face is None else enable_face
@@ -160,28 +291,22 @@ class FrameAnalyzer:
         self._rule_shapes: list[dict] = []
         self._night_rule: Optional[NightMovementRule] = None
 
-        # Per-track first-sighting bookkeeping for presence events.
+
         self._announced_tracks: dict[int, float] = {}
-        #: Per-class floor. Track ids churn whenever objects occlude one another,
-        #: so a purely per-track debounce cannot stop the flood: the old build
-        #: issued a fresh "HUMAN DETECTED" for every new id, and the event log
-        #: shows 20 ids inside 50 seconds of sample footage.
+
         self._announced_classes: dict[str, float] = {}
 
         self._face_recognizer = None
         self._anpr = None
+        #: Enrichment stages, each running at most one tick at a time.
+        self._face_stage = _AsyncStage("face")
+        self._anpr_stage = _AsyncStage("anpr")
+        #: The frame the last completed ANPR tick read.
+        self._plates_frame: Optional[np.ndarray] = None
 
-    # ------------------------------------------------------------------ #
-    # Rule configuration
-    # ------------------------------------------------------------------ #
+    
     def set_rules(self, rule_rows: list[dict]) -> None:
-        """
-        Rebuild the rule engine from plain dicts.
-
-        Callers pass already-deserialised rows so the analytics loop never
-        touches the database — the previous build ran a SQL query *per frame*
-        just to redraw the fence.
-        """
+       
         from cv.rules import DirectionRule, FenceRule, LoiterRule, ZoneRule
 
         self.rules.clear()
@@ -192,10 +317,7 @@ class FrameAnalyzer:
             geom = row.get("geometry") or []
             params = row.get("params") or {}
             name = row.get("name") or f"{rtype}_{row.get('id', '?')}"
-            # Operator-tunable knobs travel in the rule's params JSON, so a
-            # dwell threshold or a reference point can be changed per rule from
-            # the UI without touching global configuration. Anything absent
-            # falls back to the configured default.
+            
             reference = params.get("reference_point") or "foot"
             classes = params.get("classes") or None
             try:
@@ -252,26 +374,45 @@ class FrameAnalyzer:
     def rule_shapes(self) -> list[dict]:
         return list(self._rule_shapes)
 
-    # ------------------------------------------------------------------ #
-    # Lazily-loaded optional subsystems
-    # ------------------------------------------------------------------ #
-    def _face(self):
-        if self._face_recognizer is None and self.enable_face:
-            from cv.face import get_face_recognizer
 
-            self._face_recognizer = get_face_recognizer()
+    def _face(self):
+        """
+        The face recogniser, or ``None`` while it is still loading.
+
+        Returning ``None`` costs a few skipped face ticks on a cold start and
+        keeps the pipeline running; blocking here cost the whole camera.
+        """
+        if self._face_recognizer is not None or not self.enable_face:
+            return self._face_recognizer
+
+        from cv.face import face_ready, get_face_recognizer
+
+        if not face_ready():
+            _load_in_background("face", get_face_recognizer)
+            return None
+        self._face_recognizer = get_face_recognizer()
         return self._face_recognizer
 
     def _anpr_processor(self):
-        if self._anpr is None and self.enable_anpr:
-            from cv.anpr import get_anpr_processor
+        """The ANPR processor, or ``None`` while EasyOCR is still loading."""
+        if self._anpr is not None or not self.enable_anpr:
+            return self._anpr
 
-            self._anpr = get_anpr_processor()
+        from cv.anpr import anpr_ready, preload_anpr
+
+        if not anpr_ready():
+            # preload_anpr, not get_anpr_processor: the expensive part is the
+            # EasyOCR reader that is_available() builds, and constructing the
+            # processor without it would report "ready" while leaving the real
+            # stall in place for the first frame that contains a vehicle.
+            _load_in_background("anpr", preload_anpr)
+            return None
+        from cv.anpr import get_anpr_processor
+
+        self._anpr = get_anpr_processor()
         return self._anpr
 
-    # ------------------------------------------------------------------ #
-    # Main entry point
-    # ------------------------------------------------------------------ #
+ 
     def analyse(
         self,
         frame: np.ndarray,
@@ -281,17 +422,12 @@ class FrameAnalyzer:
         fps: float = 0.0,
         online: bool = True,
     ) -> AnalysisResult:
-        """Run the full pipeline over one frame."""
+        
         t_start = time.perf_counter()
         now = time.time() if timestamp is None else float(timestamp)
         self._frame_index += 1
 
-        # -- preprocess: resize to the analytics resolution --------------- #
-        # The pre-resize frame is retained (by reference — no copy) purely so
-        # ANPR can crop plate pixels from it. Detection and tracking are happy
-        # at 640x384, but OCR accuracy on small text is governed by glyph
-        # height, and a 1080p feed carries three times the linear detail that
-        # the resize is about to discard.
+    
         source_frame = frame
         if frame.shape[1] != settings.FRAME_WIDTH or frame.shape[0] != settings.FRAME_HEIGHT:
             frame = cv2.resize(
@@ -303,29 +439,24 @@ class FrameAnalyzer:
 
         work = frame
         enhanced = False
-        # Enhance based on measured brightness, not on the night latch: an IR
-        # camera is latched to night but its image is already bright, and running
-        # CLAHE on it would only amplify sensor noise.
+       
         if scene.mean_luma < settings.LOW_LIGHT_THRESHOLD:
             work, enhanced = self.enhancer.maybe_enhance(frame)
 
-        # -- detect + track ----------------------------------------------- #
+        
         xyxy, conf, cls, inference_ms = self.detector.raw_detect(work)
         detections = self.tracker.update(xyxy, conf, cls, self.detector.names)
 
         persons = [d for d in detections if d.is_person]
         vehicles = [d for d in detections if d.is_vehicle]
 
-        # -- face (cadenced, person-gated) -------------------------------- #
-        # The pre-resize frame goes to the face stage for the same reason it
-        # goes to ANPR: a face is ~1/7 of a person, so at 640x384 it is barely a
-        # dozen pixels tall and SCRFD never had anything to work with.
+       
         self._faces = self._run_face(work, detections, persons, source_frame)
 
-        # -- ANPR (cadenced, vehicle-gated) ------------------------------- #
+       
         self._plates = self._run_anpr(work, vehicles, source_frame)
 
-        # -- rules --------------------------------------------------------- #
+      
         context = {
             "is_night": night,
             "night_source": night_source,
@@ -335,14 +466,34 @@ class FrameAnalyzer:
         alerts = self.rules.update(detections, timestamp=now, context=context)
         alerts.extend(self._presence_alerts(detections, now))
 
-        # -- overlay -------------------------------------------------------- #
+        # Occupancy is read straight after the rules ran, from the same state
+        # those rules just updated, so the continuous signal and the discrete
+        # events can never disagree about who is inside.
+        occupancy = self.rules.occupancy(now)
+        occupied_rules = {
+            entry["rule"] for entry in occupancy if entry.get("occupied")
+        }
+        breached_rules = {
+            entry["rule"] for entry in occupancy if entry.get("breached")
+        }
+
+      
         annotated = work
         if annotate:
             annotated = work.copy()
-            # One shared collision map for the frame, so a fence label, a box
-            # label and a plate label can never render on top of each other.
+
             occupied: list = []
-            ov.draw_rules(annotated, self._rule_shapes, occupied)
+            # Tell the renderer which polygons currently contain something, so
+            # an occupied zone is visibly different from an empty one for as
+            # long as it stays occupied — not only in the frame where somebody
+            # crossed the boundary.
+            shapes = [
+                {**shape,
+                 "occupied": shape.get("name") in occupied_rules,
+                 "breached": shape.get("name") in breached_rules}
+                for shape in self._rule_shapes
+            ]
+            ov.draw_rules(annotated, shapes, occupied)
             ov.draw_detections(
                 annotated, detections, {a.track_id for a in alerts}, occupied
             )
@@ -381,42 +532,18 @@ class FrameAnalyzer:
             enhanced=enhanced,
             inference_ms=inference_ms,
             total_ms=(time.perf_counter() - t_start) * 1000.0,
+            plates_frame=self._plates_frame,
+            zones=occupancy,
             person_count=len(persons),
             vehicle_count=len(vehicles),
         )
 
-    # ------------------------------------------------------------------ #
-    # Stage helpers
-    # ------------------------------------------------------------------ #
     def _night_state(self, frame: np.ndarray) -> SceneCondition:
-        """
-        Decide whether night analytics apply, from **what the camera sees**.
-
-        This is the inversion of the original logic.  It used to read::
-
-            if clock_is_night(now):        # 23:00 -> night, unconditionally
-                return True, "clock"
-            if dark(frame):
-                return True, "luminance"
-
-        so at 23:00 every camera in the deployment was declared night — a
-        floodlit checkpost included — and at noon a camera inside an unlit
-        culvert was declared day.  The clock was consulted first and the pixels
-        only as a fallback, which is backwards: the scene is the observation and
-        the clock is not.
-
-        Now the measurement decides (see :mod:`cv.scene`, which fuses dark-pixel
-        fraction, mean luma and colour saturation, then latches the result over
-        several frames).  The clock survives only as an optional *hint* that can
-        slightly lower the threshold for a borderline scene, and it is disabled
-        by default.  A bright scene is never called night, whatever the hour.
-        """
+        
         condition = self.scene.measure(frame)
 
         if settings.FORCE_NIGHT_MODE:
-            # Explicit operator override for demonstrating the night rule with
-            # daytime footage. Reported honestly as "forced" so the dashboard
-            # never presents an override as a measurement.
+        
             return SceneCondition(
                 is_night=True, source="forced", darkness=condition.darkness,
                 mean_luma=condition.mean_luma, dark_fraction=condition.dark_fraction,
@@ -428,8 +555,7 @@ class FrameAnalyzer:
                 and settings.NIGHT_USE_CLOCK_HINT
                 and clock_is_night(None, settings.NIGHT_START_HOUR,
                                    settings.NIGHT_END_HOUR)):
-            # A hint, not a trigger: it can only promote a scene that is already
-            # close to the darkness threshold, never a bright one.
+           
             threshold = settings.NIGHT_DARKNESS_ENTER - settings.NIGHT_CLOCK_HINT_BONUS
             if condition.darkness >= threshold:
                 return SceneCondition(
@@ -443,54 +569,84 @@ class FrameAnalyzer:
 
     def _run_face(self, frame: np.ndarray, detections: list, persons: list,
                   source_frame: Optional[np.ndarray] = None) -> list:
+        # "Is there a person in view?" is a length check; "is the recogniser
+        # available?" can start a multi-second model load. Asking them in that
+        # order means a feed that never sees a person never pays for face
+        # recognition at all.
+        if not persons or not self.enable_face:
+            return []
         recognizer = self._face()
         if recognizer is None or not getattr(recognizer, "_enabled", False):
             return []
-        if not persons:
-            return []
-        if self._frame_index - self._last_face_frame < settings.FACE_RECOGNITION_EVERY_N_FRAMES:
-            return recognizer.cached_matches(detections, self.source_id)
-        self._last_face_frame = self._frame_index
-        try:
-            return recognizer.recognize(frame, detections=detections,
-                                        frame_number=self._frame_index,
-                                        source_frame=source_frame,
-                                        source_id=self.source_id)
-        except Exception as exc:
-            log.warning("[%s] face stage failed: %s", self.source_id, exc)
-            return []
+
+        # Due a tick, and nothing already running? Start one and carry on.
+        # The frames are copied because the capture thread reuses its buffers.
+        due = (self._frame_index - self._last_face_frame
+               >= settings.FACE_RECOGNITION_EVERY_N_FRAMES)
+        if due and not self._face_stage.busy:
+            work_frame = frame.copy()
+            work_source = None if source_frame is None else source_frame.copy()
+            work_dets = list(detections or ())
+            index, stream = self._frame_index, self.source_id
+
+            def _tick():
+                # force=True: the cadence is decided here, so letting the
+                # recogniser apply its own would make every other tick a no-op.
+                recognizer.recognize(
+                    work_frame, detections=work_dets, frame_number=index,
+                    force=True, source_frame=work_source, source_id=stream,
+                )
+                return True
+
+            if self._face_stage.submit(_tick):
+                self._last_face_frame = self._frame_index
+
+        # Answer from the identity cache either way. This is not a degraded
+        # path: it rebuilds each match against the *current* person boxes, so
+        # the overlay, the events and the evidence crop are all in step with
+        # the frame being analysed — only the identity is carried forward.
+        self._face_stage.take()
+        return recognizer.cached_matches(detections, self.source_id)
 
     def _run_anpr(self, frame: np.ndarray, vehicles: list,
                   source_frame: Optional[np.ndarray] = None) -> list:
+        # Same order as the face stage: no vehicle in view means EasyOCR is
+        # never even asked for, let alone loaded.
+        if not vehicles or not self.enable_anpr:
+            return []
         processor = self._anpr_processor()
         if processor is None or not processor.is_available():
             return []
-        if not vehicles:
-            # No vehicle in frame means no plate. The previous build still ran
-            # a full-frame candidate search plus OCR here, every single frame.
-            return []
-        if self._frame_index - self._last_anpr_frame < settings.ANPR_EVERY_N_FRAMES:
-            return processor.cached_detections(self.source_id)
-        self._last_anpr_frame = self._frame_index
-        try:
-            return processor.recognize_plates(
-                frame, vehicle_detections=vehicles,
-                frame_number=self._frame_index,
-                source_frame=source_frame,
-                source_id=self.source_id,
-            )
-        except Exception as exc:
-            log.warning("[%s] ANPR stage failed: %s", self.source_id, exc)
-            return []
+
+        due = (self._frame_index - self._last_anpr_frame
+               >= settings.ANPR_EVERY_N_FRAMES)
+        if due and not self._anpr_stage.busy:
+            work_frame = frame.copy()
+            work_source = None if source_frame is None else source_frame.copy()
+            work_vehicles = list(vehicles)
+            index, stream = self._frame_index, self.source_id
+
+            def _tick():
+                processor.recognize_plates(
+                    work_frame, vehicle_detections=work_vehicles,
+                    frame_number=index, source_frame=work_source,
+                    source_id=stream,
+                )
+                # Hand back the pixels the plate boxes belong to; unlike face
+                # matches, a plate box is not re-anchored to a current
+                # detection, so its evidence crop must come from this frame.
+                return work_source if work_source is not None else work_frame
+
+            if self._anpr_stage.submit(_tick):
+                self._last_anpr_frame = self._frame_index
+
+        done = self._anpr_stage.take()
+        if done is not None:
+            self._plates_frame = done
+        return processor.cached_detections(self.source_id)
 
     def _presence_alerts(self, detections: list, now: float) -> list[RuleAlert]:
-        """
-        First-sighting events for humans and vehicles.
-
-        These are plain detection notifications (``AI DETECTION``), separate
-        from rule outcomes, and are debounced per track so a person standing
-        in frame produces one event, not one per frame.
-        """
+       
         if not settings.PRESENCE_ALERTS_ENABLED:
             return []
 
@@ -509,12 +665,7 @@ class FrameAnalyzer:
 
             kind = "human_detected" if det.is_person else "vehicle_detected"
 
-            # A per-class floor on top of the per-track debounce. Track ids are
-            # reissued whenever objects occlude one another, so "one event per
-            # track" alone does not bound the event rate — the old log shows a
-            # fresh HUMAN DETECTED for each of 20 ids inside 50 seconds. This is
-            # a rate limit, not a filter: a genuinely new subject arriving after
-            # the cooldown still produces its own event.
+            
             class_last = self._announced_classes.get(kind)
             if (class_last is not None
                     and now - class_last < settings.PRESENCE_CLASS_COOLDOWN_SECONDS):
@@ -546,19 +697,7 @@ class FrameAnalyzer:
         return out
 
     def reset_tracking(self, *, reset_scene: bool = False) -> None:
-        """
-        Restart tracking — used when a source reconnects or a file loops.
-
-        Rule state must be dropped alongside the tracker. A looping video file
-        reissues track ids and every object appears to teleport across the frame
-        at the seam; a fence rule holding the previous lap's trajectory would
-        manufacture a phantom crossing on the first frame of the new lap.
-
-        The illumination estimator is kept by default — a reconnecting camera is
-        still pointed at the same scene, so discarding a converged measurement
-        would only re-introduce a latch delay. A genuinely new source passes
-        ``reset_scene=True``.
-        """
+       
         self.tracker.reset()
         self.rules.reset_state()
         self._announced_tracks.clear()

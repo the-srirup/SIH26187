@@ -62,6 +62,7 @@ ALERT_TITLES = {
     "face_detected": "FACE DETECTED",
     "anpr_detection": "ANPR — NUMBER PLATE READ",
     "camera_offline": "CAMERA OFFLINE",
+    "source_restarted": "VIDEO RESTARTED — REPLAY",
     "system_error": "SYSTEM ERROR",
 }
 
@@ -71,6 +72,7 @@ ALERT_ICONS = {
     "night_movement": "🌙", "human_detected": "🚶", "vehicle_detected": "🚗",
     "watchlist_match": "👤", "face_detected": "👤", "anpr_detection": "🔢",
     "camera_offline": "📵", "system_error": "⚠️",
+    "source_restarted": "🔁",
 }
 
 #: Which subsystem produced the event — the dashboard shows this so nobody
@@ -83,6 +85,7 @@ DETECTOR_BY_TYPE = {
     "anpr_detection": "anpr_ocr",
     "camera_offline": "system",
     "system_error": "system",
+    "source_restarted": "system",
 }
 
 
@@ -150,6 +153,20 @@ class EventManager:
     @property
     def recent(self) -> list[dict]:
         return list(self._recent)
+
+    def reset(self) -> None:
+        """
+        Forget the in-memory event history and counters.
+
+        The dashboard's event feed and per-type tallies live here, not in the
+        database, so a hard reset that only truncated tables would leave the
+        operator looking at events from the system they just wiped.
+        Subscribers are deliberately left attached: they are the WebSocket
+        fan-out and the alarm/SMS channels, which must survive a reset.
+        """
+        self._recent.clear()
+        self._counts.clear()
+        log.info("Event history cleared")
 
     # ------------------------------------------------------------------ #
     # Persistence
@@ -286,6 +303,13 @@ class EventManager:
 # --------------------------------------------------------------------------- #
 
 
+def _plate_of(details: dict) -> Optional[str]:
+    """The registration this event recorded, formatted for display."""
+    text = details.get("plate_text") or details.get("plate_raw") or ""
+    text = str(text).strip().upper()
+    return text or None
+
+
 def serialize_alert_row(row: Alert, camera_name: str = "") -> dict:
     """
     Convert an ``Alert`` row into the canonical API/WebSocket payload.
@@ -326,6 +350,15 @@ def serialize_alert_row(row: Alert, camera_name: str = "") -> dict:
         "session_id": row.session_id or "",
         "description": row.description or "",
         "details": details,
+        # Recognition results promoted out of ``details`` so the event log,
+        # the PDF and any C2 consumer can show a registration without having to
+        # know the internal shape of an ANPR payload. A plate read is the point
+        # of the event; it should not be buried one level down.
+        "plate": _plate_of(details),
+        "plate_confidence": (round(float(details.get("ocr_confidence") or 0.0), 3)
+                             if details.get("plate_text") else None),
+        "plate_verified": bool(details.get("format_verified")) or None,
+        "watchlist_name": details.get("watchlist_name") or None,
         "has_snapshot": bool(row.snapshot_path),
         "has_clip": bool(row.clip_path),
         "snapshot_url": f"/api/alerts/{row.id}/snapshot" if row.snapshot_path else None,

@@ -4,8 +4,8 @@ IBVAP end-to-end acceptance test against a running server.
 Exercises the real HTTP/WebSocket surface — no mocks, no stubs. Every check
 either passes against the live system or is reported as a failure.
 """
-import io
 import json
+import os
 import sys
 import time
 import urllib.request
@@ -420,7 +420,6 @@ else:
 
 # ------------------------------------------------------------- 13. security
 print("\n[13] SECURITY CHECKS")
-_, nf = get("/api/alerts/999999") if False else ({}, 0)
 try:
     urllib.request.urlopen(BASE + "/api/alerts/999999", timeout=10)
     check("Unknown alert returns 404", False, "got 200")
@@ -444,6 +443,94 @@ check("'Today' computed against IST midnight",
       stats["today_since_ist"].endswith("IST"), stats["today_since_ist"])
 check("Live aggregate reports real FPS", stats["live"]["system_fps"] > 0,
       f"{stats['live']['system_fps']} fps")
+
+# ------------------------------------------------- 15. escalation channels
+print("\n[15] ALARM & SMS ESCALATION CHANNELS")
+
+# The modules must import on any host: the alarm's GPIO library and the SMS
+# provider's SDK are both optional, and neither may be required to start.
+try:
+    from core.alarm import AlarmManager          # noqa: E402
+    from core.sms import SMSNotifier             # noqa: E402
+    from core.notify import severity_at_least    # noqa: E402
+
+    check("Notification modules import cleanly", True,
+          "core.alarm, core.sms, core.notify")
+    check("Only HIGH and above escalate",
+          severity_at_least("CRITICAL", "HIGH")
+          and severity_at_least("HIGH", "HIGH")
+          and not severity_at_least("MEDIUM", "HIGH")
+          and not severity_at_least("LOW", "HIGH"))
+    sms_text = SMSNotifier.format_message({
+        "severity": "CRITICAL", "title": "INTRUSION — FENCE CROSSED (INBOUND)",
+        "camera_name": "BOP-NORTH-01", "timestamp_ist": "12 Sep 2026 10:00:00 IST",
+        "description": "Track 7 crossed the fence line inbound.", "track_id": 7,
+    })
+    check("SMS fits one 160-char segment", len(sms_text) <= 160, f"{len(sms_text)} chars")
+    check("SMS is GSM-safe (no UCS-2 downgrade)", sms_text.isascii(), sms_text[:60])
+except Exception as e:
+    check("Notification modules import cleanly", False, str(e)[:90])
+
+notif, nstatus = get("/api/system/notifications")
+check("Notification status endpoint works", nstatus == 200 and "alarm" in notif)
+
+if nstatus == 200:
+    alarm_st, sms_st = notif["alarm"], notif["sms"]
+    check("Escalation floor reported", notif["min_severity"] in ("HIGH", "CRITICAL"),
+          notif["min_severity"])
+
+    a_one, _ = get("/api/system/alarm/status")
+    s_one, _ = get("/api/system/sms/status")
+    check("Per-channel status endpoints agree",
+          a_one["channel"] == "alarm" and s_one["channel"] == "sms")
+
+    # A disabled channel is a configuration choice, not a fault — it must say
+    # so plainly rather than reporting itself as broken.
+    for st in (alarm_st, sms_st):
+        name = st["channel"]
+        if not st["enabled"]:
+            check(f"{name}: reports disabled honestly",
+                  st["configured"] is False or st["sent"] == 0,
+                  f"enabled={st['enabled']} configured={st['configured']}")
+            # A disabled channel must never have been asked to deliver.
+            check(f"{name}: nothing escalated while disabled", st["failed"] == 0,
+                  f"{st['failed']} failure(s)")
+        elif not st["configured"]:
+            check(f"{name}: enabled but unconfigured is surfaced", True,
+                  st.get("last_error", "")[:60] or "no sink configured")
+        else:
+            check(f"{name}: armed and configured", True,
+                  f"sent={st['sent']} failed={st['failed']}")
+            check(f"{name}: dispatch worker is alive", st["worker_alive"] is True,
+                  "queue worker thread")
+
+    # Firing these for real means sounding a siren at the post and spending a
+    # billed SMS, so an armed channel is NOT triggered by a routine acceptance
+    # run. Set IBVAP_VERIFY_FIRE_ALARM=1 when commissioning, which is when you
+    # actually want the siren to go off.
+    fire = os.environ.get("IBVAP_VERIFY_FIRE_ALARM", "").strip().lower() in ("1", "true", "yes")
+    for path, st in (("alarm", alarm_st), ("sms", sms_st)):
+        if not (st["enabled"] and st["configured"]):
+            # The test hook must refuse clearly rather than report success for
+            # a siren that does not exist.
+            body, code = post(f"/api/system/{path}/test", timeout=60)
+            check(f"{path}: test hook refuses a channel that is not ready",
+                  code == 503, f"HTTP {code}")
+        elif fire:
+            body, code = post(f"/api/system/{path}/test", timeout=120)
+            check(f"{path}: live test hook delivered",
+                  code == 200 and body.get("ok") is True,
+                  body.get("error", "")[:70] or body.get("reference", ""))
+        else:
+            skip(f"{path}: live delivery",
+                 "channel is armed — set IBVAP_VERIFY_FIRE_ALARM=1 to really fire it")
+
+    escalating = notif.get("escalating", [])
+    if escalating:
+        check("At least one escalation channel is live", True, ", ".join(escalating))
+    else:
+        skip("Live escalation delivery",
+             "alarm and SMS are disabled — set ALARM_ENABLED / SMS_ENABLED to test")
 
 # ------------------------------------------------------------------ summary
 print("\n" + "=" * 74)

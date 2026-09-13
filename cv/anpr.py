@@ -199,6 +199,21 @@ class PlateVoter:
         entry = self._votes.get(track_id)
         return entry is not None and entry.published == text
 
+    def settled(self, track_id, now: float) -> bool:
+        """
+        Has this vehicle's plate been read enough times to stop spending OCR?
+
+        A vehicle whose reads already agree needs no further attention, and the
+        OCR budget it was consuming is far better spent on a car nobody has
+        looked at yet. Requires one more vote than bare consensus so a plate is
+        not abandoned on the strength of the minimum evidence.
+        """
+        agreed = self.consensus(track_id, now)
+        if agreed is None:
+            return False
+        _text, _conf, votes = agreed
+        return votes >= max(2, int(settings.ANPR_MIN_VOTES)) + 1
+
     def reset(self) -> None:
         self._votes.clear()
 
@@ -220,6 +235,22 @@ class ANPRProcessor:
     #: Tokens that legitimately appear on an Indian plate but are not the number.
     NON_PLATE_TOKENS = {"IND", "INDIA", "BH"}
 
+    #: Every state and union-territory registration code currently issued in
+    #: India, plus the codes still in circulation on older plates (OR for
+    #: Odisha, UA for Uttarakhand) and the BH national series.
+    #:
+    #: The layout grammar constrains a plate's *shape*; this constrains its
+    #: *vocabulary*. The two leading letters are not free — there are 39 legal
+    #: values and roughly six hundred illegal ones — so a reading whose state
+    #: code does not exist is known to be wrong even when its shape is perfect.
+    #: That is decidable information the shape rules alone cannot use.
+    STATE_CODES = frozenset({
+        "AN", "AP", "AR", "AS", "BH", "BR", "CG", "CH", "DD", "DL", "DN",
+        "GA", "GJ", "HP", "HR", "JH", "JK", "KA", "KL", "LA", "LD", "MH",
+        "ML", "MN", "MP", "MZ", "NL", "OD", "OR", "PB", "PY", "RJ", "SK",
+        "TN", "TR", "TS", "UA", "UK", "UP", "WB",
+    })
+
     def __init__(self, lang_list: Optional[list[str]] = None):
         self.lang_list = lang_list or [
             lang.strip() for lang in settings.ANPR_LANGUAGES.split(",") if lang.strip()
@@ -240,6 +271,10 @@ class ANPRProcessor:
         self._init_lock = threading.Lock()
         self._event_debounce: dict[tuple, float] = {}
         self._gpu = False
+        #: Round-robin bookkeeping for the OCR budget: which tick each vehicle
+        #: was last read on, so the longest-waiting car goes next.
+        self._last_ocr_tick: dict[tuple, int] = {}
+        self._tick = 0
         self._plates_read = 0
         self._plates_uncertain = 0
         self._candidates_found = 0
@@ -360,7 +395,28 @@ class ANPRProcessor:
                 ocr_source = source_frame
                 ocr_scale = (src_w / float(frm_w), src_h / float(frm_h))
 
-        candidates = self._collect_candidates(frame, enhanced, vehicle_detections)
+        # Localise where the plate actually has pixels.
+        #
+        # This is the same mistake the face stage made and had fixed: search the
+        # 640x384 analytics frame and a plate is four to twelve pixels tall,
+        # below this detector's own minimum candidate size, so the candidate
+        # list came back almost empty and ANPR quietly did nothing. Measured on
+        # 1080p traffic footage, 52 vehicle crops yielded 13 candidates searched
+        # at analytics resolution and 47 searched at source — and the ones found
+        # at analytics resolution were the largest, nearest vehicles only.
+        #
+        # OCR already read from the source frame; it was being handed boxes
+        # found in the downscale. Now both stages work on the same pixels.
+        if ocr_source is not frame:
+            search_frame = ocr_source
+            search_enhanced = self.preprocess_for_indian_plates(ocr_source)
+            search_scale = ocr_scale
+        else:
+            search_frame, search_enhanced, search_scale = frame, enhanced, (1.0, 1.0)
+
+        candidates = self._collect_candidates(
+            search_frame, search_enhanced, vehicle_detections, scale=search_scale,
+        )
         if not candidates:
             self._detection_cache[stream] = []
             self.voter.gc(ts)
@@ -368,19 +424,29 @@ class ANPRProcessor:
 
         self._candidates_found += len(candidates)
         candidates = self._deduplicate_candidates(candidates)
-        # OCR dominates the cost of this stage, so only the strongest candidates
-        # are read; that bounds worst-case latency per analytics frame.
-        candidates.sort(key=lambda c: c[4], reverse=True)
-        candidates = candidates[: max(1, int(settings.ANPR_MAX_PLATES_PER_TICK))]
+        candidates = self._schedule_candidates(
+            candidates, stream, ts,
+            frame_size=(search_frame.shape[1], search_frame.shape[0]),
+        )
 
         detections: list[PlateDetection] = []
+        inv_x = 1.0 / max(1e-6, search_scale[0])
+        inv_y = 1.0 / max(1e-6, search_scale[1])
         for x1, y1, x2, y2, score, track_id, vehicle_class in candidates:
+            # The candidate is already in ``search_frame`` coordinates, so OCR
+            # crops it directly — no second rescale, which is what would move
+            # the crop off the plate.
             text, confidence = self._read_plate(
-                frame, enhanced, (x1, y1, x2, y2),
-                ocr_source=ocr_source, ocr_scale=ocr_scale,
+                search_frame, search_enhanced, (x1, y1, x2, y2),
+                ocr_source=search_frame, ocr_scale=(1.0, 1.0),
             )
             if not text:
                 continue
+
+            # Report the box in analytics coordinates: the overlay, the rules
+            # and the evidence crop all work in that one space.
+            box = (int(x1 * inv_x), int(y1 * inv_y),
+                   int(x2 * inv_x), int(y2 * inv_y))
 
             final_text, final_conf, votes, consensus = text, confidence, 1, False
             if settings.ANPR_CONSENSUS_ENABLED and track_id is not None:
@@ -391,17 +457,37 @@ class ANPRProcessor:
                     final_text, final_conf, votes = agreed
                     consensus = True
 
-            verified = bool(self.INDIAN_PLATE_RE.match(final_text))
+            verified = self.is_plausible_plate(final_text)
             # Reward a read matching the plate grammar; discount one that is
             # merely alphanumeric noise of a plausible length.
-            adjusted = float(final_conf) * (1.0 if verified else 0.75)
+            #
+            # The discount is configurable because the grammar is Indian. On
+            # footage from anywhere else every plate fails the pattern and is
+            # permanently marked uncertain however clearly it was read — which
+            # is the right default for a border post and the wrong one for a
+            # demo over foreign footage. Set ANPR_UNVERIFIED_PENALTY=1.0 to
+            # judge a read purely on how well it was seen.
+            penalty = float(settings.ANPR_UNVERIFIED_PENALTY)
+            adjusted = float(final_conf) * (1.0 if verified else penalty)
+
+            # Agreement across frames is evidence in its own right, and it was
+            # being thrown away: a plate read identically on five separate
+            # frames scored no higher than one read once. Independent
+            # observations of the same characters are exactly what raises
+            # confidence, so a bounded bonus is applied for them — bounded so
+            # that repetition can sharpen a good read but never manufacture a
+            # confident one out of a poor one.
+            if consensus and votes > 1:
+                extra = min(int(votes) - 1, 3) / 3.0
+                adjusted *= 1.0 + float(settings.ANPR_CONSENSUS_BONUS) * extra
+            adjusted = min(1.0, adjusted)
             if adjusted >= settings.ANPR_CONFIDENCE_THRESHOLD:
                 self._plates_read += 1
             else:
                 self._plates_uncertain += 1
 
             detections.append(PlateDetection(
-                bbox=(x1, y1, x2, y2),
+                bbox=box,
                 confidence=float(score),
                 plate_text=self.format_indian_plate(final_text) if verified else final_text,
                 text_confidence=adjusted,
@@ -462,21 +548,32 @@ class ANPRProcessor:
                           getattr(det, "track_id", None), class_name))
         return boxes
 
-    def _collect_candidates(self, frame, enhanced, vehicle_detections):
-        """Plate candidates from each vehicle ROI, with a full-frame fallback."""
+    def _collect_candidates(self, frame, enhanced, vehicle_detections,
+                            scale: tuple[float, float] = (1.0, 1.0)):
+        """
+        Plate candidates from each vehicle ROI, with a full-frame fallback.
+
+        ``scale`` converts the vehicle boxes — which the detector produced in
+        analytics coordinates — into the coordinates of the image being
+        searched. Returned candidates are in that same searched-image space.
+        """
         height, width = enhanced.shape[:2]
+        sx, sy = scale
+        margin = max(8, int(8 * sx))
         candidates: list[tuple] = []
 
         for x1, y1, x2, y2, track_id, vehicle_class in self._vehicle_boxes(vehicle_detections):
+            x1, y1 = int(x1 * sx), int(y1 * sy)
+            x2, y2 = int(x2 * sx), int(y2 * sy)
             if x2 <= x1 or y2 <= y1:
                 continue
             box_height = y2 - y1
             # Search the lower 60% of the vehicle plus a small margin: plates sit
             # low on cars and at the very bottom on two-wheelers.
-            crop_x1 = max(0, x1 - 8)
+            crop_x1 = max(0, x1 - margin)
             crop_y1 = max(0, y1 + int(box_height * 0.40))
-            crop_x2 = min(width, x2 + 8)
-            crop_y2 = min(height, y2 + 8)
+            crop_x2 = min(width, x2 + margin)
+            crop_y2 = min(height, y2 + margin)
             if crop_x2 - crop_x1 < 12 or crop_y2 - crop_y1 < 6:
                 continue
 
@@ -524,9 +621,28 @@ class ANPRProcessor:
         kernel_w = max(7, min(25, int(min_w * 0.7) | 1))
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_w, 3))
         closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=1)
-        closed = cv2.dilate(closed, kernel, iterations=1)
 
+        # Two passes over the same edge map, because one setting cannot serve
+        # both kinds of footage — measured, on this project's own clips:
+        #
+        #   vehicle crops from blurry 1080p traffic   closed only:  1 candidate
+        #                                             closed+dilate: 32
+        #   a crisp, high-contrast plate              closed only:  1 candidate
+        #                                             closed+dilate:  0
+        #
+        # On soft or distant footage the character strokes are faint and
+        # fragmented, and the extra dilation is what joins them into a plate
+        # blob at all. On a sharp, well-lit plate the strokes are already
+        # contiguous, and that same dilation floods the plate outward into the
+        # vehicle body until the only contour left is the whole car. Running
+        # both and taking the union costs one extra `findContours` over an edge
+        # map we have already computed, and covers both regimes instead of
+        # choosing one and failing silently on the other.
         contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        merged = cv2.dilate(closed, kernel, iterations=1)
+        extra, _ = cv2.findContours(merged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours = list(contours) + list(extra)
+
         candidates = []
         for contour in contours:
             x, y, w, h = cv2.boundingRect(contour)
@@ -558,14 +674,95 @@ class ANPRProcessor:
                 score *= 1.25
             candidates.append((x, y, x + w, y + h, score))
 
+        # Both passes usually propose the same plate; keep the stronger and
+        # drop the duplicate rather than paying for OCR on it twice.
         candidates.sort(key=lambda c: c[4], reverse=True)
         picked: list[tuple] = []
         for cand in candidates:
             if not any(_iou(cand, kept) > 0.55 for kept in picked):
                 picked.append(cand)
-            if len(picked) >= 4:
+            if len(picked) >= 6:
                 break
         return picked
+
+    def _leaving_urgency(self, cand: tuple, width: int, height: int) -> int:
+        """
+        How close to the frame edge this candidate is, as a priority bucket.
+
+        A vehicle at the edge of the picture is about to leave it, and every
+        tick it waits is a read that will never happen — while one in the middle
+        of the scene will still be there next tick. Fair rotation alone cannot
+        see that: it treats a car with four ticks left and a car with one the
+        same. Returning 0 for "leaving now" sorts those first.
+        """
+        if not width or not height:
+            return 1
+        x1, y1, x2, y2 = cand[0], cand[1], cand[2], cand[3]
+        cx = (x1 + x2) * 0.5 / float(width)
+        cy = (y1 + y2) * 0.5 / float(height)
+        margin = float(settings.ANPR_EDGE_URGENCY_FRACTION)
+        near_edge = (cx < margin or cx > 1.0 - margin
+                     or cy < margin or cy > 1.0 - margin)
+        return 0 if near_edge else 1
+
+    def _schedule_candidates(self, candidates: list[tuple], stream: str,
+                             now: float, frame_size: tuple = (0, 0)) -> list[tuple]:
+        """
+        Choose which candidates get OCR this tick, fairly.
+
+        OCR dominates the cost of this stage, so only a few candidates can be
+        read per tick — but *which* few decides whether the system reads every
+        vehicle or the same one forever. Sorting by candidate score alone, as
+        this did, is a starvation bug: the nearest, largest, highest-scoring
+        plate wins every single tick, so on a road with four cars the other
+        three were never attempted even once. Measured on the benchmark, the
+        reader returned exactly two plates whether three, four or six vehicles
+        were in frame — which is the "it misses a lot of cars" report.
+
+        Two changes fix it, both free:
+
+        * a vehicle whose plate is already **settled** is dropped to the back.
+          Re-reading a plate that four frames agree on buys nothing, and the
+          budget it was consuming is what the unread cars needed.
+        * among the rest, the vehicle **waiting longest** goes first. That
+          turns a fixed budget into a rotation, so coverage is a matter of time
+          rather than of luck.
+
+        Candidates with no track id cannot be scheduled fairly (nothing to
+        remember them by), so they are ranked by score as before.
+        """
+        budget = max(1, int(settings.ANPR_MAX_PLATES_PER_TICK))
+        if len(candidates) <= budget:
+            return candidates
+
+        self._tick += 1
+        width, height = frame_size
+        ranked = []
+        for cand in candidates:
+            urgency = self._leaving_urgency(cand, width, height)
+            track_id = cand[5]
+            if track_id is None:
+                # Unknown vehicle: no fairness state, so judge it on merit and
+                # let it compete in the middle of the pack.
+                ranked.append((1, urgency, 0, -cand[4], cand))
+                continue
+            key = (stream, int(track_id))
+            settled = self.voter.settled(key, now)
+            # Negative so that the longest-waited sorts first.
+            waited = -(self._tick - self._last_ocr_tick.get(key, 0))
+            ranked.append((2 if settled else 0, urgency, waited, -cand[4], cand))
+
+        ranked.sort(key=lambda r: (r[0], r[1], r[2], r[3]))
+        chosen = [r[4] for r in ranked[:budget]]
+        for cand in chosen:
+            if cand[5] is not None:
+                self._last_ocr_tick[(stream, int(cand[5]))] = self._tick
+        # Bounded like every other per-track store in this file.
+        if len(self._last_ocr_tick) > 512:
+            cutoff = self._tick - 600
+            self._last_ocr_tick = {k: v for k, v in self._last_ocr_tick.items()
+                                   if v > cutoff}
+        return chosen
 
     def _deduplicate_candidates(self, candidates: list[tuple]) -> list[tuple]:
         """Merge overlapping candidates from vehicle crops and the full frame."""
@@ -597,6 +794,62 @@ class ANPRProcessor:
         scale = min(float(settings.ANPR_PLATE_MAX_UPSCALE), target / float(h))
         return cv2.resize(crop, (max(1, int(w * scale)), max(1, int(h * scale))),
                           interpolation=cv2.INTER_CUBIC)
+
+    @staticmethod
+    def _motion_deblur(crop: np.ndarray, length: int) -> Optional[np.ndarray]:
+        """
+        Undo a horizontal motion smear of roughly ``length`` pixels.
+
+        A vehicle crossing the frame smears its plate along the direction of
+        travel, and the smear is very nearly a horizontal box blur — which is
+        invertible. Wiener deconvolution against that point-spread function
+        recovers glyph edges that simple sharpening cannot: sharpening
+        amplifies what survived, deconvolution reconstructs what was spread.
+
+        The true smear length is unknown, so callers try a short ladder of
+        lengths and let the existing scorer pick the reading that wins. A wrong
+        length produces noise, and noise does not parse as a registration, so a
+        bad guess costs an OCR call rather than a wrong plate.
+        """
+        if crop is None or crop.size == 0 or length < 2:
+            return None
+        try:
+            grey = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+            height, width = grey.shape
+            if width < length * 2 or height < 4:
+                return None
+
+            psf = np.zeros((height, width), np.float32)
+            start = max(0, width // 2 - length // 2)
+            psf[height // 2, start:start + length] = 1.0
+            total = psf.sum()
+            if total <= 0:
+                return None
+            psf = np.fft.ifftshift(psf / total)
+
+            spectrum = np.fft.fft2(grey)
+            kernel = np.fft.fft2(psf)
+            snr = float(settings.ANPR_DEBLUR_SNR)
+            restored = np.real(np.fft.ifft2(
+                spectrum * np.conj(kernel) / (np.abs(kernel) ** 2 + snr)
+            ))
+            spread = float(np.ptp(restored))
+            if spread <= 1e-6:
+                return None
+            restored = np.clip((restored - restored.min()) / spread * 255.0,
+                               0, 255).astype(np.uint8)
+            return cv2.cvtColor(restored, cv2.COLOR_GRAY2BGR)
+        except Exception:
+            return None                 # never let preprocessing break a read
+
+    def _deblur_variants(self, crop: np.ndarray) -> list[np.ndarray]:
+        """Upscaled deconvolutions of one crop, over a ladder of smear lengths."""
+        out = []
+        for length in settings.ANPR_DEBLUR_LENGTHS:
+            restored = self._motion_deblur(crop, int(length))
+            if restored is not None:
+                out.append(self._upscale(restored))
+        return out
 
     def _variants(self, crop: np.ndarray) -> list[np.ndarray]:
         """
@@ -676,10 +929,10 @@ class ANPRProcessor:
             return "", 0.0
 
         best_text, best_score, best_conf = "", 0.0, 0.0
-        for source in sources:
-            if source.size == 0:
-                continue
-            for variant in self._variants(source):
+
+        def try_variants(variants) -> None:
+            nonlocal best_text, best_score, best_conf
+            for variant in variants:
                 for text, confidence in self._ocr_tokens(variant):
                     candidate = self._best_token(text)
                     if not candidate:
@@ -687,10 +940,32 @@ class ANPRProcessor:
                     score = self._score_reading(candidate, confidence)
                     if score > best_score:
                         best_text, best_score, best_conf = candidate, score, confidence
+
+        def good_enough() -> bool:
+            return bool(best_text and self.is_plausible_plate(best_text)
+                        and best_conf >= 0.5)
+
+        for source in sources:
+            if source.size == 0:
+                continue
+            try_variants(self._variants(source))
             # A confident, format-valid read from the original pixels is enough;
             # don't pay for the enhanced copy as well.
-            if best_text and self.INDIAN_PLATE_RE.match(best_text) and best_conf >= 0.5:
+            if good_enough():
                 break
+
+        # Second pass, only for crops the cheap path could not read. A moving
+        # vehicle smears its plate, and a smeared plate either returns nothing
+        # or returns something that is not a registration — both are exactly the
+        # cases worth spending a deconvolution on. A plate read cleanly the
+        # first time never reaches here, so sharp footage pays nothing for this.
+        if not good_enough() and settings.ANPR_DEBLUR_ENABLED:
+            for source in sources:
+                if source.size == 0:
+                    continue
+                try_variants(self._deblur_variants(source))
+                if good_enough():
+                    break
 
         return best_text, best_conf
 
@@ -850,13 +1125,57 @@ class ANPRProcessor:
                     candidate = "".join(out)
                     if not self.INDIAN_PLATE_RE.match(candidate):
                         continue
-                    cost = changes + layout_cost
+                    candidate, state_cost = self._resolve_state_code(candidate)
+                    cost = changes + layout_cost + state_cost
                     if best is None or cost < best[0]:
                         best = (cost, candidate)
 
         if best is None:
             return text, False
         return best[1], best[1] != text
+
+    def is_plausible_plate(self, text: str) -> bool:
+        """
+        Does this reading look like a registration that could actually exist?
+
+        Shape alone is not enough. ``KH12DE1433`` satisfies the layout perfectly
+        but ``KH`` is not a state code India issues, so the reading is known to
+        be wrong — almost always a single misread glyph in the first character.
+        Treating it as format-verified would write a registration that cannot
+        exist into a tamper-evident log and present it as identified.
+
+        Used for ``format_verified``, which drives both the confidence penalty
+        and whether the plate is logged as a number or shown as uncertain.
+        """
+        if not text or not self.INDIAN_PLATE_RE.match(text):
+            return False
+        return text[:2] in self.STATE_CODES
+
+    def _resolve_state_code(self, candidate: str) -> tuple[str, float]:
+        """
+        Check — and where it is unambiguous, repair — the state code.
+
+        Returns ``(candidate, extra_cost)``.
+
+        A valid code costs nothing. An invalid one is repaired only when
+        exactly one legal code is a single character away: one substitution is
+        the signature of a glyph misread, and a unique answer is a correction
+        rather than a guess. When several codes are equally close, or none is,
+        the reading is left exactly as OCR produced it and simply carries a
+        cost, so a different layout can win if one fits better. Nothing is ever
+        rewritten to a plate the recogniser did not plausibly see.
+        """
+        code = candidate[:2]
+        if code in self.STATE_CODES:
+            return candidate, 0.0
+
+        near = [valid for valid in self.STATE_CODES
+                if sum(1 for a, b in zip(code, valid) if a != b) == 1]
+        if len(near) == 1:
+            return near[0] + candidate[2:], 1.0
+        # Ambiguous or unreachable: keep what was read, but make this layout
+        # expensive so a reading with a real state code is preferred.
+        return candidate, 2.0
 
     def normalize_plate_text(self, raw_text: str) -> str:
         """
@@ -993,6 +1312,7 @@ class ANPRProcessor:
         """Clear per-stream state (source reconnect, file loop)."""
         self.voter.reset()
         self._detection_cache.clear()
+        self._last_ocr_tick.clear()
 
     def get_metrics(self) -> dict:
         calls = max(1, self._ocr_call_count)
@@ -1035,7 +1355,14 @@ _anpr_lock = threading.Lock()
 
 
 def get_anpr_processor() -> ANPRProcessor:
-    """Process-wide ANPR processor (the OCR model is loaded at most once)."""
+    """
+    Process-wide ANPR processor (the OCR model is loaded at most once).
+
+    Building it initialises EasyOCR, measured at ~5.6 s and longer when the
+    weights have to move onto CUDA — so never call this from a thread something
+    is waiting on. Test with :func:`anpr_ready` first, and pay the cost once at
+    startup with :func:`preload_anpr`.
+    """
     global _anpr_processor
     with _anpr_lock:
         if _anpr_processor is None:
@@ -1043,7 +1370,41 @@ def get_anpr_processor() -> ANPRProcessor:
         return _anpr_processor
 
 
+def anpr_ready() -> bool:
+    """
+    True once the OCR reader is built — or has definitively failed to build.
+
+    "Ready" deliberately means the *reader*, not the processor object.
+    Constructing ``ANPRProcessor`` is cheap and proves nothing: the EasyOCR
+    model is built by ``is_available()`` on first use, which is measured in
+    seconds and would land on whichever analytics thread first saw a vehicle.
+    Reporting readiness from the object alone would have moved that stall
+    rather than removed it.
+
+    A failed load counts as ready so the pipeline stops asking: the feature is
+    gone either way, and retrying a broken install once per frame is not a fix.
+    """
+    processor = _anpr_processor
+    if processor is None:
+        return False
+    return bool(processor._initialized or processor._init_failed)
+
+
+def preload_anpr() -> bool:
+    """
+    Build the processor **and** its OCR reader now.
+
+    Returns False when OCR is unavailable — a missing or broken EasyOCR costs
+    the ANPR feature, never the boot.
+    """
+    try:
+        return bool(get_anpr_processor().is_available())
+    except Exception:  # pragma: no cover - a missing OCR stack must not break boot
+        log.exception("ANPR processor could not be preloaded")
+        return False
+
+
 __all__ = [
     "ANPRProcessor", "PlateDetection", "PlateVoter",
-    "get_anpr_processor", "EASYOCR_AVAILABLE",
+    "get_anpr_processor", "anpr_ready", "preload_anpr", "EASYOCR_AVAILABLE",
 ]

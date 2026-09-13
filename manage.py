@@ -16,7 +16,11 @@ IBVAP CLI — database, cameras, rules, integrity and server management.
     python manage.py checkpoint           seal a Merkle checkpoint
     python manage.py stats
     python manage.py sweep                enforce evidence retention now
-    python manage.py reset                wipe the database (destructive)
+    python manage.py verify               audit every PS capability on real footage
+    python manage.py prune                reclaim archived camera rows
+    python manage.py run --fresh          start with an empty dashboard
+    python manage.py reset                recreate the schema (destructive)
+    python manage.py hard-reset --yes     wipe everything and start clean
 
 Examples:
     python manage.py camera-add --name "BOP-02 SOUTH" --url 0 --location "South Gate"
@@ -123,10 +127,21 @@ def cmd_seed(args) -> int:
         db.close()
 
 
-def cmd_cameras(_args) -> int:
+def cmd_cameras(args) -> int:
+    """
+    List cameras the operator has.
+
+    Archived cameras are hidden unless ``--all`` is given. They are removed as
+    far as anyone using the system is concerned; listing them here would
+    contradict every other view and is how a deployment ends up looking as
+    though it is carrying dozens of dead sources.
+    """
     db = _session()
     try:
-        cameras = db.query(Camera).order_by(Camera.id).all()
+        query = db.query(Camera)
+        if not args.all:
+            query = query.filter(Camera.is_deleted.is_(False))
+        cameras = query.order_by(Camera.id).all()
         if not cameras:
             print("No cameras registered. Run: python manage.py seed")
             return 0
@@ -134,47 +149,97 @@ def cmd_cameras(_args) -> int:
         print("-" * 92)
         for cam in cameras:
             rules = db.query(Rule).filter(Rule.camera_id == cam.id).count()
-            status = ("ONLINE" if cam.is_online else
-                      ("ACTIVE" if cam.is_active else "DISABLED"))
+            status = ("ARCHIVED" if cam.is_deleted else
+                      "ONLINE" if cam.is_online else
+                      "ACTIVE" if cam.is_active else "DISABLED")
             print(f"{cam.id:>3}  {cam.name[:22]:<22} {status:<9} "
                   f"{(cam.source_kind or 'live'):<7} {rules:>5}  {cam.url[:38]}")
+        if not args.all:
+            archived = db.query(Camera).filter(Camera.is_deleted.is_(True)).count()
+            if archived:
+                print(f"\n({archived} archived camera(s) hidden — "
+                      f"'camera-rm' keeps a camera's sealed events. Use --all.)")
         return 0
     finally:
         db.close()
 
 
 def cmd_camera_add(args) -> int:
+    """
+    Register a camera through the same path the API uses.
+
+    Building the row here by hand skipped URL validation and the duplicate
+    check, so the CLI could create what the API refuses: unreachable sources
+    that hang a capture thread, and several rows pointing at one feed, each
+    with its own decoder, tracker and rule engine doing identical work. That
+    is how this project's database reached four copies of one sample clip.
+    """
+    from core.sources import SourceError, register_camera
+
     db = _session()
     try:
-        camera = Camera(
-            name=args.name, url=args.url, location=args.location or "",
-            is_active=not args.disabled, is_online=False,
-            source_kind="live", created_at=utc_iso(),
+        camera = register_camera(
+            db, name=args.name, url=args.url, location=args.location or "",
+            is_active=not args.disabled, source_kind="live",
+            allow_duplicate=bool(args.allow_duplicate),
         )
-        db.add(camera)
-        db.commit()
-        db.refresh(camera)
-        print(f"Added camera #{camera.id} '{camera.name}' -> {camera.url}")
-        print("Restart the server (or use the dashboard) to bring it online.")
-        return 0
+    except SourceError as exc:
+        print(f"{CROSS}  {exc}")
+        return 1
     finally:
         db.close()
+    print(f"Added camera #{camera.id} '{camera.name}' -> {camera.url}")
+    print("Restart the server (or use the dashboard) to bring it online.")
+    return 0
 
 
 def cmd_camera_rm(args) -> int:
+    """
+    Remove a camera through the same path the API uses.
+
+    The previous implementation issued a bare ``DELETE`` on the row. Against a
+    camera referenced by an analysis session or a plate/face record that is a
+    ``FOREIGN KEY constraint failed`` and the command simply fails; against a
+    camera that owns events it would have cascaded into ``alerts`` — a SHA-256
+    hash chain in which every row's hash covers its predecessor's — so the
+    audit log would verify as COMPROMISED from then on. ``retire_camera``
+    deletes a camera that owns nothing and archives one that owns evidence,
+    and it stops the camera's threads in this process first.
+    """
+    from core.sources import retire_camera
+
     db = _session()
     try:
         camera = db.query(Camera).filter(Camera.id == args.id).first()
-        if not camera:
+        if camera is None:
             print(f"No camera with id {args.id}")
             return 1
-        name = camera.name
-        db.delete(camera)
-        db.commit()
-        print(f"Removed camera #{args.id} '{name}' (its rules and alerts too)")
-        return 0
+        if camera.is_deleted:
+            print(f"Camera #{args.id} '{camera.name}' is already removed.")
+            return 0
+        result = retire_camera(db, args.id)
     finally:
         db.close()
+
+    print(f"Removed camera #{args.id} '{result.get('name', '')}' "
+          f"({result['mode']})")
+    print(f"  rules deleted        : {result.get('rules_removed', 0)}")
+    if result["mode"] == "archived":
+        print(f"  sealed events kept   : {result.get('alerts_retained', 0)}")
+        print(f"  analysis runs kept   : {result.get('sessions_retained', 0)}")
+        print("  The camera is hidden everywhere; its evidence stays verifiable.")
+    if result.get("source_file_removed"):
+        print("  source video deleted : yes")
+    # The CLI and the API are separate processes. This command retires the row
+    # and stops any pipeline *here*, but it cannot reach into a running server
+    # to stop that server's camera threads. Saying so plainly beats implying a
+    # teardown that did not happen — and beats guessing whether a server is up,
+    # which cannot be told apart from this command's own WAL writes.
+    print()
+    print("If the API server is running, it releases this camera on its "
+          "next restart.")
+    print(f"To stop it now, use the dashboard or DELETE /api/cameras/{args.id}.")
+    return 0
 
 
 def cmd_rules(args) -> int:
@@ -410,6 +475,7 @@ def cmd_sweep(_args) -> int:
 
 
 def cmd_reset(args) -> int:
+    """Drop and recreate the schema. Use `hard-reset` for a running system."""
     if not args.yes:
         answer = input("This deletes ALL cameras, rules and the event log. Type 'yes': ")
         if answer.strip().lower() != "yes":
@@ -424,14 +490,162 @@ def cmd_reset(args) -> int:
     return 0
 
 
+def cmd_hard_reset(args) -> int:
+    """
+    Wipe the platform back to a clean, immediately usable state.
+
+    Unlike ``reset``, this also stops every running camera pipeline, cancels
+    in-flight analysis, clears the live frame buffer and the in-memory event
+    history, and can wipe the evidence tree — so what is left is a system an
+    operator can start adding cameras to, not just an empty schema.
+    """
+    from core.sources import hard_reset
+
+    wipe = bool(args.evidence)
+    if not args.yes:
+        print()
+        print("  This deletes EVERY camera, rule, sealed event, checkpoint,")
+        print("  analysis run, plate reading, face record and watchlist entry.")
+        print("  The integrity chain restarts from genesis and cannot be undone.")
+        if wipe:
+            print("  Snapshots, clips, crops and source videos will ALSO be deleted.")
+        print()
+        if input("  Type 'yes' to continue: ").strip().lower() != "yes":
+            print("Aborted.")
+            return 1
+
+    settings.ensure_dirs()
+    db = _session()
+    try:
+        result = hard_reset(db, wipe_evidence=wipe, actor="manage.py")
+    finally:
+        db.close()
+
+    rows = result["rows_deleted"]
+    print()
+    print(f"  {TICK}  HARD RESET COMPLETE  ({result['duration_ms']:.0f} ms)")
+    print()
+    print(f"  Cameras stopped   : {result['cameras_stopped']}")
+    print(f"  Analyses cancelled: {result['analyses_cancelled']}")
+    print(f"  Frames cleared    : {result['frames_cleared']}")
+    print(f"  Rows deleted      : {result['rows_deleted_total']}")
+    for table in sorted(rows):
+        if rows[table]:
+            print(f"    {table:<20} {rows[table]:>7}")
+    if result["evidence"]["wiped"]:
+        print(f"  Evidence removed  : {result['evidence']['files_removed']} file(s), "
+              f"{result['evidence']['directories_removed']} folder(s)")
+    else:
+        print("  Evidence          : kept (pass --evidence to delete it)")
+    print()
+    print("  The system is empty and usable. Add a camera with:")
+    print("    python manage.py camera-add --name \"CAM-01\" --url 0")
+    print()
+    return 0
+
+
+def cmd_verify(args) -> int:
+    """
+    Run the capability audit — what the platform actually does, measured.
+
+    Separate from the test suite on purpose. Tests prove the code behaves as
+    written; this drives the real pipeline over real footage and reports, per
+    problem-statement capability, whether anything came out the other end.
+    """
+    import verify_capabilities
+
+    argv = ["verify_capabilities", "--seconds", str(args.seconds)]
+    for clip in args.clip:
+        argv += ["--clip", clip]
+    if args.webcam:
+        argv.append("--webcam")
+    if args.json:
+        argv += ["--json", args.json]
+
+    saved, sys.argv = sys.argv, argv
+    try:
+        return verify_capabilities.main()
+    finally:
+        sys.argv = saved
+
+
 def cmd_run(args) -> int:
+    """
+    Start the server.
+
+    ``--fresh`` and ``--no-autostart`` are applied through the environment
+    rather than by mutating ``settings`` here, because ``uvicorn.run`` with
+    ``reload=True`` re-imports the application in a *separate process* — a
+    setting changed in this one would be silently lost on the reload that
+    matters most during development.
+    """
     import uvicorn
+
+    if args.fresh:
+        os.environ["FRESH_START"] = "true"
+    if args.no_autostart:
+        os.environ["AUTOSTART_CAMERAS"] = "false"
 
     settings.ensure_dirs()
     init_db()
+    if args.fresh:
+        print("FRESH START — every camera is retired at boot; "
+              "the dashboard comes up empty.")
+    elif args.no_autostart:
+        print("Auto-start disabled — registered cameras stay registered but "
+              "are not brought up.")
     print(f"IBVAP {settings.VERSION} — dashboard at http://{args.host}:{args.port}/dashboard")
     uvicorn.run("api.main:app", host=args.host, port=args.port,
                 reload=args.reload, log_level="info")
+    return 0
+
+
+def cmd_prune(args) -> int:
+    """
+    Reclaim archived camera rows that no longer hold anything.
+
+    Removal archives, rather than deletes, a camera that owns sealed events —
+    ``alerts.camera_id`` is a foreign key into a hash-chained log that must not
+    lose rows. Correct, and it means archived rows accumulate: this project's
+    database reached 49 of them. Once the last dependant of one is gone the row
+    is residue, and this removes it. Anything still holding evidence is
+    reported and left alone.
+    """
+    from core.sources import prune_archived
+
+    db = _session()
+    try:
+        result = prune_archived(db, dry_run=args.dry_run)
+    finally:
+        db.close()
+
+    removed, kept = result["removed"], result["kept"]
+    print()
+    print(f"  Archived cameras : {result['archived_total']}")
+    print(f"  Reclaimable      : {len(removed)}")
+    print(f"  Still holding    : {len(kept)}")
+    if removed:
+        print()
+        for row in removed[:20]:
+            print(f"    {'would remove' if args.dry_run else 'removed'} "
+                  f"#{row['id']:<4} {row['name'][:32]}")
+        if len(removed) > 20:
+            print(f"    … and {len(removed) - 20} more")
+    if kept:
+        print()
+        print("  Kept — these still own evidence, and the chain needs their row:")
+        for row in kept[:10]:
+            owns = ", ".join(f"{k}={v}" for k, v in row.items()
+                             if k not in ("id", "name") and v)
+            print(f"    #{row['id']:<4} {row['name'][:28]:<28} {owns}")
+        if len(kept) > 10:
+            print(f"    … and {len(kept) - 10} more")
+    print()
+    if args.dry_run:
+        print("  Nothing was written (--dry-run).")
+    elif not removed:
+        print("  Nothing to reclaim.")
+    print()
     return 0
 
 
@@ -454,7 +668,9 @@ def main() -> int:
     p_seed.add_argument("--url", default="")
     p_seed.add_argument("--location", default="Northern Checkpost — Sector 4")
 
-    sub.add_parser("cameras", help="list cameras")
+    p_cams = sub.add_parser("cameras", help="list cameras")
+    p_cams.add_argument("--all", action="store_true",
+                        help="include archived (removed) cameras")
 
     p_cadd = sub.add_parser("camera-add", help="register a camera")
     p_cadd.add_argument("--name", required=True)
@@ -462,6 +678,9 @@ def main() -> int:
                         help="rtsp://…, http://…, a webcam index like 0, or a file path")
     p_cadd.add_argument("--location", default="")
     p_cadd.add_argument("--disabled", action="store_true")
+    p_cadd.add_argument("--allow-duplicate", action="store_true",
+                        help="register a source that is already registered "
+                             "(doubles the load on one feed; rarely wanted)")
 
     p_crm = sub.add_parser("camera-rm", help="remove a camera")
     p_crm.add_argument("--id", type=int, required=True)
@@ -500,13 +719,44 @@ def main() -> int:
     sub.add_parser("stats", help="show event and storage statistics")
     sub.add_parser("sweep", help="enforce evidence retention now")
 
-    p_reset = sub.add_parser("reset", help="wipe the database (destructive)")
+    p_verify = sub.add_parser(
+        "verify",
+        help="audit every problem-statement capability against real footage",
+    )
+    p_verify.add_argument("--seconds", type=float, default=20.0,
+                          help="seconds of each clip to analyse")
+    p_verify.add_argument("--webcam", action="store_true",
+                          help="also audit face detection against the local camera")
+    p_verify.add_argument("--clip", action="append", default=[],
+                          help="footage to audit (repeatable)")
+    p_verify.add_argument("--json", help="write the full report to this path")
+
+    p_reset = sub.add_parser("reset", help="recreate the schema (destructive)")
     p_reset.add_argument("--yes", action="store_true", help="skip confirmation")
+
+    p_hard = sub.add_parser(
+        "hard-reset",
+        help="stop everything and wipe cameras, rules, events and evidence",
+    )
+    p_hard.add_argument("--yes", action="store_true", help="skip confirmation")
+    p_hard.add_argument("--evidence", action="store_true",
+                        help="also delete snapshots, clips, crops, source "
+                             "videos and processed renders")
+
+    p_prune = sub.add_parser(
+        "prune", help="reclaim archived camera rows that hold no evidence")
+    p_prune.add_argument("--dry-run", action="store_true",
+                         help="report what would be removed, write nothing")
 
     p_run = sub.add_parser("run", help="start the server")
     p_run.add_argument("--host", default=settings.HOST)
     p_run.add_argument("--port", type=int, default=settings.PORT)
     p_run.add_argument("--reload", action="store_true")
+    p_run.add_argument("--fresh", action="store_true",
+                       help="retire every camera at boot — start as though "
+                            "the software were newly installed")
+    p_run.add_argument("--no-autostart", action="store_true",
+                       help="keep registered cameras but do not bring them up")
 
     args = parser.parse_args()
     handler = globals()[f"cmd_{args.command.replace('-', '_')}"]

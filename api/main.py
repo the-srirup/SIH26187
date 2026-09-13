@@ -23,7 +23,9 @@ import asyncio
 import json
 import logging
 import os
+import secrets
 import tempfile
+from logging.handlers import RotatingFileHandler
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -37,7 +39,9 @@ from fastapi import (
     UploadFile, WebSocket, WebSocketDisconnect,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import (
+    FileResponse, JSONResponse, RedirectResponse, Response, StreamingResponse,
+)
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import desc, func
 from sqlalchemy.orm import Session
@@ -47,14 +51,20 @@ from core.analysis import (
     AnalysisManager, UploadValidationError, ensure_upload_camera,
     rules_for_camera, sanitize_filename,
 )
-from core.camera import CameraManager, FrameBuffer
+from core.camera import CameraManager, CameraProcessor, FrameBuffer
+from core.video_source import PLAYBACK_MAX_SPEED, PLAYBACK_MIN_SPEED
 from core.config import settings
 from core.database import SessionLocal, init_db
-from core.evidence import evidence_usage, is_safe_evidence_path, sweep_evidence
+from core.evidence import (
+    USAGE_MAX_AGE_SECONDS, evidence_usage, is_safe_evidence_path,
+    measure_evidence_usage, sweep_evidence,
+)
 from core.events import EventManager, serialize_alert_row
+from cv.rules import RED_ALERT_SEVERITIES, SEVERITY_BY_TYPE
 from core.sources import (
-    KIND_FILE, KIND_LIVE, SourceError, get_live_camera, register_camera,
-    retire_camera, startup_cameras, store_source_video, visible_cameras,
+    KIND_FILE, KIND_LIVE, SourceError, fresh_start, get_live_camera, hard_reset,
+    reconcile_on_start, register_camera, retire_camera, startup_cameras,
+    store_source_video, visible_cameras,
 )
 from core.hashchain import (
     chain_status, create_checkpoint, export_integrity_certificate_to_json,
@@ -101,7 +111,18 @@ def configure_logging() -> None:
 
     settings.LOG_DIR.mkdir(parents=True, exist_ok=True)
     try:
-        file_handler = logging.FileHandler(settings.LOG_DIR / "ibvap.log", encoding="utf-8")
+        # Rotating, not plain. A ``FileHandler`` never truncates: this project's
+        # own log reached 2.6 MB and had no upper bound at all, which on an
+        # unattended Border Out Post is a disk that fills months after anyone
+        # last looked at it — the slowest and least obvious way for a
+        # surveillance system to stop working. Bounded here the same way
+        # evidence is bounded by the retention sweep.
+        file_handler = RotatingFileHandler(
+            settings.LOG_DIR / "ibvap.log",
+            maxBytes=settings.LOG_MAX_MB * 1024 * 1024,
+            backupCount=settings.LOG_BACKUP_COUNT,
+            encoding="utf-8",
+        )
         file_handler.setFormatter(
             ISTFormatter("[%(asctime)s] %(levelname)-7s %(name)-18s %(message)s",
                          datefmt="%d %b %Y %H:%M:%S IST")
@@ -134,8 +155,32 @@ class ConnectionManager:
         return queue
 
     async def disconnect(self, websocket: WebSocket) -> None:
+        """
+        Forget a client and release what it was holding. Idempotent.
+
+        Three things go, and all three matter. The dictionary entry, or the
+        fan-out keeps trying to feed a socket nobody is reading — and because
+        the dict is keyed by the ``WebSocket`` object, that entry is also the
+        last reference keeping the connection alive, so a closed tab would
+        never be collected. The queue, which is bounded at 100 messages but
+        those messages are alert payloads, so a few abandoned tabs are real
+        memory. And the socket itself: a browser that vanished without a close
+        frame leaves the server side half-open until something closes it.
+        """
         async with self._lock:
-            self._connections.pop(websocket, None)
+            queue = self._connections.pop(websocket, None)
+        if queue is not None:
+            # Drop any payloads this client never read.
+            while not queue.empty():
+                try:
+                    queue.get_nowait()
+                except asyncio.QueueEmpty:      # pragma: no cover - race only
+                    break
+        try:
+            await websocket.close()
+        except Exception:
+            # Already closed, or closing — either way there is nothing to free.
+            pass
 
     def broadcast_threadsafe(self, message: dict) -> None:
         """
@@ -153,11 +198,25 @@ class ConnectionManager:
             pass
 
     def _fanout(self, message: dict) -> None:
+        """
+        Hand the message to every client's queue, never blocking on any of them.
+
+        A full queue means that client is not keeping up. Its message is
+        dropped rather than awaited: the alternative is one stalled browser tab
+        applying backpressure all the way to a camera thread.
+        """
         for queue in list(self._connections.values()):
             try:
                 queue.put_nowait(message)
             except asyncio.QueueFull:
                 pass
+
+    async def close_all(self) -> None:
+        """Disconnect every client — used on shutdown so no socket is left open."""
+        async with self._lock:
+            sockets = list(self._connections)
+        for websocket in sockets:
+            await self.disconnect(websocket)
 
     @property
     def client_count(self) -> int:
@@ -187,25 +246,41 @@ async def lifespan(app: FastAPI):
     init_db()
 
     EventManager.get().subscribe(ws_manager.broadcast_threadsafe)
+    channels = _subscribe_notification_channels()
 
-    # Load the detector off the event loop so startup never blocks the server.
-    await asyncio.to_thread(_load_detector)
+    # Load every model off the event loop so startup never blocks the server —
+    # and so no camera thread is ever the one that pays for a model.
+    await asyncio.to_thread(_warm_models)
 
     db = SessionLocal()
     try:
-        cameras = startup_cameras(db)
-        manager = CameraManager.get()
-        started = 0
-        for cam in cameras:
-            # One unreachable source must not prevent the others from starting.
-            if manager.add_camera(cam) is not None:
-                started += 1
-            else:
-                log.warning("Camera %d (%s) could not be started at boot",
-                            cam.id, cam.name)
-        log.info("Auto-started %d of %d camera(s)", started, len(cameras))
+        # 1. Make the database agree with reality before anything reads it.
+        #    Nothing is online until a processor in *this* process says so;
+        #    an ungraceful exit leaves the previous run's flags behind.
+        reconcile_on_start(db)
+
+        # 2. Optionally begin as though freshly installed.
+        if settings.FRESH_START:
+            fresh_start(db)
+
+        # 3. Bring the surviving cameras back up.
+        if not settings.AUTOSTART_CAMERAS:
+            log.info("Camera auto-start disabled (AUTOSTART_CAMERAS=false) — "
+                     "the dashboard starts empty")
+        else:
+            cameras = startup_cameras(db)
+            manager = CameraManager.get()
+            started = 0
+            for cam in cameras:
+                # One unreachable source must not prevent the others starting.
+                if manager.add_camera(cam) is not None:
+                    started += 1
+                else:
+                    log.warning("Camera %d (%s) could not be started at boot",
+                                cam.id, cam.name)
+            log.info("Auto-started %d of %d camera(s)", started, len(cameras))
     except Exception as exc:
-        log.exception("Camera auto-start failed: %s", exc)
+        log.exception("Camera startup failed: %s", exc)
     finally:
         db.close()
 
@@ -223,8 +298,137 @@ async def lifespan(app: FastAPI):
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        # Close dashboard sockets before the cameras go, so no client is left
+        # holding a connection to a server that has stopped producing.
+        await ws_manager.close_all()
         CameraManager.get().stop_all()
+        # Leave the database honest for the next boot. This is best-effort by
+        # nature — a killed process never gets here — which is why
+        # reconcile_on_start does the same job unconditionally at startup.
+        try:
+            db = SessionLocal()
+            try:
+                reconcile_on_start(db)
+            finally:
+                db.close()
+        except Exception as exc:
+            log.debug("Could not clear online flags at shutdown: %s", exc)
+        for channel, callback in channels:
+            # Unsubscribe first: a camera still draining could otherwise seal
+            # an event and queue it onto a worker that is already stopping.
+            EventManager.get().unsubscribe(callback)
+            channel.shutdown()
         log.info("Shutdown complete at %s", fmt_ist())
+
+
+def _subscribe_notification_channels() -> list:
+    """
+    Arm the outbound escalation channels the operator has switched on.
+
+    An unconfigured channel is *not* subscribed: there is no point paying the
+    severity and cooldown checks on every event to reach a sink that does not
+    exist, and a channel left out here still reports its state honestly on
+    ``/api/system/notifications``.
+
+    Note which method is subscribed. ``trigger`` / ``handle`` only gate and
+    enqueue; the blocking provider call happens on the channel's own worker
+    thread. Subscribing a delivery method instead (``SMSNotifier.send``) would
+    put an SMS gateway round-trip on the camera analytics thread that sealed
+    the event.
+    """
+    #: ``(channel, subscribed callback)`` — the callback is kept because it is
+    #: what ``unsubscribe`` has to be handed back at shutdown, and it is not
+    #: always ``channel.handle``.
+    channels: list[tuple] = []
+    events = EventManager.get()
+
+    if settings.ALARM_ENABLED:
+        try:
+            from core.alarm import AlarmManager
+
+            alarm = AlarmManager.get()
+            alarm.start()
+            events.subscribe(alarm.trigger)
+            channels.append((alarm, alarm.trigger))
+            log.info("Alarm channel armed — sinks: %s", alarm.describe_sinks())
+            if not alarm.is_configured():
+                log.warning(
+                    "ALARM_ENABLED is set but no sink is configured — "
+                    "set ALARM_WEBHOOK_URL or ALARM_GPIO_PIN"
+                )
+        except Exception as exc:
+            # A broken escalation channel must cost the feature, never the boot.
+            log.error("Alarm channel unavailable: %s", exc)
+
+    if settings.SMS_ENABLED:
+        try:
+            from core.sms import SMSNotifier
+
+            sms = SMSNotifier.get()
+            sms.start()
+            events.subscribe(sms.handle)
+            channels.append((sms, sms.handle))
+            log.info(
+                "SMS channel armed — providers: %s, recipients: %d",
+                ", ".join(sms.get_status()["providers_ready"]) or "none",
+                len(sms.recipients()),
+            )
+            if not sms.is_configured():
+                log.warning(
+                    "SMS_ENABLED is set but the channel is not configured — "
+                    "check SMS_TO_NUMBER and the provider credentials"
+                )
+        except Exception as exc:
+            log.error("SMS channel unavailable: %s", exc)
+
+    if not channels:
+        log.info("No outbound escalation channel enabled (alarm/SMS off)")
+    return channels
+
+
+def _warm_models() -> None:
+    """
+    Load every model the pipeline can use, before any camera starts.
+
+    YOLO was already loaded here; face and ANPR were not, and that asymmetry
+    was the bug. ``FrameAnalyzer`` built those two lazily **inside
+    ``analyse()``**, so the cost — measured on this machine at 6.3 s for
+    SCRFD+ArcFace and 5.6 s for EasyOCR, more onto CUDA — landed on the
+    analytics thread of whichever camera happened to be first. For those ~12-20
+    seconds that camera read frames and published none, while reporting
+    PROCESSING and ONLINE: a dead tile on a dashboard that insisted the camera
+    was fine. Removing it then took seconds rather than milliseconds, because
+    the thread could not reach its own stop check, and the loads hold the GIL
+    in long stretches, so the event loop behind the dashboard, the MJPEG
+    streams and every API call stalled with it. That is the "everything lags
+    and the camera will not go away" report, and it recurred on every single
+    start of the program.
+
+    The three loads are independent, so they run concurrently: on this machine
+    that turns ~18 s of startup into about the cost of the slowest one. A model
+    that cannot be loaded costs its feature, never the boot.
+    """
+    loaders = [("detector", _load_detector)]
+    if settings.FACE_ENABLED:
+        from cv.face import preload_face
+
+        loaders.append(("face", preload_face))
+    if settings.ANPR_ENABLED:
+        from cv.anpr import preload_anpr
+
+        loaders.append(("anpr", preload_anpr))
+
+    started = time.time()
+    threads = [
+        threading.Thread(target=fn, name=f"warm-{name}", daemon=True)
+        for name, fn in loaders
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    log.info("Models ready in %.1fs (%s)", time.time() - started,
+             ", ".join(name for name, _ in loaders))
 
 
 def _load_detector() -> None:
@@ -281,11 +485,35 @@ async def _checkpoint_worker() -> None:
 
 
 async def _evidence_sweeper() -> None:
-    """Enforce evidence retention so an unattended deployment cannot fill disk."""
+    """
+    Enforce evidence retention, and keep the storage figure warm.
+
+    Two jobs on two clocks, which is why this is one loop rather than a sleep
+    for the sweep interval.
+
+    Measuring the footprint is one ``stat`` per evidence file — 190-1685 ms on
+    a real store of 2,449 files — so it must never happen on a request.
+    ``/api/stats`` and ``/api/system/info`` both report it, so both read a
+    cached figure instead. But a cache is only useful while it is warm: with
+    the refresh tied to the 900-second sweep and the cache valid for 60, one
+    request in every fifteen still paid the full walk. Refreshing on the
+    cache's own cadence closes that, and the sweep keeps its own slower one.
+
+    Everything runs through ``asyncio.to_thread``, so neither job touches the
+    event loop that serves the dashboard.
+    """
+    # Measure once up front so the very first dashboard load is a cache hit.
+    await asyncio.to_thread(measure_evidence_usage)
+    refresh_every = max(5.0, USAGE_MAX_AGE_SECONDS * 0.5)
+    next_sweep = time.time() + settings.EVIDENCE_SWEEP_INTERVAL
     while True:
         try:
-            await asyncio.sleep(settings.EVIDENCE_SWEEP_INTERVAL)
-            await asyncio.to_thread(sweep_evidence)
+            await asyncio.sleep(refresh_every)
+            if time.time() >= next_sweep:
+                next_sweep = time.time() + settings.EVIDENCE_SWEEP_INTERVAL
+                await asyncio.to_thread(sweep_evidence)
+            # Re-measure after a sweep, and on the cache cadence otherwise.
+            await asyncio.to_thread(measure_evidence_usage)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -320,11 +548,36 @@ app.mount("/static", StaticFiles(directory=settings.STATIC_DIR), name="static")
 
 
 def get_db_session():
+    """
+    Request-scoped database session, always closed.
+
+    Every synchronous route takes this rather than opening its own session, so
+    a connection cannot be leaked by an early ``return`` or a raised
+    ``HTTPException`` — the ``finally`` runs either way. Routes that hand work
+    to a worker thread open their own session *inside that thread* instead,
+    because a Session is not safe to share across threads.
+    """
     db = SessionLocal()
     try:
         yield db
     finally:
         db.close()
+
+
+def active_processors() -> dict[int, "CameraProcessor"]:
+    """
+    The live ``{camera_id: CameraProcessor}`` registry.
+
+    There is exactly one, owned by :class:`~core.camera.CameraManager`, and
+    this is a read-only view of it. That single-owner rule is deliberate: a
+    second dictionary tracking the same threads is not a safety net, it is a
+    way for the two to disagree — and a processor present in one and absent
+    from the other is precisely the zombie this whole path exists to prevent.
+    The manager registers and starts a processor under one lock, and unregisters
+    and signals it under the same lock, so the registry never contains a
+    processor that has been stopped.
+    """
+    return {proc.camera_id: proc for proc in CameraManager.get().list_cameras()}
 
 
 def _camera_names(db: Session) -> dict[int, str]:
@@ -364,23 +617,36 @@ def dashboard():
 
 @app.get("/health")
 def health(db: Session = Depends(get_db_session)):
-    """Liveness + a one-glance view of every registered source."""
-    manager = CameraManager.get()
-    live = {proc.camera_id: proc for proc in manager.list_cameras()}
-    cameras = db.query(models.Camera).filter(models.Camera.source_kind != "upload").all()
+    """
+    Liveness + a one-glance view of every *current* source.
+
+    ``visible_cameras`` — not a raw query — is what keeps this endpoint
+    consistent with the rest of the system. This route used to select every
+    non-upload row, archived ones included, so a deployment that had removed
+    42 cameras reported all 42 back with ``is_active=false`` and ``fps=0``:
+    an operator (and a monitoring probe) reading that saw a system apparently
+    carrying dozens of dead cameras, and the removals looked like they had
+    silently failed. The list is now exactly the cameras the dashboard shows,
+    and the runtime lookup is over live processors only, so the cost is
+    proportional to what is actually running.
+    """
+    live = {proc.camera_id: proc for proc in CameraManager.get().list_cameras()}
+    cameras = visible_cameras(db)
     return {
         "status": "ok",
         "version": settings.VERSION,
         "timestamp": utc_iso(),
         "timestamp_ist": fmt_ist(),
         "timezone": "Asia/Kolkata (IST, UTC+05:30)",
+        "cameras_registered": len(cameras),
+        "cameras_running": len(live),
         "cameras": [
             {
                 "id": c.id,
                 "name": c.name,
                 "is_active": c.is_active,
                 "is_online": c.id in live and live[c.id].is_online,
-                "fps": round(live[c.id]._fps, 1) if c.id in live else 0.0,
+                "fps": round(live[c.id].stats()["fps"], 1) if c.id in live else 0.0,
             }
             for c in cameras
         ],
@@ -442,6 +708,15 @@ def system_info(db: Session = Depends(get_db_session)):
                 f"{settings.NIGHT_START_HOUR:02d}:00–{settings.NIGHT_END_HOUR:02d}:00"
                 if settings.NIGHT_USE_CLOCK_HINT else "not used"
             ),
+        },
+        #: What the dashboard should escalate on. Served rather than hard-coded
+        #: so an operator retuning NOTIFY_MIN_SEVERITY does not also have to
+        #: edit the front end.
+        "alerting": {
+            "notify_min_severity": settings.NOTIFY_MIN_SEVERITY,
+            "red_alert_severities": list(RED_ALERT_SEVERITIES),
+            "severity_by_type": dict(SEVERITY_BY_TYPE),
+            "severity_order": dict(models.SEVERITY_ORDER),
         },
         "rules": {
             "loiter_seconds": settings.LOITER_SECONDS,
@@ -520,24 +795,39 @@ def list_cameras(
 
 
 @app.post("/api/cameras", status_code=201)
-def create_camera(
+async def create_camera(
     name: str = Form(...),
     url: str = Form(...),
     location: str = Form(""),
     is_active: bool = Form(True),
-    db: Session = Depends(get_db_session),
 ):
-    """Register a network camera: RTSP / HTTP URL, or a webcam index."""
+    """
+    Register a network camera: RTSP / HTTP URL, or a webcam index.
+
+    ``async`` + ``to_thread`` for the same reason as the delete endpoint.
+    Starting a camera takes the manager lock, constructs the analyzer and
+    spawns two threads, and if a removal happens to be signalling at that
+    moment it waits behind it. On a plain ``def`` route that wait occupies one
+    of Starlette's shared threadpool workers — the pool every other synchronous
+    endpoint draws from — so adding a camera could make the rest of the
+    dashboard hitch at exactly the moment the operator is watching it.
+    """
+    def _create() -> dict:
+        db = SessionLocal()
+        try:
+            cam = register_camera(
+                db, name=name, url=url, location=location,
+                is_active=is_active, source_kind=KIND_LIVE,
+            )
+            proc = CameraManager.get().add_camera(cam) if is_active else None
+            return serialize_camera(cam, proc)
+        finally:
+            db.close()
+
     try:
-        cam = register_camera(
-            db, name=name, url=url, location=location,
-            is_active=is_active, source_kind=KIND_LIVE,
-        )
+        return await asyncio.to_thread(_create)
     except SourceError as exc:
         raise HTTPException(400, str(exc))
-
-    proc = CameraManager.get().add_camera(cam) if is_active else None
-    return serialize_camera(cam, proc)
 
 
 @app.post("/api/cameras/upload", status_code=201)
@@ -672,31 +962,124 @@ def update_camera(
 
 
 @app.delete("/api/cameras/{camera_id}")
-def delete_camera(camera_id: int, db: Session = Depends(get_db_session)):
+async def delete_camera(camera_id: int):
     """
-    Remove a camera: stop its threads, release its handles, drop its rules.
+    Remove a camera: stop its threads, release its handles, then delete the row.
 
-    Delegates to :func:`core.sources.retire_camera`, which tears the runtime
-    down before touching the database and preserves sealed evidence.  The call
-    is idempotent — removing an already-removed camera returns success rather
-    than 404, so a double-click or a retried request cannot produce an error.
+    The order is the whole point, and it is **runtime first, database second**:
+
+    1. look the running :class:`CameraProcessor` up in the live registry;
+    2. signal it to stop — its ``threading.Event`` is set, so the analytics
+       loop ends at its next turn and any back-off wait aborts immediately;
+    3. unregister it, so nothing can hand out a reference to a dead processor;
+    4. join both of its threads under a bounded timeout, so a thread parked in
+       a native read can never hang the request;
+    5. release the OpenCV capture and free the frame buffers;
+    6. **only then** touch SQLite.
+
+    Doing the database first is what produced the reported failure: the row
+    vanished from the dashboard while the pipeline kept running, invisible,
+    holding the camera device and a share of the GPU — and with nothing left
+    in any listing to point at it, nothing would ever stop it. Worse, a
+    still-running processor seals events against a ``camera_id`` that is about
+    to disappear, which fails on the foreign key from inside a camera thread.
+
+    :func:`core.sources.retire_camera` performs steps 1-6 in that order and
+    then decides whether the row can be deleted outright or must be archived
+    to keep the evidence hash chain intact. It is idempotent, so a
+    double-clicked button or a retried request returns success, not a 500.
+
+    ``background_join=True`` moves only step 4 — the *waiting* — off the
+    request. Everything that makes the camera dead has already happened
+    synchronously by then, so the operator's click returns in milliseconds
+    instead of blocking on a socket timeout they gain nothing from.
+
+    The route is ``async`` and hands its work to ``asyncio.to_thread`` because
+    a plain ``def`` route would occupy one of Starlette's 40 shared threadpool
+    workers — the same pool every other synchronous endpoint needs — for the
+    duration. Removing several dead cameras in a row stalled the dashboard
+    that way.
     """
+    def _retire() -> dict:
+        # A Session belongs to one thread. This runs on a worker, so it opens
+        # its own and closes it in a finally — never the request's session.
+        db = SessionLocal()
+        try:
+            running = active_processors().get(camera_id)
+            if running is not None:
+                log.info("CAMERA_REMOVE cam=%d (%s) — stopping pipeline before "
+                         "touching the database", camera_id, running.name)
+            return retire_camera(db, camera_id, background_join=True)
+        finally:
+            db.close()
+
     try:
-        return retire_camera(db, camera_id)
+        result = await asyncio.to_thread(_retire)
     except Exception as exc:
         log.exception("Camera removal failed for %d: %s", camera_id, exc)
         raise HTTPException(500, f"Could not remove camera: {exc}")
+
+    # Assert the contract on the way out rather than assuming it. If a
+    # processor for this id is somehow still registered, that is the zombie
+    # this endpoint exists to prevent, and it must be visible in the log.
+    if camera_id in active_processors():
+        log.error("CAMERA_REMOVE_INCOMPLETE cam=%d: a processor is still "
+                  "registered after retirement", camera_id)
+    return result
 
 
 @app.post("/api/cameras/{camera_id}/restart")
 def restart_camera(camera_id: int, db: Session = Depends(get_db_session)):
     cam = get_live_camera(db, camera_id)
-    if not cam:
-        raise HTTPException(404, "Camera not found")
     manager = CameraManager.get()
+    # Both checks matter. The row read can be stale by the time we act on it,
+    # and the tombstone is set before the row is archived — so a restart that
+    # raced a removal would otherwise start a brand-new pipeline for a camera
+    # the operator had just deleted, with nothing left to stop it.
+    if not cam or manager.is_retired(camera_id):
+        raise HTTPException(404, "Camera not found")
     manager.remove_camera(camera_id)
     proc = manager.add_camera(cam)
     return {"ok": proc is not None, "camera": serialize_camera(cam, proc)}
+
+
+@app.post("/api/cameras/{camera_id}/playback")
+def set_camera_playback(
+    camera_id: int,
+    paused: Optional[bool] = Form(None),
+    speed: Optional[float] = Form(None),
+    db: Session = Depends(get_db_session),
+):
+    """
+    Pause / resume a camera's tile, and set its review speed (0.5x - 2x).
+
+    Playback is a *view* control, not a pipeline switch. On a recording it
+    pauses the decoder, so the footage waits where the operator stopped it. On
+    a live camera it holds the published picture while capture, analytics and
+    event sealing carry on underneath — pausing a real camera's analysis to
+    look at a frame would blind the post at exactly the wrong moment.
+
+    Speed applies only where the source is paced exactly (a recording); the
+    response says so in ``speed_supported`` rather than silently ignoring it.
+    """
+    if get_live_camera(db, camera_id) is None:
+        raise HTTPException(404, "Camera not found")
+    proc = CameraManager.get().get_camera(camera_id)
+    if proc is None:
+        raise HTTPException(409, "Camera is not running")
+
+    if speed is not None and not (PLAYBACK_MIN_SPEED <= speed <= PLAYBACK_MAX_SPEED):
+        raise HTTPException(
+            400,
+            f"speed must be between {PLAYBACK_MIN_SPEED} and {PLAYBACK_MAX_SPEED}",
+        )
+    if paused is None and speed is None:
+        raise HTTPException(400, "Provide 'paused', 'speed', or both")
+
+    state = proc.set_playback(paused=paused, speed=speed)
+    log.info("Camera %d playback: paused=%s speed=%.2fx",
+             camera_id, state["paused"], state["speed"])
+    return {"camera_id": camera_id, **state}
 
 
 @app.get("/api/cameras/{camera_id}/snapshot")
@@ -939,6 +1322,111 @@ def list_alerts(
     }
 
 
+@app.get("/api/alerts/export.pdf")
+def export_alerts_pdf(
+    camera_id: Optional[int] = Query(None),
+    alert_type: Optional[str] = Query(None),
+    severity: Optional[str] = Query(None),
+    track_id: Optional[int] = Query(None),
+    source_type: Optional[str] = Query(None),
+    session_id: Optional[str] = Query(None),
+    search: Optional[str] = Query(None),
+    from_ts: Optional[str] = Query(None),
+    to_ts: Optional[str] = Query(None),
+    limit: int = Query(500, ge=1, le=5000),
+    db: Session = Depends(get_db_session),
+):
+    """
+    The filtered event log as a printable PDF.
+
+    Takes the same filters as ``GET /api/alerts`` so what is printed is exactly
+    what the operator is looking at. The report states its own scope — the
+    filters, the number of events shown against the number that matched, and
+    whether the hash chain verified at the moment of printing — because a table
+    of rows with no provenance proves nothing about the log it came from.
+    """
+    from core.report import build_event_log_pdf, pdf_available
+
+    if not pdf_available():
+        raise HTTPException(
+            503,
+            "PDF export needs the 'reportlab' package: pip install reportlab",
+        )
+
+    from core.timeutil import to_utc
+
+    query = db.query(models.Alert)
+    if camera_id is not None:
+        query = query.filter(models.Alert.camera_id == camera_id)
+    if alert_type:
+        query = query.filter(models.Alert.alert_type == alert_type)
+    if severity:
+        query = query.filter(models.Alert.severity == severity.upper())
+    if track_id is not None:
+        query = query.filter(models.Alert.track_id == track_id)
+    if source_type:
+        query = query.filter(models.Alert.source_type == source_type)
+    if session_id:
+        query = query.filter(models.Alert.session_id == session_id)
+    if search:
+        pattern = f"%{search.strip()}%"
+        query = query.filter(models.Alert.description.ilike(pattern) |
+                             models.Alert.details_json.ilike(pattern))
+    if from_ts:
+        parsed = to_utc(from_ts)
+        if parsed:
+            query = query.filter(models.Alert.timestamp >= parsed.isoformat())
+    if to_ts:
+        parsed = to_utc(to_ts)
+        if parsed:
+            query = query.filter(models.Alert.timestamp <= parsed.isoformat())
+
+    total = query.count()
+    rows = query.order_by(desc(models.Alert.id)).limit(limit).all()
+    names = _camera_names(db)
+    alerts = [serialize_alert_row(r, names.get(r.camera_id, "")) for r in rows]
+
+    # Measured now, not assumed: a report that asserts its own integrity has to
+    # have checked. Never let a verification failure deny the operator a print.
+    integrity = None
+    try:
+        result = verify_chain(db)
+        integrity = {
+            "valid": bool(result.valid),
+            "verified": int(result.total_alerts),
+            "breaks": list(result.breaks or []),
+            "message": result.message,
+        }
+    except Exception as exc:
+        log.warning("Integrity check failed while building the PDF: %s", exc)
+
+    filters = {
+        "camera": names.get(camera_id, camera_id) if camera_id is not None else None,
+        "event type": alert_type, "severity": severity, "track": track_id,
+        "source": source_type, "session": session_id, "search": search,
+        "from": from_ts, "to": to_ts,
+    }
+
+    try:
+        pdf = build_event_log_pdf(
+            alerts, total_matching=total, filters=filters, integrity=integrity,
+        )
+    except Exception as exc:
+        log.exception("PDF generation failed: %s", exc)
+        raise HTTPException(500, f"Could not build the PDF: {exc}")
+
+    # A filename that sorts chronologically and survives every filesystem:
+    # no spaces, no colons, IST because every timestamp in the report is IST.
+    filename = f"ibvap-event-log-{now_ist().strftime('%Y%m%d-%H%M')}-IST.pdf"
+    log.info("Event log PDF: %d of %d event(s), %d KB",
+             len(alerts), total, len(pdf) // 1024)
+    return Response(
+        content=pdf,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 @app.get("/api/alerts/{alert_id}")
 def get_alert(alert_id: int, db: Session = Depends(get_db_session)):
     alert = db.query(models.Alert).filter(models.Alert.id == alert_id).first()
@@ -988,6 +1476,29 @@ def get_alert_clip(alert_id: int, db: Session = Depends(get_db_session)):
     if not alert:
         raise HTTPException(404, "Alert not found")
     return _serve_evidence(alert.clip_path, "video/mp4")
+
+
+@app.get("/api/alerts/{alert_id}/plate")
+def get_alert_plate(alert_id: int, db: Session = Depends(get_db_session)):
+    """
+    The cropped number plate recorded for this event.
+
+    ANPR crops are stored against the reading that produced them, so an event
+    in the log can be opened directly onto the pixels its registration was read
+    from — which is what makes the plate evidence rather than an assertion.
+    """
+    alert = db.query(models.Alert).filter(models.Alert.id == alert_id).first()
+    if not alert:
+        raise HTTPException(404, "Alert not found")
+    reading = (
+        db.query(models.ANPRDetection)
+        .filter(models.ANPRDetection.alert_id == alert_id)
+        .order_by(desc(models.ANPRDetection.id))
+        .first()
+    )
+    if reading is None or not reading.evidence_path:
+        raise HTTPException(404, "No plate crop stored for this event")
+    return _serve_evidence(reading.evidence_path, "image/jpeg")
 
 
 @app.get("/api/stats")
@@ -1093,32 +1604,49 @@ async def _mjpeg_stream(camera_id: int, request: Request):
     lookup under a lock) rather than blocking a worker thread. Handing each
     frame's wait to ``asyncio.to_thread`` cost one threadpool dispatch per
     frame per viewer; at 15 fps with a handful of open tabs that starves the
-    very pool every synchronous endpoint depends on. The poll interval bounds
-    the added latency to a few milliseconds.
+    very pool every synchronous endpoint depends on.
+
+    The poll interval is what that costs in latency, and it is the last delay
+    in the chain before the browser, so it is kept short — 5 ms, which is a
+    dict lookup under a lock 200 times a second per viewer and immeasurable
+    next to a single JPEG encode. It used to be one half of a frame interval
+    (33 ms at 15 fps), which on top of the capture and analytics stages was a
+    third of the total end-to-end delay for nothing.
+
+    The disconnect check is the expensive part of this loop — it opens a cancel
+    scope and reads from the ASGI channel — so it runs on its own slower timer
+    rather than on every poll. Nothing is lost by that: when a client really
+    goes away the server cancels this task, and the check is a belt-and-braces
+    second signal, not the primary one.
     """
     buffer = FrameBuffer.get()
     last_seq = -1
     idle_since = time.monotonic()
-    poll = 1.0 / max(10, settings.TARGET_FPS * 2)
+    poll = min(0.005, 1.0 / max(10, settings.TARGET_FPS * 4))
+    disconnect_every = 0.5
+    next_disconnect_check = 0.0
     boundary = b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
 
     while True:
-        if await request.is_disconnected():
-            break
+        now = time.monotonic()
+        if now >= next_disconnect_check:
+            next_disconnect_check = now + disconnect_every
+            if await request.is_disconnected():
+                break
 
         seq = buffer.sequence(camera_id)
         if seq <= last_seq:
             # Nothing new yet. Hold the connection open while a camera
             # reconnects rather than tearing the viewer's stream down, but
             # do not keep a dead stream alive forever.
-            if time.monotonic() - idle_since > 120:
+            if now - idle_since > 120:
                 break
             await asyncio.sleep(poll)
             continue
 
         jpeg = buffer.get_jpeg(camera_id)
         last_seq = seq
-        idle_since = time.monotonic()
+        idle_since = now
         if jpeg is None:
             await asyncio.sleep(poll)
             continue
@@ -1204,20 +1732,37 @@ async def websocket_alerts(websocket: WebSocket):
 
         pump = asyncio.create_task(_pump())
         drain = asyncio.create_task(_drain())
-        done, pending = await asyncio.wait(
-            {pump, drain}, return_when=asyncio.FIRST_COMPLETED
-        )
-        for task in pending:
-            task.cancel()
+        try:
+            done, pending = await asyncio.wait(
+                {pump, drain}, return_when=asyncio.FIRST_COMPLETED
+            )
+        finally:
+            # Cancel *and await*. A cancelled task that is never awaited stays
+            # pending on the loop and, if it later raises, surfaces as a bare
+            # "Task exception was never retrieved" with no context. Gathering
+            # them here means a closed tab leaves nothing behind on the loop.
+            for task in (pump, drain):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(pump, drain, return_exceptions=True)
+
         for task in done:
+            if task.cancelled():
+                continue
             exc = task.exception()
             if exc and not isinstance(exc, (WebSocketDisconnect, asyncio.CancelledError)):
                 raise exc
     except WebSocketDisconnect:
+        # The normal ending: the tab was closed or refreshed.
         pass
+    except (asyncio.CancelledError, RuntimeError) as exc:
+        # Server shutting down, or the socket went away mid-send.
+        log.debug("WebSocket ended: %s", exc)
     except Exception as exc:
         log.debug("WebSocket closed: %s", exc)
     finally:
+        # Runs on every path, including a raised exception and a cancelled
+        # task, so a client can never be left in the fan-out list.
         await ws_manager.disconnect(websocket)
 
 
@@ -1800,6 +2345,112 @@ async def test_anpr_on_camera(camera_id: int):
 
 
 # --------------------------------------------------------------------------- #
+# Notifications — alarm siren & SMS
+# --------------------------------------------------------------------------- #
+
+
+def _alarm():
+    from core.alarm import AlarmManager
+
+    return AlarmManager.get()
+
+
+def _sms():
+    from core.sms import SMSNotifier
+
+    return SMSNotifier.get()
+
+
+@app.get("/api/system/notifications")
+def notification_status():
+    """
+    State of every outbound escalation channel.
+
+    Answers the three questions an operator actually has: is it switched on,
+    does it have somewhere to deliver to, and has anything failed since boot.
+    Reports honestly when a channel is off — a channel that is disabled is not
+    an error, and must not be rendered as one.
+    """
+    alarm = _alarm().get_status()
+    sms = _sms().get_status()
+    return {
+        "alarm": alarm,
+        "sms": sms,
+        "min_severity": str(settings.NOTIFY_MIN_SEVERITY).upper(),
+        "escalating": [
+            channel["channel"]
+            for channel in (alarm, sms)
+            if channel["enabled"] and channel["configured"]
+        ],
+        "checked_at_ist": fmt_ist(),
+    }
+
+
+@app.get("/api/system/alarm/status")
+def alarm_status():
+    """Alarm channel only — config, sinks, delivery counters, last error."""
+    return _alarm().get_status()
+
+
+@app.get("/api/system/sms/status")
+def sms_status():
+    """SMS channel only — provider, recipients, delivery counters, last error."""
+    return _sms().get_status()
+
+
+@app.post("/api/system/alarm/test")
+async def test_alarm_endpoint():
+    """
+    Fire a test alarm so an operator can prove the siren wiring works.
+
+    Runs off the event loop: the webhook can take its full timeout and a GPIO
+    pulse deliberately holds its pin for several seconds.
+    """
+    alarm = _alarm()
+    if not alarm.is_enabled():
+        raise HTTPException(503, "Alarm channel is disabled (set ALARM_ENABLED=true)")
+    if not alarm.is_configured():
+        raise HTTPException(
+            503, "Alarm channel has no sink configured "
+                 "(set ALARM_WEBHOOK_URL or ALARM_GPIO_PIN)"
+        )
+
+    ok = await asyncio.to_thread(alarm.test_alarm)
+    status = alarm.get_status()
+    return {
+        "ok": ok,
+        "sinks": status["sinks"],
+        "reference": status["last_reference"] if ok else "",
+        "error": "" if ok else status["last_error"],
+        "tested_at_ist": fmt_ist(),
+    }
+
+
+@app.post("/api/system/sms/test")
+async def test_sms_endpoint():
+    """Send a test SMS so an operator can prove the gateway route works."""
+    sms = _sms()
+    if not sms.is_enabled():
+        raise HTTPException(503, "SMS channel is disabled (set SMS_ENABLED=true)")
+    if not sms.is_configured():
+        raise HTTPException(
+            503, "SMS channel is not configured "
+                 "(set SMS_TO_NUMBER and the provider credentials)"
+        )
+
+    ok = await asyncio.to_thread(sms.test_sms)
+    status = sms.get_status()
+    return {
+        "ok": ok,
+        "provider": status["provider"],
+        "recipients": status["recipients"],
+        "reference": status["last_reference"] if ok else "",
+        "error": "" if ok else status["last_error"],
+        "tested_at_ist": fmt_ist(),
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Maintenance
 # --------------------------------------------------------------------------- #
 
@@ -1807,6 +2458,80 @@ async def test_anpr_on_camera(camera_id: int):
 @app.post("/api/system/evidence/sweep")
 async def trigger_evidence_sweep():
     return await asyncio.to_thread(sweep_evidence)
+
+
+@app.post("/api/system/hard-reset")
+async def system_hard_reset(
+    request: Request,
+    confirm: bool = Query(
+        False, description="Must be true. Guards against an accidental POST."
+    ),
+    wipe_evidence: Optional[bool] = Query(
+        None,
+        description="Also delete snapshots, clips, ANPR/face crops, source "
+                    "videos and processed renders. Defaults to "
+                    "HARD_RESET_WIPE_EVIDENCE.",
+    ),
+    token: str = Query("", description="HARD_RESET_TOKEN, if one is configured."),
+):
+    """
+    Wipe the platform back to a clean, immediately usable state.
+
+    **This destroys the audit chain.** Every camera, rule, event, checkpoint,
+    analysis session, plate reading, face record and watchlist entry is
+    deleted, every pipeline is stopped, and integrity verification restarts
+    from genesis. It exists because an operator preparing a demonstration
+    needs one honest way to start over, and because the alternative — deleting
+    "most" of the log — would leave verification permanently broken.
+
+    Three separate things must line up before it runs: the feature must be
+    enabled, ``?confirm=true`` must be present, and the configured token (if
+    any) must match. Evidence on disk is kept unless explicitly wiped, since a
+    truncated database can be restored from a backup and deleted footage
+    cannot.
+    """
+    if not settings.HARD_RESET_ENABLED:
+        raise HTTPException(
+            403,
+            "Hard reset is disabled on this deployment. Set HARD_RESET_ENABLED=true, "
+            "or run 'python manage.py hard-reset' on the host.",
+        )
+    if not confirm:
+        raise HTTPException(
+            400,
+            "Hard reset deletes every camera, rule and sealed event, and resets "
+            "the integrity chain. Repeat the request with ?confirm=true if that "
+            "is what you intend.",
+        )
+
+    expected = (settings.HARD_RESET_TOKEN or "").strip()
+    if expected:
+        supplied = (request.headers.get("X-Reset-Token") or token or "").strip()
+        # Constant-time: this is a shared secret, and the comparison is cheap.
+        if not secrets.compare_digest(supplied, expected):
+            raise HTTPException(
+                403, "Invalid or missing reset token (X-Reset-Token)."
+            )
+
+    actor = request.client.host if request.client else "unknown"
+
+    def _reset() -> dict:
+        db = SessionLocal()
+        try:
+            return hard_reset(db, wipe_evidence=wipe_evidence, actor=actor)
+        finally:
+            db.close()
+
+    try:
+        result = await asyncio.to_thread(_reset)
+    except Exception as exc:
+        log.exception("Hard reset failed: %s", exc)
+        raise HTTPException(500, f"Hard reset failed: {exc}")
+
+    # Tell every open dashboard to empty itself rather than waiting for the
+    # next poll to disagree with what it is showing.
+    ws_manager.broadcast_threadsafe({"type": "system_reset", "data": result})
+    return result
 
 
 @app.exception_handler(Exception)

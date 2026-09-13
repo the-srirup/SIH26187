@@ -77,23 +77,63 @@ AlertType = Literal[
 
 #: Severity assigned to each rule outcome. Kept here so the UI, the log and
 #: the API all agree on how loud an event is.
+#:
+#: The grading rule is "what should this make a human do?", and it has to be
+#: honest, because severity is what gates the siren and the desktop
+#: notification. A system that escalates a car driving past trains its operator
+#: to ignore the escalation — and then the one that matters is ignored too.
+#:
+#:   CRITICAL  an intrusion is happening now. Siren, notification, banner.
+#:   HIGH      a security event needing attention now. Alarm, notification.
+#:   MEDIUM    noteworthy; logged and shown, no escalation.
+#:   LOW       context around an event, not an event in itself.
+#:   INFO      routine traffic. The noise floor, and by far the highest volume:
+#:             on a street-facing camera ``vehicle_detected`` alone was 90 rows
+#:             in a 45-second run. These belong in the log and nowhere else.
 SEVERITY_BY_TYPE: dict[str, str] = {
+    # --- intrusion in progress ------------------------------------------- #
+    #: Crossed the fence onto the protected side.
     "entry": "CRITICAL",
-    "exit": "HIGH",
-    "enter": "HIGH",
-    "zone_exit": "LOW",
-    "loiter": "HIGH",
-    "zone_presence": "MEDIUM",
-    "wrong_direction": "HIGH",
-    "night_movement": "HIGH",
+    #: Still inside a restricted zone past its dwell threshold — not a
+    #: transient boundary touch but somebody who has stayed.
+    "zone_presence": "CRITICAL",
+    #: A face matched against the watchlist.
     "watchlist_match": "CRITICAL",
-    "face_detected": "LOW",
-    "anpr_detection": "MEDIUM",
-    "human_detected": "MEDIUM",
-    "vehicle_detected": "MEDIUM",
-    "camera_offline": "HIGH",
-    "system_error": "HIGH",
+
+    # --- security events -------------------------------------------------- #
+    "enter": "HIGH",              # entered a restricted zone
+    "loiter": "HIGH",             # dwelling in a monitored area
+    "wrong_direction": "HIGH",    # moving against a one-way constraint
+    "night_movement": "HIGH",     # movement in a scene measured as dark
+    "camera_offline": "HIGH",     # a blind spot is a security condition
+
+    # --- noteworthy, but not an escalation -------------------------------- #
+    "exit": "MEDIUM",             # crossed the fence outward
+    "system_error": "MEDIUM",     # degraded subsystem; the operator can wait
+
+    # --- context ----------------------------------------------------------- #
+    "zone_exit": "LOW",
+    "anpr_detection": "LOW",      # a plate read is a record, not an alarm
+    "face_detected": "LOW",       # a face seen is not a person identified
+
+    # --- routine traffic ---------------------------------------------------- #
+    #: A looping video file reached its end and started again. Not a security
+    #: event at all, but the operator has to be able to see the seam: without
+    #: it, a second pass through the same footage reads as a second incident.
+    "source_restarted": "INFO",
+    "human_detected": "INFO",
+    "vehicle_detected": "INFO",
 }
+
+#: Severities that constitute a "red alert" — the ones worth interrupting a
+#: human for. Everything at or above ``HIGH`` escalates; everything below is
+#: recorded and displayed and makes no noise.
+RED_ALERT_SEVERITIES = ("HIGH", "CRITICAL")
+
+
+def is_red_alert(severity: Optional[str]) -> bool:
+    """True when this severity should escalate to sound and notification."""
+    return str(severity or "").upper() in RED_ALERT_SEVERITIES
 
 
 def severity_for(alert_type: str) -> str:
@@ -468,6 +508,9 @@ class _ZoneState:
     entered_at: float = 0.0
     outside_since: Optional[float] = None
     presence_alerted: bool = False
+    #: When sustained presence was last announced, so it can re-announce while
+    #: the subject is still there rather than falling silent after one event.
+    presence_announced_at: float = 0.0
     last_seen: float = 0.0
 
 
@@ -564,6 +607,7 @@ class ZoneRule(BaseRule):
                 state.inside = True
                 state.entered_at = now
                 state.presence_alerted = False
+                state.presence_announced_at = 0.0
                 return Alert(
                     rule_name=self.name, rule_type=self.rule_type, track_id=track_id,
                     alert_type="enter", timestamp=now,
@@ -576,11 +620,26 @@ class ZoneRule(BaseRule):
                     },
                 )
 
-            # Already inside — check sustained presence.
-            if not state.presence_alerted and state.entered_at:
+            # Already inside. Sustained presence is announced once the dwell
+            # threshold is passed, and then *again* every repeat interval for
+            # as long as the subject stays — an occupied zone is a continuing
+            # condition, and a log that says "entered" once and then nothing
+            # cannot distinguish someone who left from someone still standing
+            # there. The interval keeps that honest without writing a row per
+            # frame; the frame-by-frame signal is state, not events (see
+            # :meth:`occupancy`).
+            if state.entered_at:
                 dwell = now - state.entered_at
-                if dwell >= self.presence_seconds:
+                repeat = float(settings.ZONE_PRESENCE_REPEAT_SECONDS)
+                due = (
+                    not state.presence_alerted
+                    or (repeat > 0
+                        and now - state.presence_announced_at >= repeat)
+                )
+                if dwell >= self.presence_seconds and due:
+                    first = not state.presence_alerted
                     state.presence_alerted = True
+                    state.presence_announced_at = now
                     return Alert(
                         rule_name=self.name, rule_type=self.rule_type,
                         track_id=track_id, alert_type="zone_presence", timestamp=now,
@@ -592,6 +651,9 @@ class ZoneRule(BaseRule):
                             "polygon": self.geometry(),
                             "dwell_seconds": round(dwell, 1),
                             "threshold_seconds": self.presence_seconds,
+                            "still_present": True,
+                            "first_announcement": first,
+                            "repeat_seconds": repeat,
                         },
                     )
             return None
@@ -612,6 +674,7 @@ class ZoneRule(BaseRule):
         state.inside = False
         state.outside_since = None
         state.presence_alerted = False
+        state.presence_announced_at = 0.0
         if not self.exit_alerts:
             return None
         return Alert(
@@ -624,6 +687,48 @@ class ZoneRule(BaseRule):
                 "exit_grace_seconds": self.exit_grace,
             },
         )
+
+    def occupancy(self, now: Optional[float] = None) -> dict:
+        """
+        Who is inside this zone *right now*.
+
+        This is the continuous signal. Entry and exit are moments and are
+        recorded as events; being inside is a condition, and a condition has to
+        be reported as state or it cannot be shown continuously — on the frame,
+        on the dashboard, or to anything polling the API. Derived from the same
+        hysteresis state the alerts use, so the two can never disagree.
+
+        Stale tracks are ignored rather than deleted: a detector that drops a
+        box for a frame must not empty the zone, which is the same reasoning as
+        the exit grace period.
+        """
+        now = _resolve_time(now)
+        grace = max(self.exit_grace, 1.0)
+        tracks, since = [], 0.0
+        for track_id, state in self._state.items():
+            if not state.inside:
+                continue
+            if state.last_seen and now - state.last_seen > grace:
+                continue          # not seen recently enough to still count
+            tracks.append(int(track_id))
+            if state.entered_at and (since == 0.0 or state.entered_at < since):
+                since = state.entered_at
+        return {
+            "rule": self.name,
+            "rule_type": self.rule_type,
+            "geometry": self.geometry(),
+            "occupied": bool(tracks),
+            "count": len(tracks),
+            "tracks": sorted(tracks),
+            "since": since,
+            "seconds": round(now - since, 1) if since else 0.0,
+            "threshold_seconds": self.presence_seconds,
+            #: True once the dwell threshold has been passed — the point at
+            #: which continued presence is an alert condition, not just traffic.
+            "breached": bool(tracks) and bool(
+                since and (now - since) >= self.presence_seconds
+            ),
+        }
 
     def forget(self, track_id: int) -> None:
         self._state.pop(track_id, None)
@@ -822,6 +927,36 @@ class LoiterRule(BaseRule):
                 "object_class": _class_of(detection) or "unknown",
             },
         )
+
+    def occupancy(self, now: Optional[float] = None) -> dict:
+        """
+        Who is dwelling in this area right now — the loiter counterpart of
+        :meth:`ZoneRule.occupancy`, so "is anything inside any polygon?" has one
+        answer across every rule type that has an inside.
+        """
+        now = _resolve_time(now)
+        grace = max(self.exit_grace, 1.0)
+        tracks, since = [], 0.0
+        for track_id, state in self._state.items():
+            if state.last_inside and now - state.last_inside > grace:
+                continue
+            tracks.append(int(track_id))
+            if since == 0.0 or state.entered_at < since:
+                since = state.entered_at
+        return {
+            "rule": self.name,
+            "rule_type": self.rule_type,
+            "geometry": self.geometry(),
+            "occupied": bool(tracks),
+            "count": len(tracks),
+            "tracks": sorted(tracks),
+            "since": since,
+            "seconds": round(now - since, 1) if since else 0.0,
+            "threshold_seconds": self.dwell_seconds,
+            "breached": bool(tracks) and bool(
+                since and (now - since) >= self.dwell_seconds
+            ),
+        }
 
     def forget(self, track_id: int) -> None:
         self._state.pop(track_id, None)
@@ -1062,6 +1197,26 @@ class RuleEngine:
 
     def get_rules(self) -> list[BaseRule]:
         return list(self._rules.values())
+
+    def occupancy(self, now: Optional[float] = None) -> list[dict]:
+        """
+        Live occupancy for every rule that has an inside — zones and loiter areas.
+
+        The dashboard renders this continuously, the overlay fills an occupied
+        polygon, and the alert sound holds while anything here is ``breached``.
+        Rules with no notion of "inside" (a tripwire, a direction rule) simply
+        do not appear.
+        """
+        out: list[dict] = []
+        for rule in self._rules.values():
+            probe = getattr(rule, "occupancy", None)
+            if probe is None:
+                continue
+            try:
+                out.append(probe(now))
+            except Exception:  # pragma: no cover - a rule must not break stats
+                log.warning("Rule '%s' could not report occupancy", rule.name)
+        return out
 
     def diagnostics(self) -> list[dict]:
         """
